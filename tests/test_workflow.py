@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -69,7 +70,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.data["concurrency"], {"group": "shiplord-release-orders", "cancel-in-progress": False})
         for name in ("build", "deploy"):
             self.assertIn("timeout-minutes", self.jobs[name])
-        self.assertEqual(self.jobs["deploy"]["if"], "${{ !cancelled() && github.ref == \"refs/heads/main\" && "
+        self.assertEqual(self.jobs["deploy"]["if"], "${{ !cancelled() && github.ref == 'refs/heads/main' && "
                                                     "(inputs.check_only || needs.build.result == 'success') }}")
 
     def test_a_check_only_dispatch_skips_quality_and_build_and_runs_status_instead_of_deploy(self):
@@ -80,6 +81,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((steps["Check access only"]["if"], steps["Check access only"]["run"]),
                          ("${{ inputs.check_only }}", "shiplord status --json"))
         self.assertEqual(steps["Deploy"]["if"], "${{ !inputs.check_only }}")
+
+    @unittest.skipUnless(shutil.which("actionlint"), "actionlint is required to validate Actions expressions")
+    def test_generated_workflows_pass_actionlint(self):
+        for branch in ("main", "release/prod"):
+            with self.subTest(branch=branch):
+                value = manifest(github={"repository": "Example/orders", "deployment_branch": branch})
+                result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"],
+                                        input=render_workflow(value, tooling_ref=REF),
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_deployment_and_access_conditions_for_build_and_dispatch(self):
+        # Model the generated boolean expressions for these specific GitHub contexts.
+        def evaluate(condition, *, check_only, cancelled=False, ref="refs/heads/main", build="success"):
+            expression = condition.removeprefix("${{").removesuffix("}}").strip()
+            values = {"inputs.check_only": repr(check_only), "cancelled()": repr(cancelled),
+                      "github.ref": repr(ref), "needs.build.result": repr(build)}
+            for name, value in values.items():
+                expression = expression.replace(name, value)
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            expression = re.sub(r"!(?!=)", " not ", expression).strip()
+            tree = ast.parse(expression, mode="eval")
+            allowed = (ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare, ast.Constant,
+                       ast.And, ast.Or, ast.Not, ast.Eq, ast.Load)
+            self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+            return eval(compile(tree, "<workflow condition>", "eval"), {"__builtins__": {}})
+
+        quality = self.jobs["quality"]["if"]
+        deploy = self.jobs["deploy"]["if"]
+        steps = {step.get("name"): step for step in self.steps("deploy")}
+        for context, expected in (
+            ({}, (True, True, False, True)),
+            ({"build": "failure"}, (True, False, False, False)),
+            ({"ref": "refs/heads/other"}, (True, False, False, False)),
+            ({"cancelled": True}, (True, False, False, False)),
+            ({"check_only": True, "build": "skipped"}, (False, True, True, False)),
+        ):
+            with self.subTest(context=context):
+                context.setdefault("check_only", False)
+                runs_quality = evaluate(quality, **context)
+                runs_deploy = evaluate(deploy, **context)
+                runs_check = runs_deploy and evaluate(steps["Check access only"]["if"], **context)
+                runs_release = runs_deploy and evaluate(steps["Deploy"]["if"], **context)
+                self.assertEqual((runs_quality, runs_deploy, runs_check, runs_release), expected)
+        self.assertEqual(self.jobs["build"]["needs"], "quality")
 
     def test_no_secret_variable_or_event_value_is_interpolated_into_a_shell_script(self):
         for job in self.jobs.values():
@@ -135,7 +181,7 @@ class WorkflowTests(unittest.TestCase):
         other = manifest(github={"repository": "Example/orders", "deployment_branch": "release/prod"})
         data = parse(render_workflow(other, tooling_ref=REF))
         self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["release/prod"])
-        self.assertIn("github.ref == \"refs/heads/release/prod\"", data["jobs"]["deploy"]["if"])
+        self.assertIn("github.ref == 'refs/heads/release/prod'", data["jobs"]["deploy"]["if"])
 
     def test_invalid_inputs_are_refused(self):
         for kwargs in ({"tooling_ref": "main"}, {"tooling_ref": REF[:-1]}, {"tooling_ref": REF, "platforms": "linux/386"},
