@@ -43,6 +43,8 @@ shiplord provision
 
 For an existing Docker app, run `shiplord configure` in its directory and choose the `generic` template. Shiplord will check that the app answers its readiness URL before it sends visitors to it.
 
+For a native Linux program, use the `google-adk` template above. Add `--runtime native` to `shiplord configure` before running `shiplord provision`. Shiplord assumes Docker otherwise.
+
 ## Deploy an update
 
 For a Docker app, build an image and push it to a registry. Deploy it by its digest, which identifies the exact image, and by the Git commit that produced it:
