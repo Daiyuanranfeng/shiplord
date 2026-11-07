@@ -1,8 +1,11 @@
 """Checks on .github/workflows/publish.yml, the PyPI Trusted Publishing workflow."""
 
+import os
 import re
 import shutil
 import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -18,12 +21,57 @@ class PublishWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(match, f"job {name} is missing")
         return match.group(1)
 
-    def test_runs_only_when_a_release_is_published(self):
+    def test_runs_on_published_release_or_manual_dispatch(self):
         on_block = re.search(r"^on:\n(.*?)^\S", self.text, re.S | re.M).group(1)
         self.assertIn("release:", on_block)
         self.assertIn("types: [published]", on_block)
+        self.assertIn("workflow_dispatch:", on_block)
         self.assertNotIn("push:", on_block)
         self.assertNotIn("pull_request", on_block)
+
+    def step_script(self, name):
+        pattern = rf"^      - name: {re.escape(name)}\n.*?^        run: \|\n((?:^          [^\n]*\n|^\n)+)"
+        match = re.search(pattern, self.text, re.M | re.S)
+        self.assertIsNotNone(match, f"step {name} is missing")
+        return textwrap.dedent(match.group(1))
+
+    def test_manual_tag_must_be_stable_and_have_a_published_release(self):
+        script = self.step_script("Validate manual release")
+        with tempfile.TemporaryDirectory() as directory:
+            fake_gh = Path(directory) / "gh"
+            fake_gh.write_text("#!/bin/sh\nprintf '%s\\n' \"$GH_RELEASE_RESULT\"\n")
+            fake_gh.chmod(0o755)
+            for tag, release, branch, succeeds in (
+                ("v0.1.0", "true", "refs/heads/main", True),
+                ("v0.1.0", "false", "refs/heads/main", False),
+                ("v0.1.0; echo injected", "true", "refs/heads/main", False),
+                ("main", "true", "refs/heads/main", False),
+                ("v1.2.3/other", "true", "refs/heads/main", False),
+                ("v0.1.0", "true", "refs/heads/MAIN", False),
+            ):
+                with self.subTest(tag=tag, release=release):
+                    env = dict(os.environ, PATH=directory + os.pathsep + os.environ["PATH"],
+                               RELEASE_TAG=tag, GH_RELEASE_RESULT=release,
+                               GITHUB_REPOSITORY="QueryPlanner/shiplord", GITHUB_REF=branch)
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+
+    def test_package_version_must_match_release_tag(self):
+        script = self.step_script("Verify package version")
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
+            for tag, succeeds in (("v0.1.0", True), ("v0.2.0", False)):
+                with self.subTest(tag=tag):
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                            cwd=directory, env=dict(os.environ, RELEASE_TAG=tag),
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+
+    def test_manual_dispatch_only_runs_from_main_and_checks_out_the_tag(self):
+        build = self.job("build")
+        self.assertIn("github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'", build)
+        self.assertIn("format('refs/tags/{0}', inputs.tag)", build)
 
     def test_only_the_publish_job_can_mint_an_oidc_token(self):
         self.assertEqual(self.text.count("id-token: write"), 1)
