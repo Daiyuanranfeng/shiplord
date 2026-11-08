@@ -14,6 +14,7 @@ from shiplord.admin import parse_request, run  # noqa: E402
 from shiplord.client import AdminClient  # noqa: E402
 from shiplord.installer import bootstrap  # noqa: E402
 from shiplord.protocol import ProtocolError  # noqa: E402
+from shiplord.registry import Registry  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.serverdoctor import server_doctor  # noqa: E402
 from shiplord.system import CommandResult  # noqa: E402
@@ -53,9 +54,15 @@ class DoctorTestCase(InstallerTestCase):
 
     def provision(self, app="orders"):
         from shiplord.provision import provision
-        with self.lock.acquire():
-            provision(self.layout, self.system, self.lock, application_id=app, runtime="docker", api_domain=f"{app}.example.com",
-                      image_repository=f"ghcr.io/example/{app}", public_key=ed25519(1), key_label="laptop")
+        register = Registry.register
+
+        def register_with_free_fixture_ports(registry, *args, **kwargs):
+            return register(registry, *args, probe=lambda _port: True, **kwargs)
+
+        with self.lock.acquire(), patch.object(Registry, "register", register_with_free_fixture_ports):
+            return provision(self.layout, self.system, self.lock, application_id=app, runtime="docker",
+                             api_domain=f"{app}.example.com", image_repository=f"ghcr.io/example/{app}",
+                             public_key=ed25519(1), key_label="laptop")
 
     def report(self):
         return server_doctor(self.layout, self.system, self.lock)
@@ -74,6 +81,43 @@ class ServerDoctorTests(DoctorTestCase):
         application = report["checks"]["applications"]["applications"][0]
         self.assertEqual((application["application"], application["deployed"], application["unfinished_transaction"]),
                          ("orders", False, None))
+
+    def test_admin_apps_action_lists_release_state_and_keeps_the_port_in_json(self):
+        from shiplord.serverdoctor import application_inventory
+        provisioned = self.provision()
+        report = application_inventory(self.layout, self.lock)
+        self.assertTrue(report["ok"])
+        application = report["applications"][0]
+        self.assertEqual((application["application"], application["domain"], application["runtime"],
+                          application["release_recorded"], application["unfinished_transaction"]),
+                         ("orders", "orders.example.com", "docker", False, None))
+        self.assertEqual(application["host_port"], provisioned["host_port"])
+        request = {"version": 1, "request_id": "apps-1", "action": "apps", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual(code, 0)
+        self.assertEqual(response["result"]["applications"][0]["host_port"], application["host_port"])
+        state_fd = os.open(self.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.lock.acquire():
+                ReleaseState("orders", state_fd, self.lock).begin("req-apps", release())
+        finally:
+            os.close(state_fd)
+        pending = application_inventory(self.layout, self.lock)["applications"][0]
+        self.assertEqual(pending["unfinished_transaction"], {"request_id": "req-apps", "phase": "prepared"})
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual(code, 0)
+        self.assertEqual(response["result"]["applications"][0]["unfinished_transaction"]["phase"], "prepared")
+
+    def test_admin_apps_action_rejects_application_identity_and_arguments(self):
+        request = {"version": 1, "request_id": "apps-1", "action": "apps", "application_id": None,
+                   "commit": None, "arguments": {}}
+        self.assertEqual(parse_request(request)["action"], "apps")
+        with self.assertRaises(ProtocolError):
+            parse_request(dict(request, application_id="orders"))
+        self.provision()
+        response, code = run(dict(request, arguments={"unexpected": True}), self.layout, self.system, {})
+        self.assertEqual((code, response["error"]), (2, "invalid_request"))
 
     def test_each_problem_is_reported_by_the_check_that_owns_it(self):
         cases = {

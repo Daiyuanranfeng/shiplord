@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from typer.testing import CliRunner
+
+from shiplord import cli
+from shiplord.client import ClientError
+from shiplord.commands import CommandError
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.manifest import ManifestError, load_manifest
 
@@ -365,13 +372,204 @@ class CLITests(unittest.TestCase):
             env = dict(os.environ, PATH=directory)
             result = self.invoke(directory, "doctor", "--local", env=env)
         self.assertEqual(result.returncode, 3)
-        self.assertIn('"ssh": false', result.stdout)
+        self.assertIn("ssh: missing", result.stdout)
 
     def test_version_and_help_use_shiplord(self):
         with tempfile.TemporaryDirectory() as directory:
             version = self.invoke(directory, "--version")
             help_result = self.invoke(directory, "--help")
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout.strip(), "shiplord 0.1.0")
+        self.assertEqual(version.stdout.strip(), "shiplord 0.2.0")
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("shiplord", help_result.stdout.lower())
+
+
+class CLIInventoryTests(unittest.TestCase):
+    inventory = {"ok": True, "applications": [{
+        "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,
+        "release_recorded": True, "unfinished_transaction": None, "ok": True,
+    }]}
+
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def env(self, config: Path) -> dict[str, str]:
+        return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+    def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            runner = CliRunner()
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)) as inventory:
+                result = runner.invoke(cli.app, ["apps"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Server: hetzner-vm", result.output)
+            self.assertIn("orders.example.com", result.output)
+            self.assertNotIn("23001", result.output)
+            self.assertEqual(inventory.call_args.args[0].target, "admin@host.example.com")
+
+    def test_apps_json_keeps_host_port_and_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)):
+                result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["server"], "hetzner-vm")
+        self.assertEqual(data["applications"][0]["host_port"], 23001)
+
+    def test_apps_lists_aliases_when_server_selection_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+            result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(json.loads(result.stdout)["aliases"], ["alpha", "beta"])
+
+    def test_apps_reports_unattended_sudo_authorization_as_structured_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.commands.server_applications",
+                       side_effect=ClientError("sudo authorization is required", 3,
+                                               error_code="authorization_required")):
+                result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(json.loads(result.stdout)["error_code"], "authorization_required")
+
+    def test_all_servers_marks_unreachable_aliases_as_partial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+
+            def inventory(admin):
+                if admin.target.startswith("admin@beta"):
+                    raise ClientError("the SSH exchange timed out", 3)
+                return 0, self.inventory
+
+            with patch("shiplord.cli.commands.server_applications", side_effect=inventory):
+                result = CliRunner().invoke(cli.app, ["apps", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["partial"])
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta"])
+        self.assertFalse(data["servers"][1]["ok"])
+
+    def test_named_app_uses_app_scoped_ssh_and_requires_a_server_when_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch.dict(os.environ, self.env(config), clear=True):
+                application, alias, client = cli._app_context("orders", None, False, "status")
+            self.assertEqual((application, alias, client.target), ("orders", "hetzner-vm", "ship-orders@host.example.com"))
+            self.write_servers(config, ("second", "admin@second.example.com"))
+            with patch.dict(os.environ, self.env(config), clear=True):
+                ambiguous = CliRunner().invoke(cli.app, ["status", "orders", "--json"])
+            self.assertEqual(ambiguous.exit_code, 3)
+            self.assertEqual(json.loads(ambiguous.stdout)["aliases"], ["hetzner-vm", "second"])
+
+    def test_named_app_rejects_an_environment_target_for_a_different_app(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            env = dict(self.env(config), SHIPLORD_SSH_TARGET="ship-billing@host.example.com")
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(CommandError):
+                    cli._app_context("orders", "hetzner-vm", False, "status")
+
+    def test_status_and_logs_accept_a_named_app_and_keep_status_json_shape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": {"commit": "a" * 40, "artifact": "image:tag"},
+                "previous": None, "unfinished_transaction": None, "running": True,
+            }}
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)) as status_call:
+                status = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm"],
+                                            env=self.env(config))
+            self.assertEqual(status.exit_code, 0, status.output)
+            self.assertIn("Target: orders on hetzner-vm", status.output)
+            self.assertIn("Outcome: running", status.output)
+            self.assertEqual(status_call.call_args.args[0].target, "ship-orders@host.example.com")
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)):
+                status_json = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm", "--json"],
+                                                 env=self.env(config))
+            self.assertEqual(set(json.loads(status_json.stdout)), {"ok", "application"})
+            with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})) as logs_call:
+                logs = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm"], env=self.env(config))
+            self.assertEqual(logs.exit_code, 0, logs.output)
+            self.assertIn("Target: orders on hetzner-vm", logs.output)
+            self.assertIn("one", logs.output)
+            self.assertEqual(logs_call.call_args.args[0].target, "ship-orders@host.example.com")
+            with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})):
+                logs_json = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--json"],
+                                               env=self.env(config))
+            self.assertEqual(set(json.loads(logs_json.stdout)), {"ok", "logs"})
+
+    def test_status_explains_an_observed_unfinished_transaction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": {"request_id": "req-1", "phase": "prepared"}, "running": None,
+            }}
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)):
+                result = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: recovery required", result.output)
+        self.assertIn("unfinished deployment transaction", result.output)
+        self.assertIn("shiplord recover", result.output)
+
+    def test_logs_without_a_manifest_explains_named_app_and_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = Path.cwd()
+            try:
+                os.chdir(temp)
+                result = CliRunner().invoke(cli.app, ["logs", "--json"], env=self.env(Path(temp) / "config"))
+            finally:
+                os.chdir(current)
+        self.assertEqual(result.exit_code, 2)
+        message = json.loads(result.stdout)["error"]
+        self.assertIn("shiplord logs <app> --server <alias>", message)
+        self.assertIn("shiplord apps", message)
+
+    def test_help_groups_commands_and_orders_the_quick_start(self):
+        result = CliRunner().invoke(cli.app, ["--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        quick = result.output.index("Quick start")
+        setup = result.output.index("Setup")
+        troubleshooting = result.output.index("Troubleshooting")
+        administration = result.output.index("Administration")
+        self.assertLess(quick, setup)
+        self.assertLess(setup, troubleshooting)
+        self.assertLess(troubleshooting, administration)
+        commands = re.findall(r"│\s*(apps|status|logs|plan|deploy)\s{2,}", result.output)
+        self.assertEqual(commands, ["apps", "status", "logs", "plan", "deploy"])
+        deploy_help = CliRunner().invoke(cli.app, ["deploy", "--help"])
+        self.assertIn("Advanced options", deploy_help.output)
+        self.assertIn("--allow-older", deploy_help.output)
+
+    def test_doctor_reports_client_path_and_helper_version(self):
+        local = CliRunner().invoke(cli.app, ["doctor", "--local", "--json"])
+        local_data = json.loads(local.stdout)
+        self.assertEqual(local_data["client"]["version"], "0.2.0")
+        self.assertTrue(local_data["client"]["executable"])
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.2.0", "actions": ["status"]}):
+                server = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--json"], env=self.env(config))
+        server_data = json.loads(server.stdout)
+        self.assertEqual(server_data["helper_version"], "0.2.0")
+        self.assertEqual(server_data["client"]["version"], "0.2.0")

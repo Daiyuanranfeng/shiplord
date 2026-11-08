@@ -32,9 +32,10 @@ POLL_FAILURE_LIMIT = 5
 class ClientError(Exception):
     """A remote exchange failed; ``code`` is the CLI exit status."""
 
-    def __init__(self, message: str, code: int = 1):
+    def __init__(self, message: str, code: int = 1, *, error_code: str | None = None):
         super().__init__(message)
         self.code = code
+        self.error_code = error_code
 
 
 def run_ssh(command: list[str], payload: bytes, timeout: float) -> tuple[bytes, bytes, int]:
@@ -204,7 +205,7 @@ def submit_and_wait(client: HelperClient, action: str, *, request_id: str, commi
 class AdminClient:
     """Calls the root-only admin entry point through the administrator's own sudo."""
 
-    def __init__(self, server_target: str, prompt: Callable[[str], str] = getpass.getpass, runner: Runner = run_ssh):
+    def __init__(self, server_target: str, prompt: Callable[[str], str] | None = None, runner: Runner = run_ssh):
         self.target, self.prompt, self.runner = server_target, prompt, runner
 
     def _sudo(self, argv: list[str], payload: bytes, timeout: float) -> tuple[bytes, bytes, int]:
@@ -212,6 +213,9 @@ class AdminClient:
         stdout, stderr, status = self.runner(command(["sudo", "-n"]), payload, timeout)
         needs_password = b"a password is required" in stderr
         if status != 0 and needs_password and not stdout:
+            if self.prompt is None:
+                raise ClientError("sudo authorization is required; run this command from a terminal or configure "
+                                  "passwordless sudo", 3, error_code="authorization_required")
             password = self.prompt(f"sudo password for {self.target}: ")
             stdout, stderr, status = self.runner(command(["sudo", "-S", "-p", ""]), password.encode() + b"\n" + payload,
                                                  timeout)

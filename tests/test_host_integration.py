@@ -148,6 +148,15 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertFalse(any(again["created"].values()), again)
         self.assertEqual(again["host_port"], self.provisioned["host_port"])
 
+    def test_admin_apps_inventory_reports_registered_release_state(self):
+        result = self.admin("apps", None, {})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["applications"], [{
+            "application": "orders", "domain": "orders.example.com", "runtime": "docker",
+            "host_port": self.provisioned["host_port"], "release_recorded": False,
+            "unfinished_transaction": None, "ok": True,
+        }])
+
     def test_forced_command_reaches_the_privileged_helper_for_its_own_application(self):
         result = self.login("/usr/local/libexec/shiplord-dispatch", stdin=capabilities_frame("orders"))
         self.assertEqual(result.returncode, 0, result.stderr)
