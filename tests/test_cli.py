@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import tempfile
 import unittest
@@ -555,8 +554,10 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertLess(quick, setup)
         self.assertLess(setup, troubleshooting)
         self.assertLess(troubleshooting, administration)
-        commands = re.findall(r"│\s*(apps|status|logs|plan|deploy)\s{2,}", result.output)
-        self.assertEqual(commands, ["apps", "status", "logs", "plan", "deploy"])
+        quick_help = result.output[quick:setup]
+        positions = [quick_help.find(name + " ") for name in ("apps", "status", "logs", "plan", "deploy")]
+        self.assertTrue(all(position >= 0 for position in positions), result.output)
+        self.assertEqual(positions, sorted(positions), result.output)
         deploy_help = CliRunner().invoke(cli.app, ["deploy", "--help"])
         self.assertIn("Advanced options", deploy_help.output)
         self.assertIn("--allow-older", deploy_help.output)
