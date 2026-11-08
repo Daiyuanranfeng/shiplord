@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -545,22 +546,24 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertIn("shiplord apps", message)
 
     def test_help_groups_commands_and_orders_the_quick_start(self):
-        result = CliRunner().invoke(cli.app, ["--help"])
+        result = CliRunner().invoke(cli.app, ["--help"], color=True)
         self.assertEqual(result.exit_code, 0, result.output)
-        quick = result.output.index("Quick start")
-        setup = result.output.index("Setup")
-        troubleshooting = result.output.index("Troubleshooting")
-        administration = result.output.index("Administration")
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        quick = output.index("Quick start")
+        setup = output.index("Setup")
+        troubleshooting = output.index("Troubleshooting")
+        administration = output.index("Administration")
         self.assertLess(quick, setup)
         self.assertLess(setup, troubleshooting)
         self.assertLess(troubleshooting, administration)
-        quick_help = result.output[quick:setup]
+        quick_help = output[quick:setup]
         positions = [quick_help.find(name + " ") for name in ("apps", "status", "logs", "plan", "deploy")]
-        self.assertTrue(all(position >= 0 for position in positions), result.output)
-        self.assertEqual(positions, sorted(positions), result.output)
-        deploy_help = CliRunner().invoke(cli.app, ["deploy", "--help"])
-        self.assertIn("Advanced options", deploy_help.output)
-        self.assertIn("--allow-older", deploy_help.output)
+        self.assertTrue(all(position >= 0 for position in positions), output)
+        self.assertEqual(positions, sorted(positions), output)
+        deploy_help = CliRunner().invoke(cli.app, ["deploy", "--help"], color=True)
+        deploy_output = re.sub(r"\x1b\[[0-9;]*m", "", deploy_help.output)
+        self.assertIn("Advanced options", deploy_output)
+        self.assertIn("--allow-older", deploy_output)
 
     def test_doctor_reports_client_path_and_helper_version(self):
         local = CliRunner().invoke(cli.app, ["doctor", "--local", "--json"])
