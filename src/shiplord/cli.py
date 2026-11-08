@@ -362,9 +362,9 @@ def _app_helper(application: str, server_target: str | None, *, json_output: boo
     if pinned:
         target = validate_target(pinned)
         if target.split("@", 1)[0] != deployment_user(application):
-            raise CommandError("SHIPLORD_SSH_TARGET does not match the selected application's deployment account")
+            raise CommandError("SHIPLORD_SSH_TARGET does not match the selected application's deployment account", 3)
         if server_target is not None and target.split("@", 1)[1] != server_target.split("@", 1)[1]:
-            raise CommandError("SHIPLORD_SSH_TARGET does not match the selected server")
+            raise CommandError("SHIPLORD_SSH_TARGET does not match the selected server", 3)
         return HelperClient(application, target, ssh_options=options, explicit_target=True)
     if server_target is None:
         raise CommandError("a registered server is required; run `shiplord apps` to discover servers", 3)

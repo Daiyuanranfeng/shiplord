@@ -483,8 +483,9 @@ class CLIInventoryTests(unittest.TestCase):
             self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
             env = dict(self.env(config), SHIPLORD_SSH_TARGET="ship-billing@host.example.com")
             with patch.dict(os.environ, env, clear=True):
-                with self.assertRaises(CommandError):
+                with self.assertRaises(CommandError) as caught:
                     cli._app_context("orders", "hetzner-vm", False, "status")
+        self.assertEqual(caught.exception.code, 3)
 
     def test_status_and_logs_accept_a_named_app_and_keep_status_json_shape(self):
         with tempfile.TemporaryDirectory() as temp:
