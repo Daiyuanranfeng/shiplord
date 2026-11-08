@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Detect helpers older than 0.2.0 before requesting app inventory and show the
+  bootstrap command. For this confirmed incompatibility, `shiplord apps` now
+  returns exit code 4 and `helper_upgrade_required` instead of exit code 2 and
+  `invalid_request`. Update scripts that match the previous values.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

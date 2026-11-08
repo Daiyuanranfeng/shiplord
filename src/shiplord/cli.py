@@ -91,7 +91,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
         results = []
         for entry in servers:
             try:
-                code, inventory = commands.server_applications(_admin_target(entry["ssh"], json_output))
+                code, inventory = _server_inventory(entry, json_output)
                 results.append({"server": entry["alias"], **inventory})
                 if code:
                     results[-1]["ok"] = False
@@ -110,7 +110,10 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
         else:
             for result in results:
                 typer.echo(f"Server: {result['server']}  Outcome: {'partial' if not result['ok'] else 'complete'}")
-                _render_apps(result.get("applications", []), result.get("error"))
+                if result.get("error_code") == "helper_upgrade_required":
+                    typer.echo(_upgrade_message(result))
+                else:
+                    _render_apps(result.get("applications", []), result.get("error"))
             if invalid:
                 typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
         if partial:
@@ -130,7 +133,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
             _fail(f"Server {server!r} is not registered. Registered aliases: " + (", ".join(aliases) or "none"),
                   3, json_output, aliases=aliases)
     try:
-        code, inventory = commands.server_applications(_admin_target(selected["ssh"], json_output))
+        code, inventory = _server_inventory(selected, json_output)
     except (CommandError, ClientError, ManifestError, ServerError) as error:
         _fail(_inventory_error(error, selected["alias"]), getattr(error, "code", 3), json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
@@ -139,6 +142,8 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
         payload["invalid_entries"] = invalid
     if json_output:
         _emit(payload, True)
+    elif inventory.get("error_code") == "helper_upgrade_required":
+        typer.echo(_upgrade_message(payload))
     else:
         typer.echo(f"Server: {selected['alias']}  Outcome: {'complete' if inventory['ok'] else 'incomplete'}")
         _render_apps(inventory.get("applications", []), inventory.get("error"))
@@ -146,6 +151,30 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
             typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
     if code:
         raise typer.Exit(code)
+
+
+def _server_inventory(server: dict, json_output: bool) -> tuple[int, dict]:
+    """Reject confirmed old helpers before attempting the privileged request."""
+    try:
+        response = probe_capabilities(server["ssh"], timeout=5)
+        version = response.get("helper_version")
+    except (TransportError, IncompatibleProtocol, ServerError):
+        version = None
+    # Only stable SemVer releases have an unambiguous compatibility ordering.
+    stable_version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    match = re.fullmatch(stable_version, version) if isinstance(version, str) else None
+    if match and tuple(map(int, match.groups())) < (0, 2, 0):
+        return 4, {"ok": False, "error": "App inventory requires helper 0.2.0 or later.",
+                   "error_code": "helper_upgrade_required", "helper_version": version,
+                   "minimum_helper_version": "0.2.0", "upgrade_command": f"shiplord server bootstrap {server['alias']}"}
+    prompt = None if json_output else _interactive_admin_prompt(False)
+    return commands.server_applications(AdminClient(server["ssh"], prompt=prompt))
+
+
+def _upgrade_message(result: dict) -> str:
+    alias = result["server"]
+    return (f"`{alias}` is running helper {result['helper_version']}. {result['error']} "
+            f"Run `{result['upgrade_command']}`, then retry `shiplord apps {alias}`.")
 
 
 def _inventory_error(error: Exception, alias: str) -> str:

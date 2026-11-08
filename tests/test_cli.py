@@ -390,6 +390,77 @@ class CLIInventoryTests(unittest.TestCase):
         "release_recorded": True, "unfinished_transaction": None, "ok": True,
     }]}
 
+    def setUp(self):
+        probe = patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.2.0"})
+        probe.start()
+        self.addCleanup(probe.stop)
+
+    def test_confirmed_old_helper_reports_upgrade_without_admin_or_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.1.0"}) as probe, \
+                 patch("shiplord.cli.commands.server_applications") as inventory, \
+                 patch("shiplord.cli.bootstrap_server") as bootstrap:
+                result = CliRunner().invoke(cli.app, ["apps", "hetzner-vm", "--json"], env=self.env(config))
+                text_result = CliRunner().invoke(cli.app, ["apps", "hetzner-vm"], env=self.env(config))
+            self.assertEqual(result.exit_code, 4, result.output)
+            self.assertEqual(json.loads(result.stdout), {
+                "ok": False, "server": "hetzner-vm", "error": "App inventory requires helper 0.2.0 or later.",
+                "error_code": "helper_upgrade_required", "helper_version": "0.1.0",
+                "minimum_helper_version": "0.2.0", "upgrade_command": "shiplord server bootstrap hetzner-vm"})
+            self.assertEqual(text_result.exit_code, 4)
+            self.assertIn("`hetzner-vm` is running helper 0.1.0. App inventory requires helper 0.2.0 or later. "
+                          "Run `shiplord server bootstrap hetzner-vm`, then retry `shiplord apps hetzner-vm`.", text_result.stdout)
+            self.assertEqual(probe.call_count, 2)
+            probe.assert_called_with("admin@host.example.com", timeout=5)
+            inventory.assert_not_called()
+            bootstrap.assert_not_called()
+
+    def test_inventory_falls_back_for_inconclusive_probes_and_accepts_new_helpers(self):
+        from shiplord.transport import TransportError
+        from shiplord.protocol import IncompatibleProtocol
+
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            for probe_result in ({"helper_version": "0.2.0"}, {"helper_version": "1.10.0"},
+                                 {"helper_version": "0.1.0-rc.1"}, {"helper_version": "unknown"},
+                                 TransportError("timed out"), IncompatibleProtocol("incompatible")):
+                with self.subTest(probe=probe_result):
+                    kwargs = {"side_effect": probe_result} if isinstance(probe_result, Exception) else {"return_value": probe_result}
+                    with patch("shiplord.cli.probe_capabilities", **kwargs) as probe, \
+                         patch("shiplord.cli.sys.stdin.isatty", return_value=True), \
+                         patch("shiplord.cli.sys.stderr.isatty", return_value=True), \
+                         patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)) as inventory:
+                        result = CliRunner().invoke(cli.app, ["apps", "alpha", "--json"], env=self.env(config))
+                    self.assertEqual(result.exit_code, 0, result.output)
+                    self.assertEqual(json.loads(result.stdout)["applications"], self.inventory["applications"])
+                    probe.assert_called_once_with("admin@alpha.example.com", timeout=5)
+                    self.assertIsNone(inventory.call_args.args[0].prompt)
+            with patch("shiplord.cli.probe_capabilities", side_effect=TransportError("timed out")), \
+                 patch("shiplord.cli.commands.server_applications", side_effect=ClientError("invalid request", 2, error_code="invalid_request")):
+                result = CliRunner().invoke(cli.app, ["apps", "alpha", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 2)
+            self.assertEqual(json.loads(result.stdout)["error_code"], "invalid_request")
+
+    def test_all_servers_collects_old_and_current_helper_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+            def probe(target, timeout):
+                return {"helper_version": "0.1.0" if target.startswith("admin@alpha") else "0.2.0"}
+            with patch("shiplord.cli.probe_capabilities", side_effect=probe) as probes, \
+                 patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)) as inventory:
+                result = CliRunner().invoke(cli.app, ["apps", "--all-servers", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 3, result.output)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["partial"])
+            self.assertEqual(data["servers"][0]["error_code"], "helper_upgrade_required")
+            self.assertEqual(data["servers"][1]["applications"], self.inventory["applications"])
+            self.assertEqual(probes.call_count, 2)
+            self.assertEqual(inventory.call_count, 1)
+
     def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
         directory = config / "shiplord" / "servers"
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)

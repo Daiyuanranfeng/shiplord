@@ -207,6 +207,22 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.2.0")
         self.assertEqual(list(Path("/tmp").glob("shiplord-install.*")), [])  # the upload was removed
 
+    def test_02a_inventory_checks_reported_helper_version_over_ssh(self):
+        # Simulate a legacy helper's capabilities response without changing the CLI.
+        version_file = Path("/usr/local/lib/shiplord/current/shiplord/__init__.py")
+        original = version_file.read_text()
+        try:
+            version_file.write_text(original.replace('"0.2.0"', '"0.1.0"'))
+            self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.1.0")
+            old = self.cli_json("apps", "production", check=4)
+            self.assertEqual(old["error_code"], "helper_upgrade_required")
+            self.assertEqual(old["upgrade_command"], "shiplord server bootstrap production")
+        finally:
+            version_file.write_text(original)
+        current = self.cli_json("apps", "production")
+        self.assertTrue(current["ok"], current)
+        self.assertEqual(current["applications"], [])
+
     def test_03_configure_and_provision(self):
         self.cli("configure", "--name", self.app, "--server", "production", "--api-domain", "fixture.example.test",
                  "--frontend", "https://app.example.test", check=0)
