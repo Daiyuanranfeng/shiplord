@@ -204,7 +204,7 @@ else: sys.exit("unsupported: " + " ".join(args))
         second = self.cli_json("server", "bootstrap", "production")
         self.assertFalse(any(second["changed"].values()), second)
         self.assertEqual(second["version"], first["version"])
-        self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.1.0")
+        self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.2.0")
         self.assertEqual(list(Path("/tmp").glob("shiplord-install.*")), [])  # the upload was removed
 
     def test_03_configure_and_provision(self):

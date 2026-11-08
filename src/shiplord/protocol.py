@@ -11,8 +11,9 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 _IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ACTIONS = {"capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"}
-ADMIN_ACTIONS = {"provision", "keys", "environment", "registry", "deprovision", "doctor"}
+ADMIN_ACTIONS = {"provision", "keys", "environment", "registry", "deprovision", "doctor", "apps"}
 HOSTWIDE_ACTIONS = {"capabilities", "doctor"}  # requests that name no application
+ADMIN_HOSTWIDE_ACTIONS = {"doctor", "apps"}
 
 
 class ProtocolError(ValueError):
@@ -47,7 +48,8 @@ def validate_request(message: object, *, require_compatible: bool = True,
         raise ProtocolError("incompatible protocol version")
     for field in ("request_id", "application_id"):
         value = message[field]
-        if field == "application_id" and value is None and message.get("action") in HOSTWIDE_ACTIONS:
+        if (field == "application_id" and value is None
+                and message.get("action") in HOSTWIDE_ACTIONS | ADMIN_HOSTWIDE_ACTIONS):
             continue
         if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
             raise ProtocolError(f"invalid {field}")

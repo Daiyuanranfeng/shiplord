@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
+### Added
+
+- Add server application inventory with partial all-server results.
+- Add named application targets for status and logs.
+- Group command help and render concise inventory, release, and doctor output.
+- Add actionable recovery and server authorization errors.
+- Report client executable and helper versions in diagnostics.
+
+### Changed
+
+- Publish the CLI and server helper as version 0.2.0.
+
 ## [0.1.0] - 2026-11-06
 
 ### Added
@@ -23,5 +37,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Generate valid GitHub Actions branch expressions for release workflows.
 
-[Unreleased]: https://github.com/QueryPlanner/shiplord/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/QueryPlanner/shiplord/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/QueryPlanner/shiplord/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/QueryPlanner/shiplord/releases/tag/v0.1.0

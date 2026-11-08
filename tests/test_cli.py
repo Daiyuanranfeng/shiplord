@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from typer.testing import CliRunner
+
+from shiplord import cli
+from shiplord.client import ClientError
+from shiplord.commands import CommandError
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.manifest import ManifestError, load_manifest
 
@@ -365,13 +372,347 @@ class CLITests(unittest.TestCase):
             env = dict(os.environ, PATH=directory)
             result = self.invoke(directory, "doctor", "--local", env=env)
         self.assertEqual(result.returncode, 3)
-        self.assertIn('"ssh": false', result.stdout)
+        self.assertIn("ssh: missing", result.stdout)
 
     def test_version_and_help_use_shiplord(self):
         with tempfile.TemporaryDirectory() as directory:
             version = self.invoke(directory, "--version")
             help_result = self.invoke(directory, "--help")
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout.strip(), "shiplord 0.1.0")
+        self.assertEqual(version.stdout.strip(), "shiplord 0.2.0")
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("shiplord", help_result.stdout.lower())
+
+
+class CLIInventoryTests(unittest.TestCase):
+    inventory = {"ok": True, "applications": [{
+        "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,
+        "release_recorded": True, "unfinished_transaction": None, "ok": True,
+    }]}
+
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def env(self, config: Path) -> dict[str, str]:
+        return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+    def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            runner = CliRunner()
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)) as inventory:
+                result = runner.invoke(cli.app, ["apps"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Server: hetzner-vm", result.output)
+            self.assertIn("orders.example.com", result.output)
+            self.assertNotIn("23001", result.output)
+            self.assertEqual(inventory.call_args.args[0].target, "admin@host.example.com")
+
+    def test_apps_json_keeps_host_port_and_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)):
+                result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["server"], "hetzner-vm")
+        self.assertEqual(data["applications"][0]["host_port"], 23001)
+
+    def test_apps_lists_aliases_when_server_selection_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+            result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(json.loads(result.stdout)["aliases"], ["alpha", "beta"])
+
+    def test_apps_reports_unattended_sudo_authorization_as_structured_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.commands.server_applications",
+                       side_effect=ClientError("sudo authorization is required", 3,
+                                               error_code="authorization_required")):
+                result = CliRunner().invoke(cli.app, ["apps", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(json.loads(result.stdout)["error_code"], "authorization_required")
+
+    def test_all_servers_marks_unreachable_aliases_as_partial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+
+            def inventory(admin):
+                if admin.target.startswith("admin@beta"):
+                    raise ClientError("the SSH exchange timed out", 3)
+                return 0, self.inventory
+
+            with patch("shiplord.cli.commands.server_applications", side_effect=inventory):
+                result = CliRunner().invoke(cli.app, ["apps", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["partial"])
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta"])
+        self.assertFalse(data["servers"][1]["ok"])
+
+    def test_inventory_reports_invalid_records_and_unreadable_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            bad = config / "shiplord" / "servers" / "bad.json"
+            bad.write_text("invalid")
+            bad.chmod(0o600)
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)):
+                result = CliRunner().invoke(cli.app, ["apps", "--all-servers", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 3)
+            self.assertTrue(json.loads(result.stdout)["partial"])
+            for inventory in ({"ok": False, "applications": [], "error": "application registry is unreadable"},
+                              {"ok": False, "applications": [{**self.inventory["applications"][0], "ok": False,
+                               "release_recorded": None, "error": "application state is unreadable"}]}):
+                with patch("shiplord.cli.commands.server_applications", return_value=(3, inventory)):
+                    result = CliRunner().invoke(cli.app, ["apps", "alpha"], env=self.env(config))
+                self.assertIn("unreadable", result.stdout)
+                self.assertNotIn("No applications registered", result.stdout)
+                if inventory["applications"]:
+                    self.assertIn("unknown", result.stdout)
+
+    def test_old_helper_inventory_rejection_gives_upgrade_guidance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.commands.server_applications", side_effect=ClientError("invalid request", 2, error_code="invalid_request")):
+                for args in (["apps", "alpha", "--json"], ["apps", "--all-servers", "--json"]):
+                    result = CliRunner().invoke(cli.app, args, env=self.env(config))
+                    self.assertIn("doctor --server alpha --deep", result.stdout)
+                    self.assertIn("server bootstrap alpha", result.stdout)
+
+    def test_interactive_json_can_prompt_for_sudo(self):
+        with patch("shiplord.cli.sys.stdin.isatty", return_value=True), patch("shiplord.cli.sys.stderr.isatty", return_value=True):
+            self.assertIsNotNone(cli._interactive_admin_prompt(True))
+
+    def test_deployment_displays_release_and_warnings(self):
+        result = {"ok": True, "status": "succeeded", "release": {"commit": "abc", "artifact": "image:tag"},
+                  "probes": {"warning": "routing unverified"}, "warnings": ["cleanup failed"]}
+        output = self.invoke_deploy(0, result)
+        for value in ("abc", "image:tag", "routing unverified", "cleanup failed"):
+            self.assertIn(value, output.stdout)
+
+    def test_named_app_uses_app_scoped_ssh_and_requires_a_server_when_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch.dict(os.environ, self.env(config), clear=True):
+                application, alias, client = cli._app_context("orders", None, False, "status")
+            self.assertEqual((application, alias, client.target), ("orders", "hetzner-vm", "ship-orders@host.example.com"))
+            self.write_servers(config, ("second", "admin@second.example.com"))
+            with patch.dict(os.environ, self.env(config), clear=True):
+                ambiguous = CliRunner().invoke(cli.app, ["status", "orders", "--json"])
+            self.assertEqual(ambiguous.exit_code, 3)
+            self.assertEqual(json.loads(ambiguous.stdout)["aliases"], ["hetzner-vm", "second"])
+
+    def test_named_app_rejects_an_environment_target_for_a_different_app(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            env = dict(self.env(config), SHIPLORD_SSH_TARGET="ship-billing@host.example.com")
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(CommandError) as caught:
+                    cli._app_context("orders", "hetzner-vm", False, "status")
+        self.assertEqual(caught.exception.code, 3)
+
+    def test_status_and_logs_accept_a_named_app_and_keep_status_json_shape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": {"commit": "a" * 40, "artifact": "image:tag"},
+                "previous": None, "unfinished_transaction": None, "running": True,
+            }}
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)) as status_call:
+                status = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm"],
+                                            env=self.env(config))
+            self.assertEqual(status.exit_code, 0, status.output)
+            self.assertIn("Target: orders on hetzner-vm", status.output)
+            self.assertIn("Outcome: running", status.output)
+            self.assertEqual(status_call.call_args.args[0].target, "ship-orders@host.example.com")
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)):
+                status_json = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm", "--json"],
+                                                 env=self.env(config))
+            self.assertEqual(set(json.loads(status_json.stdout)), {"ok", "application"})
+            with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})) as logs_call:
+                logs = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm"], env=self.env(config))
+            self.assertEqual(logs.exit_code, 0, logs.output)
+            self.assertEqual(logs.stdout, "one\n")
+            self.assertIn("Target: orders on hetzner-vm", logs.stderr)
+            self.assertIn("one", logs.output)
+            self.assertEqual(logs_call.call_args.args[0].target, "ship-orders@host.example.com")
+            with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})):
+                logs_json = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--json"],
+                                               env=self.env(config))
+            self.assertEqual(set(json.loads(logs_json.stdout)), {"ok", "logs"})
+
+    def test_status_explains_an_observed_unfinished_transaction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": {"request_id": "req-1", "phase": "prepared"}, "running": None,
+            }}
+            with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)):
+                result = CliRunner().invoke(cli.app, ["status", "orders", "--server", "hetzner-vm"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: recovery required", result.output)
+        self.assertIn("unfinished deployment transaction", result.output)
+        self.assertIn("shiplord recover", result.output)
+
+    def invoke_remote_plan(self, plan_result: dict, *, as_json: bool = False):
+        arguments = ["plan", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.validate_deploy_inputs"), \
+                patch("shiplord.cli.commands.commit_sequence", return_value=1001), \
+                patch("shiplord.cli.commands.plan_application", return_value=(0, plan_result)):
+            return CliRunner().invoke(cli.app, arguments)
+
+    def invoke_deploy(self, code: int, deploy_result: dict, *, as_json: bool = False):
+        arguments = ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.validate_deploy_inputs"), \
+                patch("shiplord.cli.commands.commit_sequence", return_value=1001), \
+                patch("shiplord.cli.commands.deploy_application", return_value=(code, deploy_result)):
+            return CliRunner().invoke(cli.app, arguments)
+
+    def test_plan_renders_release_route_storage_and_shutdown_changes(self):
+        plan_result = {
+            "ok": True, "scope": "server plan; nothing was changed", "action": "deploy",
+            "candidate": {"commit": "a" * 40, "sequence": 1001, "release_id": "candidate",
+                          "artifact": "ghcr.io/example/orders@sha256:" + "a" * 64},
+            "current": {"commit": "b" * 40, "sequence": 1000, "release_id": "current",
+                        "artifact": "ghcr.io/example/orders@sha256:" + "b" * 64},
+            "restarts_application": True, "route_change": "replace", "domain": "orders.example.com",
+            "storage": {"current_path": "/app/src/.adk", "candidate_path": "/data", "same_volume": True,
+                        "note": "the same volume is mounted at the candidate path; no files are moved"},
+            "shutdown": {"outgoing_policy": {"timeout_seconds": 10, "action": "fail"},
+                         "candidate_policy": {"timeout_seconds": 60, "action": "force"},
+                         "note": "the outgoing container policy governs its stop"},
+        }
+        result = self.invoke_remote_plan(plan_result)
+        self.assertEqual(result.exit_code, 0, result.output)
+        lines = result.output.splitlines()
+        self.assertEqual(lines[:2], ["Target: orders on hetzner-vm", "Outcome: ready"])
+        self.assertIn("Plan action: deploy", result.output)
+        self.assertIn("Current release: bbbbbbbbbbbb", result.output)
+        self.assertIn("Candidate release: aaaaaaaaaaaa", result.output)
+        self.assertIn("sequence 1001", result.output)
+        self.assertIn("Restarts application: yes", result.output)
+        self.assertIn("Route change: replace", result.output)
+        self.assertIn("Storage path: /app/src/.adk to /data", result.output)
+        self.assertIn("Application volume reused: yes", result.output)
+        self.assertIn("no files are moved", result.output)
+        self.assertIn("Outgoing shutdown policy: 10 seconds, fail", result.output)
+        self.assertIn("Candidate shutdown policy: 60 seconds, force", result.output)
+        json_result = self.invoke_remote_plan(plan_result, as_json=True)
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        self.assertEqual(json.loads(json_result.stdout), plan_result)
+
+    def test_plan_renderer_handles_unchanged_and_refused_responses(self):
+        unchanged = {"ok": True, "action": "unchanged",
+                     "current": {"commit": "a" * 40, "sequence": 1001, "artifact": "image:sha256"},
+                     "candidate": {"commit": "a" * 40, "sequence": 1001, "artifact": "image:sha256"}}
+        result = self.invoke_remote_plan(unchanged)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: no changes required", result.output)
+        self.assertNotIn("Route change:", result.output)
+        self.assertNotIn("Restarts application:", result.output)
+
+        refused = {"ok": True, "action": "none", "reason": "failed", "error": "recovery_required",
+                   "message": "an unfinished transaction exists; run recover first"}
+        result = self.invoke_remote_plan(refused)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: recovery required", result.output)
+        self.assertIn("Reason: recovery required", result.output)
+        self.assertIn("shiplord recover", result.output)
+
+    def test_deploy_shows_public_https_failures_without_changing_json_or_exit_codes(self):
+        dns_failure = {"ok": True, "request_id": "req-1", "status": "succeeded", "exit_code": 0,
+                       "release": {"commit": "b" * 40}, "url": "https://orders.example.com",
+                       "public": {"ok": False, "status": None, "error": "dns_unresolved"}}
+        result = self.invoke_deploy(0, dns_failure)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.splitlines()[:2], [
+            "Target: orders on hetzner-vm", "Outcome: deployed; public HTTPS check failed",
+        ])
+        self.assertIn("Public HTTPS: failed (dns unresolved)", result.output)
+        json_result = self.invoke_deploy(0, dns_failure, as_json=True)
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        self.assertEqual(json.loads(json_result.stdout), dns_failure)
+
+        required_failure = {**dns_failure, "ok": False, "exit_code": 1,
+                            "error": "the deployment is live on the server, but the public HTTPS check failed",
+                            "public": {"ok": False, "status": 503, "error": "unexpected_status"}}
+        result = self.invoke_deploy(1, required_failure)
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Public HTTPS: failed (HTTP 503; unexpected status)", result.output)
+        self.assertIn("Error: the deployment is live on the server", result.output)
+
+    def test_logs_without_a_manifest_explains_named_app_and_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = Path.cwd()
+            try:
+                os.chdir(temp)
+                result = CliRunner().invoke(cli.app, ["logs", "--json"], env=self.env(Path(temp) / "config"))
+            finally:
+                os.chdir(current)
+        self.assertEqual(result.exit_code, 2)
+        message = json.loads(result.stdout)["error"]
+        self.assertIn("shiplord logs <app> --server <alias>", message)
+        self.assertIn("shiplord apps", message)
+
+    def test_help_groups_commands_and_orders_the_quick_start(self):
+        result = CliRunner().invoke(cli.app, ["--help"], color=True)
+        self.assertEqual(result.exit_code, 0, result.output)
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        quick = output.index("Quick start")
+        setup = output.index("Setup")
+        troubleshooting = output.index("Troubleshooting")
+        administration = output.index("Administration")
+        self.assertLess(quick, setup)
+        self.assertLess(setup, troubleshooting)
+        self.assertLess(troubleshooting, administration)
+        quick_help = output[quick:setup]
+        positions = [quick_help.find(name + " ") for name in ("apps", "status", "logs", "plan", "deploy")]
+        self.assertTrue(all(position >= 0 for position in positions), output)
+        self.assertEqual(positions, sorted(positions), output)
+        deploy_help = CliRunner().invoke(cli.app, ["deploy", "--help"], color=True)
+        deploy_output = re.sub(r"\x1b\[[0-9;]*m", "", deploy_help.output)
+        self.assertIn("Advanced options", deploy_output)
+        self.assertIn("--allow-older", deploy_output)
+
+    def test_doctor_reports_client_path_and_helper_version(self):
+        local = CliRunner().invoke(cli.app, ["doctor", "--local", "--json"])
+        local_data = json.loads(local.stdout)
+        self.assertEqual(local_data["client"]["version"], "0.2.0")
+        self.assertTrue(local_data["client"]["executable"])
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.2.0", "actions": ["status"]}):
+                server = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--json"], env=self.env(config))
+        server_data = json.loads(server.stdout)
+        self.assertEqual(server_data["helper_version"], "0.2.0")
+        self.assertEqual(server_data["client"]["version"], "0.2.0")

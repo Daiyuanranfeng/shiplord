@@ -205,6 +205,15 @@ class AdminClientTests(unittest.TestCase):
             self.assertNotIn("hunter2", " ".join(command))
         self.assertEqual(read_frame(io.BytesIO(second_payload[len(b"hunter2\n"):]))["action"], "keys")
 
+    def test_noninteractive_sudo_failure_returns_authorization_code_without_prompting(self):
+        ssh = FakeSsh((b"", b"sudo: a password is required\n", 1))
+        client = AdminClient("appuser@server", runner=ssh)
+        with self.assertRaises(ClientError) as caught:
+            client.call("keys", "orders", {})
+        self.assertEqual((caught.exception.code, caught.exception.error_code), (3, "authorization_required"))
+        self.assertEqual(len(ssh.calls), 1)
+        self.assertIn("authorization", str(caught.exception))
+
     def test_a_rejected_password_or_sudo_failure_is_reported_without_echoing_the_password(self):
         ssh = FakeSsh((b"", b"sudo: a password is required\n", 1), (b"", b"Sorry, try again.\n", 1))
         with self.assertRaises(ClientError) as caught:

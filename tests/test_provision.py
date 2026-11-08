@@ -9,11 +9,13 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shiplord.admin import parse_request, run, serve
 from shiplord.framing import read_frame, write_frame
 from shiplord.layout import Layout
 from shiplord.protocol import ProtocolError
+from shiplord.registry import Registry
 from shiplord.provision import ProvisionError, deprovision, manage_environment, manage_key, manage_registry, provision
 from shiplord.release_state import HostLock, ReleaseState
 from shiplord.system import CommandResult
@@ -102,7 +104,12 @@ class ProvisionTestCase(unittest.TestCase):
         arguments = {"application_id": app, "runtime": "docker", "api_domain": f"{app}.example.com",
                      "image_repository": f"ghcr.io/example/{app}", "public_key": ed25519(1), "key_label": "laptop"}
         arguments.update(changes)
-        with self.lock.acquire():
+        register = Registry.register
+
+        def register_with_free_fixture_ports(registry, *args, **kwargs):
+            return register(registry, *args, probe=lambda _port: True, **kwargs)
+
+        with self.lock.acquire(), patch.object(Registry, "register", register_with_free_fixture_ports):
             return provision(self.layout, self.system, self.lock, **arguments)
 
     def snapshot(self):

@@ -345,3 +345,9 @@ def server_doctor(admin: AdminClient) -> tuple[int, dict]:
     """Deep server health: helper, Caddy wiring, sshd confinement, Docker, disk, and each application's state."""
     result = admin.call("doctor", None, {})
     return (0 if result["ok"] else 3), {"ok": result["ok"], "scope": "server health (read-only)", "checks": result["checks"]}
+
+
+def server_applications(admin: AdminClient) -> tuple[int, dict]:
+    """Read the registered applications from the server's root-only inventory."""
+    result = admin.call("apps", None, {})
+    return (0 if result["ok"] else 3), result

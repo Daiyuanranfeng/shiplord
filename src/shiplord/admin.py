@@ -16,7 +16,7 @@ from .framing import read_frame, write_frame
 from .layout import Layout
 from .manifest import ManifestError
 from .protocol import ADMIN_ACTIONS, PROTOCOL_VERSION, ProtocolError, validate_request
-from .serverdoctor import server_doctor
+from .serverdoctor import application_inventory, server_doctor
 from .provision import ProvisionError, deprovision, manage_environment, manage_key, manage_registry, provision
 from .registry import Registry
 from .retire import make_retirer
@@ -31,7 +31,8 @@ class AdminDenied(Exception):
 
 def parse_request(message: object) -> dict:
     request = validate_request(message, require_compatible=False, actions=ADMIN_ACTIONS)
-    if request["commit"] is not None or (request["application_id"] is None) != (request["action"] == "doctor"):
+    hostwide = request["action"] in {"doctor", "apps"}
+    if request["commit"] is not None or (request["application_id"] is None) != hostwide:
         raise ProtocolError("invalid administration request")
     return request
 
@@ -56,6 +57,10 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         if args:
             raise ProtocolError("unknown arguments")
         return server_doctor(layout, system, lock)
+    if action == "apps":
+        if args:
+            raise ProtocolError("unknown arguments")
+        return application_inventory(layout, lock)
     allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb"},
                "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text"}, "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]

@@ -40,6 +40,40 @@ def _admin_api_reachable() -> bool:
         return False
 
 
+def application_inventory(layout: Layout, lock: HostLock) -> dict:
+    """List registered applications and their recorded release state, without contacting app runtimes."""
+    try:
+        descriptor = os.open(layout.registrations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            registrations = Registry(descriptor, lock).list()
+        finally:
+            os.close(descriptor)
+    except (OSError, StateError):
+        return {"ok": False, "applications": [], "error": "application registry is unreadable"}
+
+    applications = []
+    for registration in registrations:
+        app = registration["application_id"]
+        entry = {"application": app, "domain": registration["api_domain"], "runtime": registration["runtime"],
+                 "host_port": registration["host_port"], "release_recorded": None,
+                 "unfinished_transaction": None}
+        try:
+            state_fd = os.open(layout.app_state / app, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                store = ReleaseState(app, state_fd, lock)
+                state, journal = store.read_state(), store.read_journal()
+            finally:
+                os.close(state_fd)
+            entry["release_recorded"] = state["current"] is not None
+            entry["unfinished_transaction"] = (None if journal is None else
+                                                {"request_id": journal["request_id"], "phase": journal["phase"]})
+            entry["ok"] = True
+        except (OSError, StateError):
+            entry.update(ok=False, error="application state is unreadable")
+        applications.append(entry)
+    return {"ok": all(entry["ok"] for entry in applications), "applications": applications}
+
+
 def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
     checks: dict[str, dict] = {}
     current = layout.lib / "current"
