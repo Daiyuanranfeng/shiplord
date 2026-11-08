@@ -464,6 +464,48 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta"])
         self.assertFalse(data["servers"][1]["ok"])
 
+    def test_inventory_reports_invalid_records_and_unreadable_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            bad = config / "shiplord" / "servers" / "bad.json"
+            bad.write_text("invalid")
+            bad.chmod(0o600)
+            with patch("shiplord.cli.commands.server_applications", return_value=(0, self.inventory)):
+                result = CliRunner().invoke(cli.app, ["apps", "--all-servers", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 3)
+            self.assertTrue(json.loads(result.stdout)["partial"])
+            for inventory in ({"ok": False, "applications": [], "error": "application registry is unreadable"},
+                              {"ok": False, "applications": [{**self.inventory["applications"][0], "ok": False,
+                               "release_recorded": None, "error": "application state is unreadable"}]}):
+                with patch("shiplord.cli.commands.server_applications", return_value=(3, inventory)):
+                    result = CliRunner().invoke(cli.app, ["apps", "alpha"], env=self.env(config))
+                self.assertIn("unreadable", result.stdout)
+                self.assertNotIn("No applications registered", result.stdout)
+                if inventory["applications"]:
+                    self.assertIn("unknown", result.stdout)
+
+    def test_old_helper_inventory_rejection_gives_upgrade_guidance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.commands.server_applications", side_effect=ClientError("invalid request", 2, error_code="invalid_request")):
+                for args in (["apps", "alpha", "--json"], ["apps", "--all-servers", "--json"]):
+                    result = CliRunner().invoke(cli.app, args, env=self.env(config))
+                    self.assertIn("doctor --server alpha --deep", result.stdout)
+                    self.assertIn("server bootstrap alpha", result.stdout)
+
+    def test_interactive_json_can_prompt_for_sudo(self):
+        with patch("shiplord.cli.sys.stdin.isatty", return_value=True), patch("shiplord.cli.sys.stderr.isatty", return_value=True):
+            self.assertIsNotNone(cli._interactive_admin_prompt(True))
+
+    def test_deployment_displays_release_and_warnings(self):
+        result = {"ok": True, "status": "succeeded", "release": {"commit": "abc", "artifact": "image:tag"},
+                  "probes": {"warning": "routing unverified"}, "warnings": ["cleanup failed"]}
+        output = self.invoke_deploy(0, result)
+        for value in ("abc", "image:tag", "routing unverified", "cleanup failed"):
+            self.assertIn(value, output.stdout)
+
     def test_named_app_uses_app_scoped_ssh_and_requires_a_server_when_ambiguous(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"
@@ -509,7 +551,8 @@ class CLIInventoryTests(unittest.TestCase):
             with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})) as logs_call:
                 logs = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm"], env=self.env(config))
             self.assertEqual(logs.exit_code, 0, logs.output)
-            self.assertIn("Target: orders on hetzner-vm", logs.output)
+            self.assertEqual(logs.stdout, "one\n")
+            self.assertIn("Target: orders on hetzner-vm", logs.stderr)
             self.assertIn("one", logs.output)
             self.assertEqual(logs_call.call_args.args[0].target, "ship-orders@host.example.com")
             with patch("shiplord.cli.commands.application_logs", return_value=(0, {"ok": True, "logs": "one\n"})):

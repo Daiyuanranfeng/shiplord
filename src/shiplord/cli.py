@@ -85,7 +85,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
     aliases = [entry["alias"] for entry in servers]
     if all_servers:
         if not servers:
-            result = {"ok": False, "partial": False, "servers": [], "error": "no servers are registered"}
+            result = {"ok": False, "partial": bool(invalid), "servers": [], "error": "no readable servers are registered", "invalid_entries": invalid}
             _emit(result, json_output)
             raise typer.Exit(3)
         results = []
@@ -97,11 +97,11 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
                     results[-1]["ok"] = False
             except (CommandError, ClientError, ManifestError, ServerError) as error:
                 item = {"server": entry["alias"], "ok": False, "applications": [],
-                        "error": _recovery_hint(str(error))}
+                        "error": _inventory_error(error, entry["alias"])}
                 if isinstance(error, ClientError) and error.error_code:
                     item["error_code"] = error.error_code
                 results.append(item)
-        partial = any(not result["ok"] for result in results)
+        partial = bool(invalid) or any(not result["ok"] for result in results)
         payload = {"ok": not partial, "partial": partial, "servers": results}
         if invalid:
             payload["invalid_entries"] = invalid
@@ -110,9 +110,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
         else:
             for result in results:
                 typer.echo(f"Server: {result['server']}  Outcome: {'partial' if not result['ok'] else 'complete'}")
-                if result.get("error"):
-                    typer.echo(f"  Error: {result['error']}")
-                _render_apps(result.get("applications", []))
+                _render_apps(result.get("applications", []), result.get("error"))
             if invalid:
                 typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
         if partial:
@@ -134,7 +132,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
     try:
         code, inventory = commands.server_applications(_admin_target(selected["ssh"], json_output))
     except (CommandError, ClientError, ManifestError, ServerError) as error:
-        _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
+        _fail(_inventory_error(error, selected["alias"]), getattr(error, "code", 3), json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
     payload = {**inventory, "server": selected["alias"]}
     if invalid:
@@ -143,14 +141,26 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
         _emit(payload, True)
     else:
         typer.echo(f"Server: {selected['alias']}  Outcome: {'complete' if inventory['ok'] else 'incomplete'}")
-        _render_apps(inventory.get("applications", []))
+        _render_apps(inventory.get("applications", []), inventory.get("error"))
         if invalid:
             typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
     if code:
         raise typer.Exit(code)
 
 
-def _render_apps(applications: list[dict]) -> None:
+def _inventory_error(error: Exception, alias: str) -> str:
+    message = _recovery_hint(str(error))
+    if isinstance(error, ClientError) and error.error_code == "invalid_request":
+        message += (f"; the server helper may not support inventory. Run `shiplord doctor --server {alias} --deep` "
+                    f"to inspect it, or `shiplord server bootstrap {alias}` to update the helper.")
+    return message
+
+
+def _render_apps(applications: list[dict], error: str | None = None) -> None:
+    if error:
+        typer.echo(f"  Error: {error}")
+    if not applications and error:
+        return
     if not applications:
         typer.echo("  No applications registered.")
         return
@@ -158,7 +168,7 @@ def _render_apps(applications: list[dict]) -> None:
     rows = []
     for item in applications:
         release = "yes" if item.get("release_recorded") is True else "no" if item.get("release_recorded") is False else "unknown"
-        transaction = item.get("unfinished_transaction")
+        transaction = item.get("unfinished_transaction") if item.get("ok", True) else "unknown"
         if isinstance(transaction, dict):
             transaction = transaction.get("phase") or "pending"
         rows.append((item["application"], item["domain"], item["runtime"], release, transaction or "none"))
@@ -167,6 +177,9 @@ def _render_apps(applications: list[dict]) -> None:
     typer.echo("  " + "  ".join("-" * width for width in widths))
     for row in rows:
         typer.echo("  " + "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+    for item in applications:
+        if item.get("error"):
+            typer.echo(f"  {item['application']}: {item['error']}")
 
 
 @app.command(rich_help_panel="Quick start")
@@ -313,7 +326,7 @@ def _helper(manifest: dict) -> HelperClient:
 
 
 def _interactive_admin_prompt(json_output: bool) -> Callable[[str], str] | None:
-    return getpass.getpass if not json_output and sys.stdin.isatty() and sys.stderr.isatty() else None
+    return getpass.getpass if sys.stdin.isatty() and sys.stderr.isatty() else None
 
 
 def _admin_target(target: str, json_output: bool) -> AdminClient:
@@ -580,6 +593,16 @@ def _render_operation(code: int, result: dict, target: str, operation: str) -> N
     if operation == "plan":
         _render_plan_details(result)
     elif operation == "deployment":
+        release = result.get("release")
+        if isinstance(release, dict):
+            for name in ("commit", "artifact"):
+                if release.get(name) is not None:
+                    typer.echo(f"{name.capitalize()}: {release[name]}")
+        probes = result.get("probes")
+        if isinstance(probes, dict) and probes.get("warning"):
+            typer.echo(f"Warning: {probes['warning']}")
+        for warning in result.get("warnings") or []:
+            typer.echo(f"Warning: {warning}")
         _render_public_check(public)
     if outcome == "recovery required":
         typer.echo("Why: an unfinished deployment transaction blocks this operation.")
@@ -840,8 +863,8 @@ def logs(application: Optional[str] = typer.Argument(None, metavar="APP"),
     else:
         lines = len(result["logs"].splitlines())
         target = f"{app_name} on {server_alias}" if server_alias else app_name
-        typer.echo(f"Target: {target}")
-        typer.echo(f"Outcome: retrieved {lines} log {'line' if lines == 1 else 'lines'}")
+        typer.echo(f"Target: {target}", err=True)
+        typer.echo(f"Outcome: retrieved {lines} log {'line' if lines == 1 else 'lines'}", err=True)
         sys.stdout.write(result["logs"])
 
 

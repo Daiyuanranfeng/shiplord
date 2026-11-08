@@ -235,7 +235,8 @@ class AdminClient:
             raise ClientError("the server helper speaks a different protocol version", 4)
         if response.get("status") != "ok":
             raise ClientError(response.get("message") or f"the server refused the request ({response.get('error')})",
-                              3 if response.get("error") == "denied" else 2 if response.get("error") == "invalid_request" else 1)
+                              3 if response.get("error") == "denied" else 2 if response.get("error") == "invalid_request" else 1,
+                              error_code=response.get("error"))
         return response["result"]
 
 
