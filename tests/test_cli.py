@@ -532,6 +532,101 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertIn("unfinished deployment transaction", result.output)
         self.assertIn("shiplord recover", result.output)
 
+    def invoke_remote_plan(self, plan_result: dict, *, as_json: bool = False):
+        arguments = ["plan", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.validate_deploy_inputs"), \
+                patch("shiplord.cli.commands.commit_sequence", return_value=1001), \
+                patch("shiplord.cli.commands.plan_application", return_value=(0, plan_result)):
+            return CliRunner().invoke(cli.app, arguments)
+
+    def invoke_deploy(self, code: int, deploy_result: dict, *, as_json: bool = False):
+        arguments = ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.validate_deploy_inputs"), \
+                patch("shiplord.cli.commands.commit_sequence", return_value=1001), \
+                patch("shiplord.cli.commands.deploy_application", return_value=(code, deploy_result)):
+            return CliRunner().invoke(cli.app, arguments)
+
+    def test_plan_renders_release_route_storage_and_shutdown_changes(self):
+        plan_result = {
+            "ok": True, "scope": "server plan; nothing was changed", "action": "deploy",
+            "candidate": {"commit": "a" * 40, "sequence": 1001, "release_id": "candidate",
+                          "artifact": "ghcr.io/example/orders@sha256:" + "a" * 64},
+            "current": {"commit": "b" * 40, "sequence": 1000, "release_id": "current",
+                        "artifact": "ghcr.io/example/orders@sha256:" + "b" * 64},
+            "restarts_application": True, "route_change": "replace", "domain": "orders.example.com",
+            "storage": {"current_path": "/app/src/.adk", "candidate_path": "/data", "same_volume": True,
+                        "note": "the same volume is mounted at the candidate path; no files are moved"},
+            "shutdown": {"outgoing_policy": {"timeout_seconds": 10, "action": "fail"},
+                         "candidate_policy": {"timeout_seconds": 60, "action": "force"},
+                         "note": "the outgoing container policy governs its stop"},
+        }
+        result = self.invoke_remote_plan(plan_result)
+        self.assertEqual(result.exit_code, 0, result.output)
+        lines = result.output.splitlines()
+        self.assertEqual(lines[:2], ["Target: orders on hetzner-vm", "Outcome: ready"])
+        self.assertIn("Plan action: deploy", result.output)
+        self.assertIn("Current release: bbbbbbbbbbbb", result.output)
+        self.assertIn("Candidate release: aaaaaaaaaaaa", result.output)
+        self.assertIn("sequence 1001", result.output)
+        self.assertIn("Restarts application: yes", result.output)
+        self.assertIn("Route change: replace", result.output)
+        self.assertIn("Storage path: /app/src/.adk to /data", result.output)
+        self.assertIn("Application volume reused: yes", result.output)
+        self.assertIn("no files are moved", result.output)
+        self.assertIn("Outgoing shutdown policy: 10 seconds, fail", result.output)
+        self.assertIn("Candidate shutdown policy: 60 seconds, force", result.output)
+        json_result = self.invoke_remote_plan(plan_result, as_json=True)
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        self.assertEqual(json.loads(json_result.stdout), plan_result)
+
+    def test_plan_renderer_handles_unchanged_and_refused_responses(self):
+        unchanged = {"ok": True, "action": "unchanged",
+                     "current": {"commit": "a" * 40, "sequence": 1001, "artifact": "image:sha256"},
+                     "candidate": {"commit": "a" * 40, "sequence": 1001, "artifact": "image:sha256"}}
+        result = self.invoke_remote_plan(unchanged)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: no changes required", result.output)
+        self.assertNotIn("Route change:", result.output)
+        self.assertNotIn("Restarts application:", result.output)
+
+        refused = {"ok": True, "action": "none", "reason": "failed", "error": "recovery_required",
+                   "message": "an unfinished transaction exists; run recover first"}
+        result = self.invoke_remote_plan(refused)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Outcome: recovery required", result.output)
+        self.assertIn("Reason: recovery required", result.output)
+        self.assertIn("shiplord recover", result.output)
+
+    def test_deploy_shows_public_https_failures_without_changing_json_or_exit_codes(self):
+        dns_failure = {"ok": True, "request_id": "req-1", "status": "succeeded", "exit_code": 0,
+                       "release": {"commit": "b" * 40}, "url": "https://orders.example.com",
+                       "public": {"ok": False, "status": None, "error": "dns_unresolved"}}
+        result = self.invoke_deploy(0, dns_failure)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.splitlines()[:2], [
+            "Target: orders on hetzner-vm", "Outcome: deployed; public HTTPS check failed",
+        ])
+        self.assertIn("Public HTTPS: failed (dns unresolved)", result.output)
+        json_result = self.invoke_deploy(0, dns_failure, as_json=True)
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        self.assertEqual(json.loads(json_result.stdout), dns_failure)
+
+        required_failure = {**dns_failure, "ok": False, "exit_code": 1,
+                            "error": "the deployment is live on the server, but the public HTTPS check failed",
+                            "public": {"ok": False, "status": 503, "error": "unexpected_status"}}
+        result = self.invoke_deploy(1, required_failure)
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Public HTTPS: failed (HTTP 503; unexpected status)", result.output)
+        self.assertIn("Error: the deployment is live on the server", result.output)
+
     def test_logs_without_a_manifest_explains_named_app_and_discovery(self):
         with tempfile.TemporaryDirectory() as temp:
             current = Path.cwd()

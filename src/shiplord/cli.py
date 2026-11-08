@@ -443,6 +443,93 @@ def _short_release(release: dict | None) -> str:
     return f"{commit} ({artifact or 'artifact unknown'})"
 
 
+def _plan_outcome(result: dict) -> str:
+    error = result.get("error")
+    if error == "recovery_required":
+        return "recovery required"
+    if error == "stale_release":
+        return "blocked by a stale release"
+    if result.get("action") == "deploy":
+        return "ready"
+    if result.get("action") == "unchanged":
+        return "no changes required"
+    if result.get("action") == "none":
+        return "blocked"
+    return "plan available"
+
+
+def _plan_release(release: dict | None) -> str:
+    summary = _short_release(release)
+    if release is not None and release.get("sequence") is not None:
+        summary += f"; sequence {release['sequence']}"
+    return summary
+
+
+def _shutdown_policy(policy: object) -> str:
+    if not isinstance(policy, dict):
+        return "none"
+    details = []
+    if policy.get("timeout_seconds") is not None:
+        details.append(f"{policy['timeout_seconds']} seconds")
+    if policy.get("action") is not None:
+        details.append(str(policy["action"]))
+    return ", ".join(details) if details else "unknown"
+
+
+def _render_plan_details(result: dict) -> None:
+    if result.get("action") is not None:
+        typer.echo(f"Plan action: {result['action']}")
+    reason = result.get("error") or result.get("reason")
+    if reason is not None:
+        typer.echo(f"Reason: {str(reason).replace('_', ' ')}")
+    if result.get("message") is not None:
+        typer.echo(f"Message: {result['message']}")
+    if "current" in result:
+        typer.echo(f"Current release: {_plan_release(result['current'])}")
+    if "candidate" in result:
+        typer.echo(f"Candidate release: {_plan_release(result['candidate'])}")
+    if result.get("restarts_application") is not None:
+        restart = "yes" if result["restarts_application"] else "no"
+        typer.echo(f"Restarts application: {restart}")
+    if result.get("route_change") is not None:
+        typer.echo(f"Route change: {result['route_change']}")
+    if result.get("domain") is not None:
+        typer.echo(f"Domain: {result['domain']}")
+
+    storage = result.get("storage")
+    if isinstance(storage, dict):
+        current_path = storage.get("current_path") or "none"
+        candidate_path = storage.get("candidate_path") or "unknown"
+        typer.echo(f"Storage path: {current_path} to {candidate_path}")
+        if storage.get("same_volume") is not None:
+            reused = "yes" if storage["same_volume"] else "no"
+            typer.echo(f"Application volume reused: {reused}")
+        if storage.get("note") is not None:
+            typer.echo(f"Storage note: {storage['note']}")
+
+    shutdown = result.get("shutdown")
+    if isinstance(shutdown, dict):
+        if "outgoing_policy" in shutdown:
+            typer.echo(f"Outgoing shutdown policy: {_shutdown_policy(shutdown['outgoing_policy'])}")
+        if "candidate_policy" in shutdown:
+            typer.echo(f"Candidate shutdown policy: {_shutdown_policy(shutdown['candidate_policy'])}")
+        if shutdown.get("note") is not None:
+            typer.echo(f"Shutdown note: {shutdown['note']}")
+
+
+def _render_public_check(public: object) -> None:
+    if not isinstance(public, dict):
+        return
+    state = "passed" if public.get("ok") is True else "failed" if public.get("ok") is False else "unknown"
+    details = []
+    if public.get("status") is not None:
+        details.append(f"HTTP {public['status']}")
+    if public.get("error") is not None:
+        details.append(str(public["error"]).replace("_", " "))
+    suffix = " (" + "; ".join(details) + ")" if details else ""
+    typer.echo(f"Public HTTPS: {state}{suffix}")
+
+
 def _render_status(application: str, server: str | None, result: dict) -> None:
     status = result.get("application", {})
     current = status.get("current")
@@ -472,7 +559,12 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
 
 def _render_operation(code: int, result: dict, target: str, operation: str) -> None:
     status = result.get("status")
-    if status in {"recovery_required", "intervention_required", "interrupted"} or result.get("error") == "recovery_required":
+    public = result.get("public")
+    if operation == "plan":
+        outcome = _plan_outcome(result)
+    elif operation == "deployment" and isinstance(public, dict) and public.get("ok") is False:
+        outcome = "deployed; public HTTPS check failed"
+    elif status in {"recovery_required", "intervention_required", "interrupted"} or result.get("error") == "recovery_required":
         outcome = "recovery required"
     elif code == 0:
         outcome = "ready" if operation == "plan" else (status or "succeeded").replace("_", " ")
@@ -481,8 +573,14 @@ def _render_operation(code: int, result: dict, target: str, operation: str) -> N
     typer.echo(f"Target: {target}")
     typer.echo(f"Outcome: {outcome}")
     for name in ("commit", "artifact", "url", "error", "message"):
+        if operation == "plan" and name in {"error", "message"}:
+            continue
         if result.get(name) is not None:
             typer.echo(f"{name.replace('_', ' ').capitalize()}: {result[name]}")
+    if operation == "plan":
+        _render_plan_details(result)
+    elif operation == "deployment":
+        _render_public_check(public)
     if outcome == "recovery required":
         typer.echo("Why: an unfinished deployment transaction blocks this operation.")
         typer.echo("Next: run `shiplord recover` from this application's repository to reconcile it.")
