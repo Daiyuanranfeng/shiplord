@@ -112,8 +112,9 @@ shiplord deploy --binary ./dist/orders --commit "$(git rev-parse HEAD)"
 
 The second command is the whole release. `--commit` must be the full 40-character lowercase commit SHA of a
 SHA-1 repository; `git rev-parse HEAD` prints exactly that. Shiplord accepts exactly 40 lowercase hex characters,
-so a SHA-256 repository's 64-character id is refused. If you omit `--commit`, `shiplord` runs the same command in
-the application directory, so pass it explicitly when the binary was built from another checkout. `--binary` is
+so a SHA-256 repository's 64-character id is refused. If you omit `--commit`, `shiplord` runs `git rev-parse HEAD`
+itself in the application directory and refuses with `could not read HEAD; pass --commit` when that fails; pass it
+explicitly when the binary was built from another checkout. `--binary` is
 refused for a Docker manifest, and `--image` is refused for a native one.
 
 Before it connects, the CLI reads the file and refuses it unless all of these hold:
