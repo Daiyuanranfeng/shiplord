@@ -22,7 +22,7 @@ from .keys import KeyError_, KeyStore, PublicKey, parse_public_key, validate_lab
 from .layout import Layout, deployment_user, runtime_user
 from .manifest import validate_app_name
 from .registry import DEFAULT_MAX_MEMORY_MB, PORT_RANGE, Registry, validate_registration
-from .release_state import HostLock, ReleaseState, StateError
+from .release_state import HostLock, ReleaseState, StateError, _directory
 from .system import CommandError, System
 
 USERADD, USERMOD, USERDEL = "/usr/sbin/useradd", "/usr/sbin/usermod", "/usr/sbin/userdel"
@@ -371,6 +371,35 @@ def _remove_account(system: System, name: str, sleep: Callable[[float], None]) -
     raise ProvisionError("could not remove the deployment account; end its sessions and retry")
 
 
+def _remove_route(layout: Layout, application_id: str) -> bool:
+    """Remove the application's managed route and any interrupted-change backup; a missing route directory is fine."""
+    try:
+        ship = os.open(layout.caddy_root / "ship", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False  # a host without Caddy has nothing routed
+    except OSError:
+        raise ProvisionError("could not open the managed route directory") from None
+    removed = False
+    try:
+        try:
+            _directory(ship)
+        except StateError:
+            raise ProvisionError("the managed route directory is not trusted") from None
+        for name in (f"{application_id}.caddy", f".prior-{application_id}"):
+            try:
+                os.unlink(name, dir_fd=ship)
+                removed = True
+            except FileNotFoundError:
+                pass
+        if removed:
+            os.fsync(ship)
+    except OSError:
+        raise ProvisionError("could not remove the application's route") from None
+    finally:
+        os.close(ship)
+    return removed
+
+
 def deprovision(layout: Layout, system: System, lock: HostLock, application_id: str, *,
                 retire: Callable[[dict, dict], dict | None] | None = None,
                 sleep: Callable[[float], None] = time.sleep) -> dict:
@@ -429,13 +458,13 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
         _remove_account(system, name, sleep)
     removed["account"] = account is not None
     for directory, key in ((layout.app_state / app, "state_directory"), (layout.environments / app, "environment_directory"),
-                           (layout.registry_logins / app, "registry_login")):
+                           (layout.registry_logins / app, "registry_login"), (layout.jobs / app, "jobs_directory")):
         if directory.is_symlink():
             raise ProvisionError(f"{directory} is a symbolic link")
         if directory.exists():
             shutil.rmtree(directory)
             removed[key] = True
-        elif key != "registry_login":  # an optional item is reported only when it existed
+        elif key not in ("registry_login", "jobs_directory"):  # an optional item is reported only when it existed
             removed[key] = False
     retained = []
     if isinstance(retired, dict):  # what retirement kept is part of what this command kept
@@ -447,6 +476,8 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
     if (layout.releases / app).exists():
         shutil.rmtree(layout.releases / app)
         removed["release_binaries"] = True
+    if _remove_route(layout, app):
+        removed["route"] = True
     unit = layout.systemd_units / f"shiplord-{app}.service"
     if unit.exists():
         _run(system, ["/usr/bin/systemctl", "disable", "--now", unit.name], "systemctl")

@@ -13,9 +13,35 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fakes import REGISTRATION, FakeCaddy, FakeProbes, FakeRuntime, configuration, record, request  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
 from shiplord.probes import ProbeFailure  # noqa: E402
+from shiplord.registry import validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState, StateError  # noqa: E402
 from shiplord.routing import RouteManager, RoutingError  # noqa: E402
 from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
+
+NATIVE_REGISTRATION = validate_registration({
+    "schema_version": 1, "application_id": "orders", "deployment_uid": 1001, "deployment_user": "ship-orders",
+    "runtime": "native", "api_domain": "orders.example.com", "host_port": 20007, "image_repository": None,
+    "max_memory_mb": 4096})
+
+
+def native_request(request_id="req-1", commit="a", sequence=1000, sha256="b"):
+    return {"request_id": request_id, "commit": commit * 40, "sequence": sequence,
+            "artifact": {"kind": "native", "sha256": sha256 * 64, "size": 10, "architecture": "linux-amd64"},
+            "configuration": dict(configuration(), runtime="native")}
+
+
+def native_record(**kwargs):
+    value = native_request(**kwargs)
+    return {k: value[k] for k in ("commit", "sequence", "artifact", "configuration")}
+
+
+class FakeNativeRuntime(FakeRuntime):
+    """A native release is discarded by release ID: its directory is named for the release, not for the binary."""
+
+    def discard(self, registration, release):
+        self.discarded.append(release_id(release))
+        return []
+
 
 class DeployTestCase(unittest.TestCase):
     def setUp(self):
@@ -363,6 +389,62 @@ class AbandonedCandidateTests(DeployTestCase):
         self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
         self.assertEqual(self.run_locked(self.deployer.rollback, "req-3").status, "succeeded")
         self.assertEqual(self.runtime.discarded, [])
+
+
+class NativeRetentionTests(DeployTestCase):
+    """A native release owns a directory named for its release ID, even when the binary is unchanged."""
+
+    def build(self):
+        self.routes = RouteManager(self.caddy_root, self.lock, self.caddy)
+        self.deployer = Deployer(registration=NATIVE_REGISTRATION, state=self.state, routes=self.routes,
+                                 runtime=self.runtime, probes=self.probes,
+                                 progress=lambda phase, info: self.progress.append(phase))
+
+    def setUp(self):
+        super().setUp()
+        self.runtime = FakeNativeRuntime()
+        self.probes = FakeProbes(self.runtime)
+        self.build()
+
+    def deploy_native(self, **kwargs):
+        return self.run_locked(self.deployer.deploy, native_request(**kwargs))
+
+    def test_one_binary_under_several_commits_does_not_accumulate_release_directories(self):
+        self.assertEqual(self.deploy_native().status, "succeeded")
+        self.assertEqual(self.deploy_native(request_id="req-2", commit="c", sequence=1001).status, "succeeded")
+        self.assertEqual(self.deploy_native(request_id="req-3", commit="e", sequence=1002).status, "succeeded")
+        self.assertEqual(self.runtime.discarded, [release_id(native_record())])
+
+    def test_a_rolled_back_native_release_is_never_discarded(self):
+        self.deploy_native()
+        self.deploy_native(request_id="req-2", commit="c", sequence=1001)
+        self.assertEqual(self.run_locked(self.deployer.rollback, "req-3").status, "succeeded")
+        self.assertEqual(self.runtime.discarded, [])
+
+
+class JournalOpenFailureTests(DeployTestCase):
+    """A prepared artifact must not outlive a transaction whose journal could not be opened."""
+
+    def test_a_prepared_artifact_is_removed_when_the_journal_cannot_be_opened(self):
+        with patch.object(self.state, "begin", side_effect=StateError("journal is unavailable")):
+            outcome = self.deploy()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "journal_unavailable"))
+        self.assertEqual(self.runtime.discarded, ["ghcr.io/example/orders@sha256:" + "b" * 64])
+        self.assertEqual(outcome.detail["warnings"], [])
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_prepared_artifact_is_kept_when_a_journal_references_it(self):
+        begin = self.state.begin
+
+        def begin_then_fail(request_id, candidate, **kwargs):
+            begin(request_id, candidate, **kwargs)
+            raise StateError("journal is unavailable")
+
+        with patch.object(self.state, "begin", side_effect=begin_then_fail):
+            outcome = self.deploy()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "journal_unavailable"))
+        self.assertEqual(self.runtime.discarded, [])  # recovery may still need the candidate
+        self.assertEqual(self.state.read_journal()["request_id"], "req-1")
 
 
 class CrashRecoveryTests(DeployTestCase):
