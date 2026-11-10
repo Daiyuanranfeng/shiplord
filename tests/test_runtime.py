@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shiplord.layout import Layout
-from shiplord.runtime import DockerRuntime, RuntimeFailure, release_id
-from shiplord.system import CommandError, CommandResult
+from shiplord.runtime import MAX_LOG_BYTES, DockerRuntime, RuntimeFailure, release_id
+from shiplord.system import CommandError, CommandResult, run_command
 
 ID_A, ID_B = "a" * 64, "b" * 64
 
@@ -418,6 +418,35 @@ class InspectTests(RuntimeTestCase):
         self.assertEqual(self.runtime.discard(REGISTRATION, release()), [])
         self.docker.results["image rm"] = CommandResult(1, "conflict: image is being used")
         self.assertEqual(len(self.runtime.discard(REGISTRATION, release())), 1)
+
+
+class ScriptedDocker:
+    """Runs a local script through the real command runner, so its output cap is the one under test."""
+
+    def __init__(self, script):
+        self.script = script
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        if argv[1] == "ps":
+            return CommandResult(0, ID_A + "\n")
+        return run_command([self.script], max_output=max_output)
+
+
+class LogTruncationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.script = self.directory / "docker"
+        self.script.write_text('#!/bin/sh\nhead -c 300000 /dev/zero | tr "\\0" x; printf "the failure\\n"\n')
+        self.script.chmod(0o755)
+        self.runtime = DockerRuntime(ScriptedDocker(str(self.script)), Layout(self.directory.resolve()),
+                                     platform_name="linux/amd64")
+
+    def test_the_newest_log_lines_survive_the_log_cap(self):
+        logs = self.runtime.logs(REGISTRATION, 50)
+        self.assertLessEqual(len(logs), MAX_LOG_BYTES)
+        self.assertTrue(logs.endswith("the failure\n"))
 
 
 class StorageMountTests(RuntimeTestCase):

@@ -39,10 +39,32 @@ class RunCommandTests(unittest.TestCase):
         result = run_command([self.script("wc -c\n")], input=payload)
         self.assertEqual(result.output.strip(), "500000")
 
-    def test_output_is_capped_and_control_characters_are_replaced(self):
-        result = run_command([self.script('printf "a\\033[0mb"; head -c 300000 /dev/zero | tr "\\0" y\n')])
+    def test_output_is_capped_to_the_newest_bytes(self):
+        result = run_command([self.script('head -c 300000 /dev/zero | tr "\\0" a; printf "END"\n')])
         self.assertLessEqual(len(result.output), 4096)
-        self.assertTrue(result.output.startswith("a?[0mb"))
+        self.assertTrue(result.output.endswith("END"))
+
+    def test_truncated_output_says_the_earlier_output_was_dropped(self):
+        result = run_command([self.script('head -c 300000 /dev/zero | tr "\\0" a\n')])
+        self.assertTrue(result.output.startswith("[shiplord: earlier output truncated]\n"))
+        self.assertEqual(len(result.output), 4096)
+
+    def test_output_within_the_cap_is_returned_whole(self):
+        result = run_command([self.script('printf "first\\nlast\\n"\n')])
+        self.assertEqual(result.output, "first\nlast\n")
+
+    def test_a_zero_cap_returns_no_output(self):
+        self.assertEqual(run_command([self.script('printf "xxxx"\n')], max_output=0).output, "")
+
+    def test_a_window_cut_inside_a_character_decodes_with_a_replacement(self):
+        result = run_command([self.script('printf "\\303\\251%.0s" $(seq 3000)\n')], max_output=4094)
+        self.assertLessEqual(len(result.output), 4094)
+        self.assertIn("\ufffd", result.output)
+        self.assertTrue(result.output.endswith("\u00e9"))
+
+    def test_control_characters_are_replaced(self):
+        result = run_command([self.script('printf "a\\033[0mb\\n"\n')])
+        self.assertEqual(result.output, "a?[0mb\n")
 
     def test_environment_is_fixed_not_inherited(self):
         os.environ["SHIPLORD_LEAK_TEST"] = "secret"

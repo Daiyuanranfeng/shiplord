@@ -551,13 +551,13 @@ class SubprocessCaddyTests(unittest.TestCase):
         self.assertFalse(Path(home).exists())  # removed afterwards, with anything Caddy wrote there
 
     def test_failure_exposes_capped_clean_detail_but_not_in_the_message(self):
-        caddy = self.script("caddy", 'printf "bad\\033[31m config\\n"; head -c 200000 /dev/zero | tr "\\0" x; exit 3\n')
+        caddy = self.script("caddy", 'head -c 200000 /dev/zero | tr "\\0" x; printf "bad\\033[31m config\\n"; exit 3\n')
         with self.assertRaises(RoutingError) as caught:
             SubprocessCaddy(caddy).validate(Path("/x"))
         error = caught.exception
         self.assertEqual(error.kind, "validation")
         self.assertLessEqual(len(error.detail), 4096)
-        self.assertIn("bad?[31m config", error.detail)
+        self.assertTrue(error.detail.endswith("bad?[31m config\n"))
         self.assertNotIn("bad", str(error))
 
     def test_timeout_kills_the_process_and_reports_it(self):
