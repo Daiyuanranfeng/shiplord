@@ -14,6 +14,7 @@ from typing import Mapping, Protocol, Sequence
 MAX_OUTPUT_BYTES = 4096
 DEFAULT_TIMEOUT_SECONDS = 60
 FIXED_ENVIRONMENT = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
+TRUNCATION_MARKER = "[shiplord: earlier output truncated]\n"
 
 
 @dataclass(frozen=True)
@@ -36,9 +37,13 @@ class System(Protocol):
             timeout: float = DEFAULT_TIMEOUT_SECONDS, max_output: int = MAX_OUTPUT_BYTES) -> CommandResult: ...
 
 
-def sanitize(data: bytes | bytearray, limit: int = MAX_OUTPUT_BYTES) -> str:
-    text = bytes(data[:limit]).decode("utf-8", "replace")
-    return "".join(char if char == "\n" or char.isprintable() else "?" for char in text)
+def sanitize(data: bytes | bytearray, limit: int = MAX_OUTPUT_BYTES, *, truncated: bool = False) -> str:
+    """Decode the newest ``limit`` bytes; ``truncated`` says older bytes were dropped and labels them."""
+    limit = max(0, limit)
+    marker = TRUNCATION_MARKER if truncated and len(TRUNCATION_MARKER) < limit else ""
+    size = limit - len(marker)
+    text = (bytes(data[len(data) - size:]) if size else b"").decode("utf-8", "replace")
+    return marker + "".join(char if char == "\n" or char.isprintable() else "?" for char in text)
 
 
 def run_command(argv: Sequence[str], *, timeout: float = DEFAULT_TIMEOUT_SECONDS, input: bytes | None = None,
@@ -56,6 +61,7 @@ def run_command(argv: Sequence[str], *, timeout: float = DEFAULT_TIMEOUT_SECONDS
     except OSError:
         raise CommandError("could not start the command", "start") from None
     kept = bytearray()
+    truncated = False
     deadline = time.monotonic() + timeout
     writer = None
     if input is not None:
@@ -71,19 +77,23 @@ def run_command(argv: Sequence[str], *, timeout: float = DEFAULT_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise CommandError("the command timed out", "timeout", sanitize(kept, max_output))
+                raise CommandError("the command timed out", "timeout", sanitize(kept, max_output, truncated=truncated))
             if select.select([process.stdout], [], [], min(0.1, remaining))[0]:
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if not chunk:
                     break
-                kept.extend(chunk[: max(0, max_output - len(kept))])
+                kept.extend(chunk)
+                if len(kept) > max_output:
+                    del kept[: len(kept) - max_output]
+                    truncated = True
             elif process.poll() is not None and not select.select([process.stdout], [], [], 0)[0]:
                 break
         try:
             code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            raise CommandError("the command timed out", "timeout", sanitize(kept, max_output)) from None
-        return CommandResult(code, sanitize(kept, max_output))
+            raise CommandError("the command timed out", "timeout",
+                               sanitize(kept, max_output, truncated=truncated)) from None
+        return CommandResult(code, sanitize(kept, max_output, truncated=truncated))
     finally:
         if process.poll() is None:
             try:

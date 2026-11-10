@@ -14,10 +14,10 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from shiplord.layout import Layout, runtime_user  # noqa: E402
-from shiplord.native import (ARCHITECTURES, JOURNALCTL, SYSTEMCTL, NativeRuntime, elf_architecture,  # noqa: E402
+from shiplord.native import (ARCHITECTURES, JOURNALCTL, MAX_LOG_BYTES, SYSTEMCTL, NativeRuntime, elf_architecture,  # noqa: E402
                              host_architecture, render_environment, render_unit, systemd_quote, verify_elf)
 from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
-from shiplord.system import CommandError, CommandResult  # noqa: E402
+from shiplord.system import CommandError, CommandResult, run_command  # noqa: E402
 
 REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "orders.example.com"}
 
@@ -336,6 +336,35 @@ class InspectTests(RuntimeTestCase):
         self.assertEqual(self.runtime.logs(REGISTRATION, 5), "")
         self.system.errors[JOURNALCTL] = CommandError("x", "start")
         self.assertEqual(self.runtime.logs(REGISTRATION, 5), "")
+
+
+class ScriptSystem:
+    """Runs a local script through the real command runner, so its output cap is the one under test."""
+
+    def __init__(self, script):
+        self.script = script
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        return run_command([self.script], max_output=max_output)
+
+
+class LogTruncationTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("shiplord.native.host_architecture", return_value="linux-amd64")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        script = self.directory / "journalctl"
+        script.write_text('#!/bin/sh\nhead -c 300000 /dev/zero | tr "\\0" x; printf "the failure\\n"\n')
+        script.chmod(0o755)
+        self.runtime = NativeRuntime(ScriptSystem(str(script)), Layout(self.directory.resolve()))
+
+    def test_the_newest_journal_lines_survive_the_log_cap(self):
+        logs = self.runtime.logs(REGISTRATION, 50)
+        self.assertLessEqual(len(logs), MAX_LOG_BYTES)
+        self.assertTrue(logs.endswith("the failure\n"))
 
 
 class DiscardTests(RuntimeTestCase):
