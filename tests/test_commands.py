@@ -122,6 +122,37 @@ class AdminCommandTests(unittest.TestCase):
         self.assertEqual((code, output["deploy_login"]), (0, "ship-orders@server.example.com"))
         self.assertIn("DNS", output["next"])
 
+    def test_provision_update_sends_the_flag_and_explains_what_was_kept(self):
+        result = {"application_id": "orders", "deployment_user": "ship-orders", "host_port": 20000,
+                  "api_domain": "new.example.com", "runtime": "docker", "max_memory_mb": 8192,
+                  "key_fingerprint": "SHA256:x", "created": {}, "updated": True, "route_changed": True,
+                  "changes": {"api_domain": {"from": "orders.example.com", "to": "new.example.com"},
+                              "max_memory_mb": {"from": 4096, "to": 8192}}}
+        github = {"github": {"repository": "Example/Orders", "deployment_branch": "main"}}
+        ssh = FakeSsh((ok(result), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertTrue(sent["arguments"]["update"])
+        self.assertEqual((code, output["updated"]), (0, True))
+        self.assertIn("public route was moved", output["next"])
+        self.assertIn("DNS", output["next"])
+
+        memory_only = dict(result, api_domain="orders.example.com", route_changed=False,
+                           changes={"max_memory_mb": {"from": 4096, "to": 8192}})
+        ssh = FakeSsh((ok(memory_only), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        self.assertIn("memory ceiling", output["next"])
+        self.assertNotIn("route", output["next"])
+
+        unchanged = dict(result, api_domain="orders.example.com", route_changed=False, updated=False, changes={})
+        ssh = FakeSsh((ok(unchanged), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        self.assertEqual((code, output["updated"]), (0, False))
+        self.assertIn("nothing changed", output["next"])
+
     def test_empty_or_invalid_environment_input_is_refused_before_any_connection(self):
         ssh = FakeSsh()
         client = AdminClient("a@h", runner=ssh)

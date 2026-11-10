@@ -214,7 +214,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
-| `provision` | Create the application's account, state, port, and key access on the server. |
+| `provision [--update]` | Create the application's account, state, port, and key access on the server. `--update` applies a changed hostname or memory ceiling without removing state or keys. |
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
@@ -281,6 +281,20 @@ If a worker is killed mid-deployment the journal remains, further deployments ar
   Caddy's admin endpoint to a unix socket.
 - A deployment account cannot be used to run arbitrary code as root, but anyone holding its key can deploy whatever
   that application's registration allows.
+
+## Changing an application
+
+Edit `ship.toml`, then apply the change without removing the application:
+
+```sh
+shiplord provision --update
+```
+
+`--update` applies a changed `http.api_domain` and a changed memory ceiling (`--max-memory-mb`). It keeps the
+application's account, state, environment, keys, releases, and data. Changing the runtime or the image repository is
+refused before anything is touched; deprovision and provision the application again for those changes. If a release is
+deployed and the hostname changed, the public route is moved immediately; point the new name's DNS record at the
+server.
 
 ## Removing an application
 

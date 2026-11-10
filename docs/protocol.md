@@ -102,7 +102,7 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 | Action | `arguments` |
 | --- | --- |
-| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label` |
+| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname or ceiling to an existing application |
 | `keys` | `operation` (`add`, `remove`, `list`), `label`, `public_key` |
 | `environment` | `operation` (`set`, `clear`, `keys`), `text` |
 | `registry` | `operation` (`login`, `logout`, `list`), `registry` (`ghcr.io`), `username`, `token` |
@@ -111,7 +111,9 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 Responses are `{"status": "ok", "request_id", "result"}` or `{"status": "error", "request_id", "error":
 "denied|invalid_request|failed", "message"}`. Provisioning is idempotent and writes the registration last, because
-the registration is what enables an application's access.
+the registration is what enables an application's access. An `update` keeps the account, port, state, environment,
+and keys; it may change only the hostname and the memory ceiling, and refuses a changed runtime or image repository
+before any side effect.
 
 ## Exit status of the entry points
 

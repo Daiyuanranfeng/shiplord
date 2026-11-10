@@ -23,6 +23,9 @@ _REPOSITORY = re.compile(r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:
 _FIELDS = {"schema_version", "application_id", "deployment_uid", "deployment_user", "runtime",
            "api_domain", "host_port", "image_repository", "max_memory_mb"}
 _IDENTITY_FIELDS = _FIELDS - {"host_port"}
+# An update may change the public hostname and the memory ceiling; everything else is fixed at provisioning.
+_IMMUTABLE_FIELDS = {"schema_version", "application_id", "deployment_uid", "deployment_user", "runtime",
+                     "image_repository"}
 
 
 class RegistryError(StateError):
@@ -67,6 +70,27 @@ def validate_registration(value: object, application_id: str | None = None) -> d
     return {"schema_version": 1, "application_id": app, "deployment_uid": uid, "deployment_user": user,
             "runtime": runtime, "api_domain": domain, "host_port": port, "image_repository": repository,
             "max_memory_mb": memory}
+
+
+def registration_request(application_id: str, *, deployment_uid: int, deployment_user: str, runtime: str,
+                         api_domain: str, image_repository: str | None,
+                         max_memory_mb: int = DEFAULT_MAX_MEMORY_MB,
+                         host_port: int = PORT_RANGE.start) -> dict:
+    """Build the record a registration request asks for; the caller supplies a real port when it allocates one."""
+    return {"schema_version": 1, "application_id": application_id, "deployment_uid": deployment_uid,
+            "deployment_user": deployment_user, "runtime": runtime, "api_domain": api_domain,
+            "host_port": host_port, "image_repository": image_repository, "max_memory_mb": max_memory_mb}
+
+
+def validate_update(existing: dict, requested: dict) -> dict:
+    """Return the record an update would write; refuse a change to anything fixed at provisioning."""
+    if existing is None:
+        raise RegistryError("the application is not registered; run `shiplord provision` first")
+    for field in sorted(_IMMUTABLE_FIELDS):
+        if existing[field] != requested[field]:
+            name = field.replace("_", " ")
+            raise RegistryError(f"registration {name} differs; an update cannot change it")
+    return validate_registration(dict(requested, host_port=existing["host_port"]), existing["application_id"])
 
 
 def port_is_free(port: int) -> bool:
@@ -124,9 +148,9 @@ class Registry:
         if not self.lock.held:
             raise RegistryError("host lock is required")
         app = validate_app_name(application_id)
-        requested = {"schema_version": 1, "application_id": app, "deployment_uid": deployment_uid,
-                     "deployment_user": deployment_user, "runtime": runtime, "api_domain": api_domain,
-                     "host_port": PORT_RANGE.start, "image_repository": image_repository, "max_memory_mb": max_memory_mb}
+        requested = registration_request(app, deployment_uid=deployment_uid, deployment_user=deployment_user,
+                                         runtime=runtime, api_domain=api_domain, image_repository=image_repository,
+                                         max_memory_mb=max_memory_mb)
         validate_registration(requested)
         others = [record for record in self.list() if record["application_id"] != app]
         existing = self.read(app)
@@ -146,6 +170,31 @@ class Registry:
                 _write(self.directory, app + ".json", record, create=True)
                 return record
         raise RegistryError("no loopback port is available")
+
+    def update(self, application_id: str, *, deployment_uid: int, deployment_user: str, runtime: str,
+               api_domain: str, image_repository: str | None, max_memory_mb: int = DEFAULT_MAX_MEMORY_MB,
+               dry_run: bool = False) -> tuple[dict, bool]:
+        """Change an existing registration's hostname or memory ceiling, keeping its identity and port.
+
+        With ``dry_run`` every check runs and the record that would be written is returned, but nothing is written;
+        a caller uses it to refuse an update before its first side effect.
+        """
+        if not self.lock.held:
+            raise RegistryError("host lock is required")
+        app = validate_app_name(application_id)
+        existing = self.read(app)
+        requested = registration_request(app, deployment_uid=deployment_uid, deployment_user=deployment_user,
+                                         runtime=runtime, api_domain=api_domain, image_repository=image_repository,
+                                         max_memory_mb=max_memory_mb)
+        updated = validate_update(existing, requested)
+        for record in self.list():
+            if record["application_id"] != app and record["api_domain"] == updated["api_domain"]:
+                raise RegistryError("hostname is already registered to another application")
+        if updated == existing:
+            return existing, False
+        if not dry_run:
+            _write(self.directory, app + ".json", updated, create=False)
+        return updated, True
 
     def unregister(self, application_id: str) -> bool:
         """Remove a registration, which disables the application's access; idempotent."""

@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `shiplord provision --update` to apply a changed hostname or memory
+  ceiling without removing the application's state, environment, or keys.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

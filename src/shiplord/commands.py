@@ -79,7 +79,7 @@ def commit_sequence(commit: str, override: int | None, directory: Path | None = 
 
 def provision_application(manifest: dict, admin: AdminClient, *, public_key: Path | None = None,
                           image_repository: str | None = None, key_label: str | None = None,
-                          max_memory_mb: int | None = None) -> tuple[int, dict]:
+                          max_memory_mb: int | None = None, update: bool = False) -> tuple[int, dict]:
     text, fingerprint = read_public_key(public_key)
     label = key_label or "local-" + fingerprint.split(":", 1)[1][:8].lower().replace("+", "x").replace("/", "y")
     arguments = {"runtime": manifest["runtime"], "api_domain": manifest["http"]["api_domain"],
@@ -87,10 +87,24 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
                  "key_label": label}
     if max_memory_mb is not None:
         arguments["max_memory_mb"] = max_memory_mb  # the ceiling a deploy request may ask for (default 4096)
+    if update:
+        arguments["update"] = True
     result = admin.call("provision", manifest["name"], arguments)
     host = admin.target.partition("@")[2]
+    if update:
+        if not result.get("updated"):
+            next_step = "The application already matches the manifest; nothing changed."
+        elif "api_domain" not in result.get("changes", {}):
+            next_step = "The memory ceiling is registered; it applies to the next deployment."
+        elif result.get("route_changed"):
+            next_step = "The hostname is registered and the public route was moved; point its DNS record at the server."
+        else:
+            next_step = ("The hostname is registered; point its DNS record at the server, then run `shiplord deploy` "
+                         "to move the route.")
+    else:
+        next_step = "Point DNS for the API hostname at the server, then run `shiplord deploy`."
     return 0, {"ok": True, **result, "deploy_login": f"{result['deployment_user']}@{host}", "key_label": label,
-               "next": "Point DNS for the API hostname at the server, then run `shiplord deploy`."}
+               "next": next_step}
 
 
 def deprovision_application(manifest: dict, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:

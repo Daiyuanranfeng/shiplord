@@ -474,6 +474,25 @@ class CLIInventoryTests(unittest.TestCase):
     def env(self, config: Path) -> dict[str, str]:
         return dict(os.environ, XDG_CONFIG_HOME=str(config))
 
+    def test_provision_update_passes_the_flag_through(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "ship.toml").write_text(MANIFEST)
+            self.write_servers(config, ("production", "admin@host.example.com"))
+            original = os.getcwd()
+            self.addCleanup(os.chdir, original)
+            os.chdir(project)
+            with patch("shiplord.cli.commands.provision_application", return_value=(0, {"ok": True})) as provision:
+                result = CliRunner().invoke(cli.app, ["provision", "--update", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(provision.call_args.kwargs["update"])
+            with patch("shiplord.cli.commands.provision_application", return_value=(0, {"ok": True})) as provision:
+                result = CliRunner().invoke(cli.app, ["provision", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(provision.call_args.kwargs["update"])
+
     def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"

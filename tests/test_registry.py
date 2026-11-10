@@ -124,6 +124,68 @@ class RegistryTests(unittest.TestCase):
                         self.register(**change)
         self.assertEqual(self.registry.read("orders"), first)
 
+    def test_update_changes_only_the_hostname_and_memory_ceiling(self):
+        with self.lock.acquire():
+            first = self.register()
+            updated, changed = self.registry.update(
+                "orders", deployment_uid=first["deployment_uid"], deployment_user=first["deployment_user"],
+                runtime="docker", api_domain="new.example.com", image_repository="ghcr.io/example/orders",
+                max_memory_mb=8192)
+        self.assertTrue(changed)
+        self.assertEqual((updated["api_domain"], updated["max_memory_mb"]), ("new.example.com", 8192))
+        self.assertEqual((updated["host_port"], updated["deployment_uid"], updated["deployment_user"],
+                          updated["runtime"], updated["image_repository"]),
+                         (first["host_port"], first["deployment_uid"], first["deployment_user"],
+                          first["runtime"], first["image_repository"]))
+        self.assertEqual(self.registry.read("orders"), updated)
+        self.assertEqual(json.loads((self.directory / "orders.json").read_text()), updated)
+
+    def test_update_is_idempotent_and_a_dry_run_writes_nothing(self):
+        with self.lock.acquire():
+            first = self.register()
+            before = (self.directory / "orders.json").read_bytes()
+            planned, changed = self.registry.update(
+                "orders", deployment_uid=first["deployment_uid"], deployment_user=first["deployment_user"],
+                runtime="docker", api_domain="new.example.com", image_repository="ghcr.io/example/orders",
+                max_memory_mb=8192, dry_run=True)
+            self.assertTrue(changed)
+            self.assertEqual(planned["api_domain"], "new.example.com")
+            self.assertEqual((self.directory / "orders.json").read_bytes(), before)
+            self.assertEqual(self.registry.update(
+                "orders", deployment_uid=first["deployment_uid"], deployment_user=first["deployment_user"],
+                runtime="docker", api_domain="orders.example.com", image_repository="ghcr.io/example/orders"),
+                (first, False))
+
+    def test_update_refuses_a_changed_runtime_repository_or_account(self):
+        with self.lock.acquire():
+            first = self.register()
+            for change in ({"runtime": "native", "image_repository": None},
+                           {"image_repository": "ghcr.io/example/other"},
+                           {"deployment_uid": 2000}, {"deployment_user": "someone"}):
+                with self.subTest(change=change), self.assertRaisesRegex(RegistryError, "cannot change it"):
+                    self.registry.update("orders", **request("orders", **change))
+            self.assertEqual(self.registry.read("orders"), first)
+        self.assertEqual(json.loads((self.directory / "orders.json").read_text()), first)
+
+    def test_update_refuses_an_unknown_application_a_conflict_or_invalid_input_without_writing(self):
+        with self.lock.acquire():
+            self.register("orders")
+            self.register("billing", deployment_uid=1002, deployment_user="ship-billing")
+            before = {name: (self.directory / name).read_bytes() for name in os.listdir(self.directory)}
+            with self.assertRaisesRegex(RegistryError, "not registered"):
+                self.registry.update("catalog", **request("catalog"))
+            with self.assertRaisesRegex(RegistryError, "hostname"):
+                self.registry.update("orders", **request("orders", api_domain="billing.example.com"))
+            for bad in ({"api_domain": "bad domain"}, {"max_memory_mb": 0}, {"runtime": "vm"}):
+                with self.subTest(bad=bad), self.assertRaises(RegistryError):
+                    self.registry.update("orders", **request("orders", **bad))
+        self.assertEqual({name: (self.directory / name).read_bytes() for name in os.listdir(self.directory)}, before)
+
+    def test_update_requires_the_host_lock(self):
+        with self.assertRaisesRegex(RegistryError, "lock"):
+            self.registry.update("orders", **request("orders"))
+        self.assertEqual(os.listdir(self.directory), [])
+
     def test_hostname_and_account_conflicts_are_refused_without_writing(self):
         with self.lock.acquire():
             self.register("orders")
