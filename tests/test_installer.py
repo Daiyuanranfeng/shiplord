@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import shiplord
 from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
@@ -237,12 +238,26 @@ class BootstrapTests(InstallerTestCase):
 
     def test_a_missing_caddy_binary_names_caddy_and_how_to_install_it(self):
         self.caddy.unavailable_at = 1
-        with self.assertRaisesRegex(
-                BootstrapError, r"Caddy is not installed.*install the caddy package.*/usr/bin/caddy"):
-            self.run_bootstrap()
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": ""}):
+            with self.assertRaisesRegex(
+                    BootstrapError, r"Caddy is not installed.*install the caddy package.*/usr/bin/caddy"):
+                self.run_bootstrap()
         self.assertEqual(self.caddy.validated, 1)  # the probe; nothing else ran
         self.assertFalse(self.layout.lib.exists())
         self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_missing_caddy_binary_names_the_configured_path(self):
+        self.caddy.unavailable_at = 1
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": "/opt/caddy/caddy"}):
+            with self.assertRaisesRegex(BootstrapError, r"put the binary at /opt/caddy/caddy"):
+                self.run_bootstrap()
+        self.assertEqual(self.caddy.validated, 1)
+
+    def test_a_missing_caddy_binary_names_a_runners_own_path(self):
+        self.caddy.unavailable_at = 1
+        self.caddy.caddy = "/opt/runner/caddy"
+        with self.assertRaisesRegex(BootstrapError, r"put the binary at /opt/runner/caddy"):
+            self.run_bootstrap()
 
     def test_a_missing_caddy_binary_leaves_the_previous_helper_active(self):
         first = self.run_bootstrap()

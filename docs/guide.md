@@ -32,7 +32,14 @@ verified: the plan's controlled install on *your* production server (§12E). See
   anything, and refuses the server with a message naming the path and the version instead of failing later with
   an unreadable response. Install Caddy from its official package repository (the `caddy` package) so the binary
   is at `/usr/bin/caddy`; `shiplord server bootstrap` validates a fixed minimal Caddyfile before it installs or
-  switches the helper, and refuses a host without Caddy with a message naming the package and that path.
+  switches the helper, and refuses a host without Caddy with a message naming the package and that path. A Caddy
+  binary elsewhere is configured with `SHIPLORD_CADDY_BINARY`, which must be an absolute path; a relative or
+  malformed value is ignored and `/usr/bin/caddy` is used. Only the processes that run the helper read it: the
+  bootstrap preflight, the administrator operations, and the deploy worker. The local CLI never forwards it, and
+  `sudo` drops it unless the host keeps it (`sudo -E`, or `env_keep` for that variable). The worker is started
+  with `systemd-run`, so it inherits the systemd manager's environment rather than your shell: for a
+  non-standard path at deploy time, set `DefaultEnvironment=SHIPLORD_CADDY_BINARY=...` in the manager
+  configuration. The Caddy child process itself never receives the variable.
 - **Your machine:** Python 3.11 or later, Git, and OpenSSH.
 
 ## Install the CLI
