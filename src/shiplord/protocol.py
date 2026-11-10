@@ -11,9 +11,9 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 _IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ACTIONS = {"capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"}
-ADMIN_ACTIONS = {"provision", "keys", "environment", "registry", "deprovision", "doctor", "apps"}
+ADMIN_ACTIONS = {"provision", "keys", "environment", "registry", "deprovision", "doctor", "apps", "uninstall"}
 HOSTWIDE_ACTIONS = {"capabilities", "doctor"}  # requests that name no application
-ADMIN_HOSTWIDE_ACTIONS = {"doctor", "apps"}
+ADMIN_HOSTWIDE_ACTIONS = {"doctor", "apps", "uninstall"}
 
 
 class ProtocolError(ValueError):

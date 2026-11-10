@@ -24,6 +24,30 @@
 Bootstrap adds exactly one line to the main Caddyfile (`import /etc/caddy/ship/*.caddy`) after validating it,
 and never rewrites anything else in it.
 
+Each successful bootstrap also collects old helper versions. It keeps the version that is running, every version a
+symlink in `/usr/local/lib/shiplord` points at (including `current`), and the newest other finished version as the
+rollback target, and removes older ones. A directory whose name bootstrap did not generate, or that never finished
+installing, is left for the next run.
+
+## Removing Shiplord from a server
+
+`shiplord server uninstall <alias>` removes exactly what bootstrap installed: the four launchers, the helper code
+and its `current` link, the sshd drop-in, and the managed Caddy import and placeholder route. Each removal is
+proven by ownership, not by path alone. A launcher is removed only when its bytes are the ones bootstrap writes;
+the sshd drop-in and Caddy placeholder only when they still start with Shiplord's managed marker; a version
+directory only when its name is one bootstrap generates and it holds the `.complete` marker; and a directory only
+when it is empty. Anything else is left in place and named in the report.
+
+Application artifacts are never deleted, with or without `--force`: registrations, keys, sudoers rules, routes,
+accounts, `/var/lib/shiplord` state, `/opt/shiplord` releases, and native application data under
+`/var/lib/shiplord/data` stay. The command prints what it left behind and the one thing it always keeps, the state
+directory that holds the host lock.
+
+The command refuses while any application is still provisioned, before it changes anything. Deprovision the
+applications first, or pass `--force` to remove the host and leave every application artifact in place; a later
+`shiplord server bootstrap <alias>` restores service. Uninstall is idempotent: a second run removes nothing and
+reports that the host was already uninstalled. Run `shiplord server bootstrap <alias>` to install the helper again.
+
 ## Accounts
 
 - `ship-<app>`: the deployment account (for long names, a shortened name with a hash). Its shell is only ever

@@ -227,7 +227,7 @@ class AdminClient:
             raise ClientError(f"sudo failed on the server: {stderr.decode('utf-8', 'replace').strip()[:200]}", 3)
         return stdout, stderr, status
 
-    def call(self, action: str, application_id: str, arguments: dict, *, timeout: float = 120) -> dict:
+    def call(self, action: str, application_id: str | None, arguments: dict, *, timeout: float = 120) -> dict:
         request_id = new_request_id("admin")
         message = {"version": PROTOCOL_VERSION, "request_id": request_id, "action": action,
                    "application_id": application_id, "commit": None, "arguments": arguments}
@@ -236,9 +236,10 @@ class AdminClient:
         if response.get("status") == "incompatible":
             raise ClientError("the server helper speaks a different protocol version", 4)
         if response.get("status") != "ok":
-            raise ClientError(response.get("message") or f"the server refused the request ({response.get('error')})",
-                              3 if response.get("error") == "denied" else 2 if response.get("error") == "invalid_request" else 1,
-                              error_code=response.get("error"))
+            error = response.get("error")
+            raise ClientError(response.get("message") or f"the server refused the request ({error})",
+                              3 if error == "denied" else 2 if error in ("invalid_request", "rejected") else 1,
+                              error_code=error)
         return response["result"]
 
 

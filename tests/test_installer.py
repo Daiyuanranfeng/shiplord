@@ -8,10 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import shiplord
 from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
-                                SSHD_DROPIN, BootstrapError, bootstrap, helper_modules, python_supported)
+                                SSHD_DROPIN, BootstrapError, bootstrap, collect_old_versions, helper_modules,
+                                python_supported)
 from shiplord.layout import Layout, deployment_user
 from shiplord.routing import RoutingError
 from shiplord.system import TRUNCATION_MARKER, CommandResult
@@ -235,6 +237,89 @@ class BootstrapTests(InstallerTestCase):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
         self.assertNotIn(["/usr/sbin/sshd", "-t"], self.system.calls)
+
+
+class CollectTests(InstallerTestCase):
+    """A successful bootstrap keeps the current and previous helper versions and collects older ones."""
+
+    def version(self, name, *, complete=True):
+        path = self.layout.lib / name
+        (path / "shiplord").mkdir(parents=True)
+        (path / "shiplord" / "installer.py").write_text("x = 1\n")
+        if complete:
+            (path / ".complete").write_text("")
+        return path
+
+    def age(self, path, marker_mtime_ns):
+        os.utime(path / ".complete", ns=(marker_mtime_ns, marker_mtime_ns))
+
+    def old_versions(self):
+        """Two finished versions older than the installed one, newest first after the current version."""
+        first = self.run_bootstrap()
+        base = (self.layout.lib / first["version"] / ".complete").stat().st_mtime_ns
+        older = self.version("0.1.0-aaaaaaaaaaaa")
+        newer = self.version("0.1.0-bbbbbbbbbbbb")
+        self.age(older, base - 2_000_000_000)
+        self.age(newer, base - 1_000_000_000)
+        return first, older, newer
+
+    def test_a_second_bootstrap_keeps_the_current_and_the_previous_version(self):
+        first, older, newer = self.old_versions()
+        second = self.run_bootstrap()
+        self.assertEqual(second["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue((self.layout.lib / first["version"]).is_dir())
+        self.assertTrue(newer.is_dir())
+        self.assertFalse(older.exists())
+
+    def test_collecting_again_removes_nothing(self):
+        self.old_versions()
+        self.run_bootstrap()
+        self.assertEqual(self.run_bootstrap()["collected"], [])
+
+    def test_a_version_a_symlink_points_at_is_kept(self):
+        _first, older, newer = self.old_versions()
+        (self.layout.lib / "rollback").symlink_to(older.name)
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_the_version_the_running_helper_executes_from_is_kept(self):
+        _first, older, newer = self.old_versions()
+        running = older / "shiplord" / "installer.py"
+        with patch("shiplord.installer.__file__", str(running)):
+            self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_an_unfinished_version_and_a_foreign_directory_are_left_alone(self):
+        self.old_versions()
+        unfinished = self.version("0.1.0-cccccccccccc", complete=False)
+        foreign = self.layout.lib / "manual"
+        foreign.mkdir()
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue(unfinished.is_dir())
+        self.assertTrue(foreign.is_dir())
+
+    def test_a_collection_failure_is_a_warning_not_a_failed_bootstrap(self):
+        _first, older, _newer = self.old_versions()
+        with patch("shiplord.installer.remove_version_tree",
+                   side_effect=BootstrapError("could not remove an old helper version")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["collected"], [])
+        self.assertEqual(result["warnings"], ["could not remove an old helper version"])
+        self.assertTrue(older.is_dir())
+
+    def test_a_listing_failure_is_a_warning_without_a_host_path(self):
+        self.run_bootstrap()
+        with patch("shiplord.installer.complete_versions",
+                   side_effect=OSError(13, "Permission denied", "/var/lib/shiplord/current")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["warnings"], ["old helper versions could not be collected"])
+        self.assertNotIn("/var/lib", result["warnings"][0])
+
+    def test_collecting_needs_an_installed_helper_directory(self):
+        with self.assertRaisesRegex(BootstrapError, "helper directory"):
+            collect_old_versions(self.layout)
 
 
 class SshdTests(InstallerTestCase):

@@ -561,6 +561,83 @@ class EnsureImportTests(RoutingTestCase):
         self.assertTrue(caught.exception.intervention_required)
 
 
+class RemoveImportTests(RoutingTestCase):
+    """Uninstall removes the managed import once, and only when it is the one Shiplord wrote."""
+
+    def setUp(self):
+        super().setUp()
+        self.line = f"import {self.root}/ship/*.caddy\n"
+
+    def test_removes_only_the_managed_import_and_reloads_once(self):
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual(self.caddy.reload_calls, 1)
+        self.assertNotIn(self.line, self.caddy.validate_calls[0]["text"])
+        self.assertIn("example.org", self.caddy.validate_calls[0]["text"])
+        self.assertNoTransactionLeftovers()
+        self.assertEqual(self.mode(self.root / "Caddyfile"), 0o644)
+
+    def test_a_caddyfile_without_the_import_is_left_untouched(self):
+        self.write_main(self.MAIN)
+        before = self.snapshot()
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls, self.caddy.validate_calls), (before, 0, []))
+
+    def test_rewriting_the_caddyfile_preserves_its_owner_and_mode(self):
+        path = self.root / "Caddyfile"
+        path.chmod(0o640)
+        before = path.stat()
+        with self.lock.acquire():
+            self.manager.remove_import()
+        after = path.stat()
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o640, before.st_uid, before.st_gid))
+
+    def test_duplicate_imports_missing_file_and_missing_lock_are_refused(self):
+        with self.assertRaisesRegex(RoutingError, "lock"):
+            self.manager.remove_import()
+        self.write_main(self.MAIN + self.line + self.line)
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "more than once"):
+            self.manager.remove_import()
+        self.assertEqual(self.snapshot(), before)
+        (self.root / "Caddyfile").unlink()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "missing"):
+            self.manager.remove_import()
+
+    def test_an_interrupted_change_is_refused_without_touching_anything(self):
+        (self.root / ".prior-Caddyfile").write_text("old")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertEqual((self.root / ".prior-Caddyfile").read_text(), "old")
+        self.assertEqual([p.name for p in self.root.rglob(".tmp-*")], [])
+        self.assertEqual([p.name for p in self.root.rglob(".shiplord-validate-*")], [])
+
+    def test_validation_failure_leaves_the_caddyfile_untouched(self):
+        self.caddy.fail_validate = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertEqual(caught.exception.kind, "validation")
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertNoTransactionLeftovers()
+
+    def test_reload_failure_restores_the_caddyfile_and_reloads_again(self):
+        self.caddy.fail_reload = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertFalse(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 2))
+        self.assertNoTransactionLeftovers()
+
+
 class SubprocessCaddyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

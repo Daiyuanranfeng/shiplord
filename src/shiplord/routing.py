@@ -328,6 +328,56 @@ class RouteManager:
             os.close(root)
             os.close(ship)
 
+    def remove_import(self) -> RouteResult:
+        """Remove the managed import from the main Caddyfile once, validated and restorable."""
+        if not self.lock.held:
+            raise RoutingError("host lock is required", "precondition")
+        try:
+            root = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise RoutingError("Caddy directory is unavailable", "precondition") from None
+        try:
+            _directory(root)
+            prior, token = ".prior-Caddyfile", secrets.token_hex(8)
+            if os.path.lexists(self.root / prior):
+                raise RoutingError("an interrupted Caddyfile change requires manual inspection", "interrupted",
+                                   intervention_required=True)
+            main = _read_file(root, "Caddyfile", trusted=True)
+            if main is None:
+                raise RoutingError("the main Caddyfile is missing", "precondition")
+            text = main.data.decode("utf-8", "replace")
+            found = _Inspection("", self.own_glob, False).own_import_lines(text)
+            if not found:
+                return RouteResult(changed=False)
+            if len(found) > 1:
+                raise RoutingError("the main Caddyfile imports the managed routes more than once", "precondition")
+            lines = text.splitlines()
+            del lines[found[0]]
+            candidate = ("\n".join(lines) + "\n" if lines else "").encode()
+            name = _VALIDATE_PREFIX + token
+            self._create(root, name, candidate, preserve=main)
+            try:
+                self.commands.validate(self.root / name)
+            except RoutingError as error:
+                raise RoutingError("Caddy rejected the Caddyfile without the managed import", "validation",
+                                   detail=error.detail) from None
+            finally:
+                self._unlink(root, name)
+            temp = _TEMP_PREFIX + "Caddyfile-" + token
+            self._create(root, temp, candidate, preserve=main)
+            os.link("Caddyfile", prior, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+            self._publish(root, temp, "Caddyfile")
+            try:
+                self.commands.reload()
+            except RoutingError as error:
+                self._restore(root, "Caddyfile", prior, True, error)
+                raise RoutingError("Caddy rejected the Caddyfile without the managed import; it was restored",
+                                   "reload", detail=error.detail) from None
+            self._unlink(root, prior)
+            return RouteResult(changed=True)
+        finally:
+            os.close(root)
+
     # implementation
     def _open(self) -> tuple[int, int]:
         try:
