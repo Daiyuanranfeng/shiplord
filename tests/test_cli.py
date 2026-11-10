@@ -855,8 +855,8 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertTrue(run.call_args.kwargs["force_stop"])
         self.assertEqual(run.call_args.args[2], "recover")
-        plain = CliRunner().invoke(cli.app, ["recover", "--help"])
-        self.assertIn("--force-stop", plain.output)
+        plain = CliRunner().invoke(cli.app, ["recover", "--help"], color=True)
+        self.assertIn("--force-stop", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
 
     def test_plan_renders_release_route_storage_and_shutdown_changes(self):
         plan_result = {
