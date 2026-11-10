@@ -14,7 +14,7 @@ from . import __version__
 from .authorization import AuthorizationError, authorize_application
 from .framing import read_frame, write_frame
 from .host import HostDeadline, extend_deadline, run_timed
-from .jobs import MAX_PENDING_JOBS, JobError
+from .jobs import MAX_PENDING_JOBS, JobError, valid_job_id
 from .native import host_architecture
 from .payload import PayloadError, discard_upload, receive_payload
 from .manifest import GENERIC_DOCKER_FEATURE, ManifestError
@@ -127,6 +127,8 @@ def _prepare(request: dict):
 
     if action == "status":
         job_id = _arguments(request, {"job_id"}).get("job_id")
+        if job_id is not None and not valid_job_id(job_id):
+            raise ProtocolError("job_id must be a job ID")
         return (lambda session, source: ok({"application": session.deployer().status(),
                                            "job": _job(session, job_id)})), False
     if action == "logs":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import re
+import shlex
 import socket
 import ssl
 import subprocess
@@ -14,6 +15,7 @@ from typing import Callable
 
 from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
+from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
@@ -266,7 +268,8 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     request_id = request_id or new_request_id("deploy")
     timeout = timeout or job_timeout(manifest)
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
-                              timeout=timeout, on_progress=on_progress, payload=binary)
+                              timeout=timeout, on_progress=on_progress, payload=binary,
+                              lookup_command=status_lookup_command(manifest, request_id))
     result = {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
               "exit_code": outcome["exit_code"], **outcome["detail"]}
     code = outcome["exit_code"]
@@ -291,8 +294,18 @@ def plan_application(manifest: dict, client: HelperClient, *, image: str | None 
     return 0, {"ok": True, "scope": "server plan; nothing was changed", **response["result"]}
 
 
+def status_lookup_command(manifest: dict, job_id: str) -> str | None:
+    """A copyable command that reads one job back, when the application and registered alias are known."""
+    name, server = manifest.get("name"), manifest.get("server")
+    if not isinstance(name, str) or not isinstance(server, str):
+        return None
+    return f"shiplord status {name} --server {server} --job-id {shlex.quote(job_id)}"
+
+
 def application_status(client: HelperClient, job_id: str | None = None) -> tuple[int, dict]:
-    response = client.call("status", arguments={"job_id": job_id} if job_id else {})
+    if job_id is not None and not valid_job_id(job_id):
+        raise CommandError("--job-id must start with a letter or digit and contain only letters, digits, '-' and '_'")
+    response = client.call("status", arguments={"job_id": job_id} if job_id is not None else {})
     return 0, {"ok": True, **response["result"]}
 
 
@@ -306,7 +319,7 @@ def run_job_command(manifest: dict, client: HelperClient, action: str, *, reques
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
     outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress)
+                              on_progress=on_progress, lookup_command=status_lookup_command(manifest, request_id))
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 

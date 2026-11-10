@@ -160,7 +160,7 @@ class HelperClient:
 
 def wait_for_job(client: HelperClient, job_id: str, *, timeout: float, on_progress: Callable[[str], None] = lambda p: None,
                  interval: float = POLL_INTERVAL_SECONDS, sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> dict:
+                 clock: Callable[[], float] = time.monotonic, lookup_command: str | None = None) -> dict:
     """Poll a job by ID until it finishes; tolerates brief SSH failures. Returns the outcome dict."""
     deadline, failures, last_phase = clock() + timeout, 0, None
     while True:
@@ -183,13 +183,14 @@ def wait_for_job(client: HelperClient, job_id: str, *, timeout: float, on_progre
                         "detail": {"error": "worker_vanished", "job_id": job_id,
                                    "message": "the job stopped before finishing; run `shiplord recover`"}}
         if clock() >= deadline:
-            raise ClientError(f"timed out waiting for job {job_id}; it may still be running: run `shiplord status`", 1)
+            hint = f"run `{lookup_command}`" if lookup_command else "run `shiplord status`"
+            raise ClientError(f"timed out waiting for job {job_id}; it may still be running: {hint}", 1)
         sleep(interval)
 
 
 def submit_and_wait(client: HelperClient, action: str, *, request_id: str, commit: str | None = None,
                     arguments: dict | None = None, timeout: float, on_progress: Callable[[str], None] = lambda p: None,
-                    payload: Path | None = None, **wait_options) -> dict:
+                    payload: Path | None = None, lookup_command: str | None = None, **wait_options) -> dict:
     response = client.call(action, request_id=request_id, commit=commit, arguments=arguments, payload=payload)
     if response["status"] == "finished":
         return response["outcome"]
@@ -199,7 +200,8 @@ def submit_and_wait(client: HelperClient, action: str, *, request_id: str, commi
     on_progress(job["phase"])
     if job["state"] == "finished":
         return job["outcome"]
-    return wait_for_job(client, request_id, timeout=timeout, on_progress=on_progress, **wait_options)
+    return wait_for_job(client, request_id, timeout=timeout, on_progress=on_progress,
+                        lookup_command=lookup_command, **wait_options)
 
 
 class AdminClient:

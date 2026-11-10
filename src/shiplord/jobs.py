@@ -33,6 +33,11 @@ class JobError(StateError):
     """A job record is invalid, or the job cannot be created or launched."""
 
 
+def valid_job_id(value: object) -> bool:
+    """Whether a value can name a job; request IDs and job IDs share one grammar."""
+    return isinstance(value, str) and bool(_ID.fullmatch(value))
+
+
 def unit_name(application_id: str, request_id: str) -> str:
     # ":" is legal in a unit name but cannot occur in an application name or request ID, so two (app, request) pairs
     # can never produce the same name, and no job name can equal a native application's "shiplord-<app>.service".
@@ -62,7 +67,7 @@ class JobStore:
 
     @staticmethod
     def _name(request_id: str) -> str:
-        if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
+        if not valid_job_id(request_id):
             raise JobError("invalid job ID")
         return request_id + ".json"
 

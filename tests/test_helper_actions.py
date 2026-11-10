@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fakes import FakeCaddy, FakeProbes, FakeRuntime, configuration, record, request  # noqa: E402
 from shiplord.host import HostDeadline  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
-from shiplord.jobs import JobError  # noqa: E402
+from shiplord.jobs import JobError, JobStore  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.privileged_host import dispatch, job_view, serve  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION, ProtocolError  # noqa: E402
@@ -115,10 +115,10 @@ class ReadOnlyActionTests(HelperTestCase):
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
-        bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}) if False else ("logs", {"tail": 0}),
-               ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}), ("deploy", {}),
-               ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}), ("rollback", {"x": 1}),
-               ("recover", {"x": 1})]
+        bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}), ("status", {"job_id": 5}),
+               ("logs", {"tail": 0}), ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}),
+               ("deploy", {}), ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}),
+               ("rollback", {"x": 1}), ("recover", {"x": 1})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
@@ -136,6 +136,16 @@ class ReadOnlyActionTests(HelperTestCase):
         self.assertIsNone(self.call("status", job_id="nope")[0]["result"]["job"])
         with self.assertRaises(Exception):
             self.call("status", job_id="../etc/passwd")
+
+    def test_status_job_lookup_is_scoped_to_the_application(self):
+        billing = self.layout.jobs / "billing"
+        billing.mkdir(mode=0o700)
+        descriptor = os.open(billing, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            JobStore("billing", descriptor).create("billing-1", "deploy", request())
+        finally:
+            os.close(descriptor)
+        self.assertIsNone(self.call("status", job_id="billing-1")[0]["result"]["job"])
 
     def test_logs_return_the_runtime_output(self):
         self.runtime.logs = lambda registration, tail: f"tail={tail}\n"

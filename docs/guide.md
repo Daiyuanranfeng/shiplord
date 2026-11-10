@@ -218,7 +218,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
-| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
+| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
