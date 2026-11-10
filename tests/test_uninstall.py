@@ -192,6 +192,17 @@ class OwnershipTests(UninstallTestCase):
             self.run_uninstall()
         self.assertTrue(self.layout.releases.is_dir())
 
+    def test_a_symlinked_managed_directory_is_left_in_place(self):
+        elsewhere = self.layout.releases.parent / "elsewhere"
+        elsewhere.mkdir()
+        self.layout.releases.rmdir()
+        self.layout.releases.symlink_to(elsewhere)
+        result = self.run_uninstall()
+        self.assertNotIn("releases", result["removed"]["directories"])
+        self.assertTrue(self.layout.releases.is_symlink())  # the link is never followed and never unlinked
+        self.assertTrue(elsewhere.is_dir())
+        self.assertTrue(any("releases" in note for note in result["retained"]))
+
     def test_a_launcher_shiplord_did_not_write_is_left_in_place(self):
         foreign = "#!/bin/sh\nexec /bin/true\n"
         self.layout.host.write_text(foreign)

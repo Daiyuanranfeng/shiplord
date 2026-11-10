@@ -132,6 +132,9 @@ def _remove_empty(path: Path, what: str) -> bool:
     if parent is None:
         return False
     try:
+        entry = _entry(parent, path.name)
+        if entry is None or not stat.S_ISDIR(entry.st_mode):
+            return False  # a link or a file at this path is not the directory bootstrap created
         child = _open_at(parent, path.name, "a Shiplord directory is unavailable")
         if child is None:
             return False
@@ -302,7 +305,7 @@ def _retained(layout: Layout, applications: list[str], removed: dict) -> list[st
         notes.append("the helper directory, which still holds files Shiplord did not write")
     leftovers = [name for name in MANAGED_DIRECTORIES if os.path.lexists(getattr(layout, name))]
     if leftovers:
-        notes.append("managed state directories that still hold files: " + ", ".join(leftovers))
+        notes.append("managed state directories that are still present: " + ", ".join(leftovers))
     notes.append("the state directory that holds the host lock")
     return notes
 
