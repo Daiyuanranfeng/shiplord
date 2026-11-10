@@ -30,7 +30,14 @@ verified: the plan's controlled install on *your* production server (§12E). See
   helper reads TOML with `tomllib`, which only exists from Python 3.11, so Ubuntu
   22.04 (Python 3.10) and Debian 11 (Python 3.9) are too old. `shiplord server bootstrap` checks that
   interpreter over SSH before it builds or uploads anything, and refuses the server with a message naming the
-  path and the version instead of failing later with an unreadable response.
+  path and the version instead of failing later with an unreadable response. A Caddy binary elsewhere is
+  configured with `SHIPLORD_CADDY_BINARY`, which must be an absolute path; a relative or malformed value is
+  ignored and `/usr/bin/caddy` is used. Only the processes that run the helper read it: the bootstrap
+  preflight, the administrator operations, and the deploy worker. The local CLI never forwards it, and `sudo`
+  drops it unless the host keeps it (`sudo -E`, or `env_keep` for that variable). The worker is started with
+  `systemd-run`, so it inherits the systemd manager's environment rather than your shell: for a non-standard
+  path at deploy time, set `DefaultEnvironment=SHIPLORD_CADDY_BINARY=...` in the manager configuration. The
+  Caddy child process itself never receives the variable.
 - **Your machine:** Python 3.11 or later, Git, and OpenSSH.
 
 ## Install the CLI

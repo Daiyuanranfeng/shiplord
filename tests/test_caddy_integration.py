@@ -267,6 +267,36 @@ class RealCaddyTests(unittest.TestCase):
         self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"still served")
         self.assertEqual([p.name for p in self.root.rglob(".*")], [])
 
+    def test_a_symlinked_sites_enabled_file_is_inspected(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "orders.conf"
+        target.write_text("orders.example.com {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "orders.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(self.registration(managed_port(set())))
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(list((self.root / "ship").iterdir()), [])
+
+    def test_a_symlinked_sites_enabled_file_for_another_site_still_applies(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "legacy.conf"
+        target.write_text("legacy.example.net {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "legacy.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
     def test_a_caddyfile_that_reads_a_service_variable_validates(self):
         # A container without systemd cannot report the unit, so this exercises the packaged-defaults path: the
         # variable the Caddyfile reads has to reach `caddy validate`, or the file is judged broken for no reason.

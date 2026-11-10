@@ -23,7 +23,7 @@ from pathlib import Path
 from . import __version__
 from .layout import Layout
 from .release_state import HostLock
-from .routing import CaddyCommands, RouteManager, RoutingError, probe_caddy
+from .routing import CaddyCommands, RouteManager, RoutingError, caddy_binary, probe_caddy
 from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
 CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
@@ -61,7 +61,6 @@ Match Group {group}
 """
 SSHD = "/usr/sbin/sshd"
 SYSTEMCTL = "/usr/bin/systemctl"
-CADDY_BINARY = "/usr/bin/caddy"  # SubprocessCaddy's default, and the path a bootstrap refusal names
 SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
 SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
 SSHD_INCLUDE_DEPTH = 8
@@ -415,6 +414,12 @@ def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None)
     return True
 
 
+def _caddy_binary(caddy: CaddyCommands) -> str:
+    """The Caddy path a refusal names: the runner's own when it has one, else the documented resolution."""
+    configured = getattr(caddy, "caddy", None)
+    return configured if isinstance(configured, str) and configured else caddy_binary()
+
+
 def _caddy_preflight(caddy: CaddyCommands) -> None:
     """Refuse a host whose Caddy cannot run, before any Shiplord directory or helper is written."""
     try:
@@ -423,7 +428,7 @@ def _caddy_preflight(caddy: CaddyCommands) -> None:
         if error.kind == "unavailable":
             raise BootstrapError(
                 "Caddy is not installed or cannot be started: install the caddy package or put the binary at "
-                f"{CADDY_BINARY}") from None
+                f"{_caddy_binary(caddy)}") from None
         raise BootstrapError(
             f"Caddy rejected a minimal configuration ({error.kind}): check the Caddy installation") from None
 
