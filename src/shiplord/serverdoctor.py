@@ -7,7 +7,7 @@ import shutil
 from http.client import HTTPException
 from pathlib import Path
 
-from .installer import SSHD_DROPIN, sshd_dropin_included, sshd_units
+from .installer import DEPLOY_GROUP, SSHD_DROPIN, sshd_dropin_included, sshd_units
 from .layout import Layout
 from .probes import http_get
 from .registry import Registry
@@ -92,7 +92,8 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
     active, _ = _run(system, ["/usr/bin/systemctl", "is-active", "--quiet", "caddy"])
     checks["caddy"] = {"ok": wired and active, "import_present": wired, "service_active": active,
                        "admin_api": _admin_api_reachable()}  # informational: deploys cannot verify routing without it
-    dropin_ok = layout.sshd_dropin.is_file() and layout.sshd_dropin.read_text() == SSHD_DROPIN.format(keys=layout.authorized_keys)
+    dropin_ok = layout.sshd_dropin.is_file() and layout.sshd_dropin.read_text() == SSHD_DROPIN.format(
+        keys=layout.authorized_keys, group=DEPLOY_GROUP)
     valid, _ = _run(system, ["/usr/sbin/sshd", "-t"])
     try:
         unit, _socket = sshd_units(system)

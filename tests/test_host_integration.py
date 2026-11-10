@@ -19,7 +19,7 @@ from pathlib import Path
 import shiplord
 from shiplord.admin import run as admin_run
 from shiplord.framing import read_frame, write_frame
-from shiplord.installer import bootstrap
+from shiplord.installer import DEPLOY_GROUP, bootstrap
 from shiplord.layout import Layout
 from shiplord.protocol import PROTOCOL_VERSION
 from shiplord.routing import SubprocessCaddy
@@ -30,6 +30,7 @@ ENABLED = (os.environ.get("SHIPLORD_TEST_HOST") == "1" and DISPOSABLE and os.get
            and shutil.which("caddy") and shutil.which("sshd"))
 SOURCE = Path(shiplord.__file__).parent
 PORT = 2222
+CA_PORT = 2223  # a second sshd that trusts an SSH CA and runs an AuthorizedKeysCommand
 
 
 class NoSystemd(HostSystem):
@@ -63,11 +64,20 @@ def _port_open(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
-def ssh(key: Path, known_hosts: Path, user: str, *remote: str, stdin: bytes = b"", extra=()):
-    command = ["ssh", "-p", str(PORT), "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+def ssh(key: Path, known_hosts: Path, user: str, *remote: str, stdin: bytes = b"", extra=(), port: int = PORT):
+    command = ["ssh", "-p", str(port), "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
                *extra, f"{user}@127.0.0.1", *remote]
     return subprocess.run(command, input=stdin, capture_output=True, timeout=60)
+
+
+def effective(user: str, config: Path | None = None) -> dict[str, str]:
+    """The sshd configuration sshd itself reports for an account."""
+    command = ["sshd", "-T", "-C", f"user={user},host=localhost,addr=127.0.0.1"]
+    if config is not None:
+        command += ["-f", str(config)]
+    output = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+    return dict(line.split(" ", 1) for line in output.splitlines() if " " in line)
 
 
 def capabilities_frame(application_id):
@@ -148,16 +158,90 @@ class HostIntegrationTests(unittest.TestCase):
                 self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", unit], system.calls)
 
     def test_sshd_match_block_applies_to_deployment_accounts_only(self):
-        def effective(user):
-            output = subprocess.run(["sshd", "-T", "-C", f"user={user},host=localhost,addr=127.0.0.1"],
-                                    capture_output=True, text=True, check=True).stdout
-            return dict(line.split(" ", 1) for line in output.splitlines() if " " in line)
         deployment, other = effective("ship-orders"), effective("someoneelse")
         self.assertEqual(deployment["authorizedkeysfile"], "/etc/shiplord/authorized_keys/%u")
         self.assertEqual((deployment["permittty"], deployment["allowtcpforwarding"], deployment["passwordauthentication"]),
                          ("no", "no", "no"))
+        self.assertEqual((deployment["authorizedkeyscommand"], deployment["trustedusercakeys"]), ("none", "none"))
         self.assertNotIn("shiplord", other["authorizedkeysfile"])
         self.assertEqual(other["permittty"], "yes")  # the Match block did not leak into other accounts
+
+    def test_a_human_account_with_the_deployment_prefix_keeps_the_default_policy(self):
+        subprocess.run(["useradd", "--system", "--no-create-home", "--user-group", "ship-human"], check=True)
+        self.addCleanup(subprocess.run, ["userdel", "ship-human"], check=False)
+        policy = effective("ship-human")
+        self.assertNotIn("shiplord", policy["authorizedkeysfile"])
+        self.assertEqual(policy["permittty"], "yes")
+        self.assertNotIn("ship-human", subprocess.run(["getent", "group", DEPLOY_GROUP],
+                                                      capture_output=True, text=True).stdout)
+
+    def test_an_account_provisioned_after_bootstrap_is_confined(self):
+        """The drop-in is written at bootstrap; this account and its key are created afterwards."""
+        key = self.work / "billing"
+        subprocess.run(["ssh-keygen", "-q", "-N", "", "-t", "ed25519", "-f", str(key)], check=True)
+        self.admin("provision", "billing", {
+            "runtime": "docker", "api_domain": "billing.example.com", "image_repository": "ghcr.io/example/billing",
+            "public_key": (self.work / "billing.pub").read_text(), "key_label": "laptop"})
+        self.addCleanup(self.admin, "deprovision", "billing", {})
+        self.assertIn("ship-billing", subprocess.run(["getent", "group", DEPLOY_GROUP],
+                                                     capture_output=True, text=True).stdout)
+        policy = effective("ship-billing")
+        self.assertEqual(policy["authorizedkeysfile"], "/etc/shiplord/authorized_keys/%u")
+        self.assertEqual((policy["permittty"], policy["authorizedkeyscommand"], policy["trustedusercakeys"]),
+                         ("no", "none", "none"))
+
+    def test_a_host_ca_and_keys_command_cannot_authenticate_a_deployment_account(self):
+        """A host that trusts an SSH CA or runs an AuthorizedKeysCommand must not bypass the forced command."""
+        work = self.work / "ca"
+        work.mkdir()
+        authority = work / "authority"
+        subprocess.run(["ssh-keygen", "-q", "-N", "", "-t", "ed25519", "-C", "test-ca", "-f", str(authority)],
+                       check=True)
+        certified = work / "certified"
+        subprocess.run(["ssh-keygen", "-q", "-N", "", "-t", "ed25519", "-f", str(certified)], check=True)
+        subprocess.run(["ssh-keygen", "-q", "-s", str(authority), "-I", "deploy", "-n", "ship-orders",
+                        f"{certified}.pub"], check=True)
+        stranger = work / "stranger"
+        subprocess.run(["ssh-keygen", "-q", "-N", "", "-t", "ed25519", "-f", str(stranger)], check=True)
+        command = work / "authorized-keys"
+        command.write_text(f"#!/bin/sh\ncat {stranger}.pub\n")
+        command.chmod(0o755)
+        config = work / "sshd_config"
+        config.write_text(
+            f"Port {CA_PORT}\nListenAddress 127.0.0.1\nHostKey /etc/ssh/ssh_host_ed25519_key\n"
+            f"PidFile {work}/sshd.pid\nTrustedUserCAKeys {authority}.pub\n"
+            f"AuthorizedKeysCommand {command} %u\nAuthorizedKeysCommandUser root\n"
+            "Include /etc/ssh/sshd_config.d/*.conf\n")
+        server = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.addCleanup(server.kill)
+        for _ in range(100):
+            if _port_open(CA_PORT):
+                break
+            if server.poll() is not None:
+                self.fail("sshd with an SSH CA did not start: " + server.stderr.read().decode())
+            time.sleep(0.1)
+        else:
+            self.fail("sshd with an SSH CA did not listen")
+
+        outside, inside = effective("someoneelse", config), effective("ship-orders", config)
+        self.assertEqual(outside["trustedusercakeys"], f"{authority}.pub")  # the host settings are live ...
+        self.assertEqual(outside["authorizedkeyscommand"], f"{command} %u")
+        self.assertEqual((inside["trustedusercakeys"], inside["authorizedkeyscommand"]), ("none", "none"))
+
+        host_key = Path("/etc/ssh/ssh_host_ed25519_key.pub").read_text().split()[:2]
+        known_hosts = work / "known_hosts"
+        known_hosts.write_text(f"[127.0.0.1]:{CA_PORT} {host_key[0]} {host_key[1]}\n")
+        certificate = ssh(certified, known_hosts, "ship-orders", "/usr/local/libexec/shiplord-dispatch",
+                          stdin=capabilities_frame("orders"), port=CA_PORT,
+                          extra=("-o", f"CertificateFile={certified}-cert.pub"))
+        self.assertEqual(certificate.returncode, 255, certificate.stderr)
+        keys_command = ssh(stranger, known_hosts, "ship-orders", "/usr/local/libexec/shiplord-dispatch",
+                           stdin=capabilities_frame("orders"), port=CA_PORT)
+        self.assertEqual(keys_command.returncode, 255, keys_command.stderr)
+        allowed = ssh(self.client_key, known_hosts, "ship-orders", "/usr/local/libexec/shiplord-dispatch",
+                      stdin=capabilities_frame("orders"), port=CA_PORT)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)  # the port works; only the forced command answers
 
     def test_repeating_bootstrap_and_provision_changes_nothing(self):
         self.assertFalse(any(bootstrap(self.layout, SOURCE, self.system, self.caddy)["changed"].values()))

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from .environment import EnvironmentError_, load_environment_file, parse_environment
+from .installer import DEPLOY_GROUP, DEPLOY_MARKER
 from .keys import KeyError_, KeyStore, PublicKey, parse_public_key, validate_label
 from .layout import Layout, deployment_user, runtime_user
 from .manifest import validate_app_name
@@ -39,7 +40,7 @@ class ProvisionError(Exception):
 
 def _marker(application_id: str) -> str:
     """The account comment that marks an account as ours; passwd comments cannot contain a colon."""
-    return f"shiplord-deploy-{application_id}"
+    return f"{DEPLOY_MARKER}-{application_id}"
 
 
 def _run(system: System, argv: list[str], step: str):
@@ -78,6 +79,25 @@ def _ensure_user(system: System, name: str, marker: str, home: str, shell: str) 
 
 def _ensure_account(system: System, application_id: str) -> tuple[dict, bool]:
     return _ensure_user(system, deployment_user(application_id), _marker(application_id), "/", "/bin/sh")
+
+
+def _ensure_group_membership(system: System, name: str) -> bool:
+    """Put a deployment account in the group the sshd drop-in matches; idempotent.
+
+    This runs before the account's first key is installed, so a failure here leaves an account that cannot log in
+    rather than one that can log in without the forced command.
+    """
+    result = _run(system, [GETENT, "group", DEPLOY_GROUP], "getent")
+    if result.code == 2:
+        raise ProvisionError("the deployment group is missing; bootstrap the server again")
+    fields = result.output.strip().split(":")
+    if result.code != 0 or len(fields) < 4 or fields[0] != DEPLOY_GROUP:
+        raise ProvisionError("could not read the deployment group")
+    if name in fields[3].split(","):
+        return False
+    if _run(system, [USERMOD, "--append", "--groups", DEPLOY_GROUP, name], "usermod").code != 0:
+        raise ProvisionError("could not add the deployment account to the deployment group")
+    return True
 
 
 def _ensure_runtime(layout: Layout, system: System, application_id: str) -> dict[str, bool]:
@@ -168,6 +188,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
         raise ProvisionError(f"invalid application settings: {error}") from None
     created: dict[str, bool] = {}
     account, created["account"] = _ensure_account(system, app)
+    created["deployment_group"] = _ensure_group_membership(system, account["name"])
     if runtime == "native":
         created.update(_ensure_runtime(layout, system, app))
     created["state_directory"] = _private_directory(layout.app_state / app)

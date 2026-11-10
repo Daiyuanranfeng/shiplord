@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from shiplord.admin import parse_request, run, serve
 from shiplord.framing import read_frame, write_frame
+from shiplord.installer import DEPLOY_GROUP
 from shiplord.layout import Layout
 from shiplord.protocol import ProtocolError
 from shiplord.registry import Registry
@@ -42,19 +43,29 @@ class FakeSystem:
 
     def __init__(self):
         self.users: dict[str, dict] = {}
+        self.groups: dict[str, set[str]] = {DEPLOY_GROUP: set()}  # bootstrap creates the group
         self.calls: list[list[str]] = []
         self.visudo_code = 0
         self.next_uid = 900
         self.fail = set()
+        self.fail_membership = False
         self.busy_userdel = 0
 
-    def run(self, argv, *, input=None, timeout=60):
+    def run(self, argv, *, input=None, timeout=60, max_output=None):
         argv = list(argv)
         self.calls.append(argv)
         tool = argv[0].rsplit("/", 1)[-1]
         if tool in self.fail:
             return CommandResult(1, "failed")
+        if tool == "getent" and argv[1] == "group":
+            members = self.groups.get(argv[2])
+            return CommandResult(2, "") if members is None else CommandResult(
+                0, f"{argv[2]}:x:990:{','.join(sorted(members))}\n")
         if tool == "getent":
+            if len(argv) == 2:  # the whole passwd database, as bootstrap reads it
+                return CommandResult(0, "".join(f"{name}:x:{user['uid']}:{user['uid']}:{user['comment']}:"
+                                                f"{user['home']}:{user['shell']}\n"
+                                                for name, user in sorted(self.users.items())))
             user = self.users.get(argv[2])
             if user is None:
                 return CommandResult(2, "")
@@ -66,7 +77,12 @@ class FakeSystem:
             self.next_uid += 1
             return CommandResult(0, "")
         if tool == "usermod":
-            self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
+            if "--groups" in argv:
+                if self.fail_membership:
+                    return CommandResult(1, "failed")
+                self.groups.setdefault(argv[argv.index("--groups") + 1], set()).add(argv[-1])
+            else:
+                self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
             return CommandResult(0, "")
         if tool == "userdel":
             if self.busy_userdel:  # a lingering session: userdel reports "currently logged in" until it ends
@@ -151,7 +167,22 @@ class ProvisionTests(ProvisionTestCase):
         self.assertFalse(any(second["created"].values()), second["created"])
         self.assertEqual((second["host_port"], second["deployment_user"]), (first["host_port"], first["deployment_user"]))
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent"])
+        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent", "getent"])
+
+    def test_a_new_deployment_account_joins_the_group_the_sshd_policy_matches(self):
+        """An account created after bootstrap must be covered by the drop-in bootstrap already wrote."""
+        result = self.provision()
+        self.assertTrue(result["created"]["deployment_group"])
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
+        self.assertIn(["/usr/sbin/usermod", "--append", "--groups", DEPLOY_GROUP, "ship-orders"], self.system.calls)
+
+    def test_membership_is_set_before_the_account_can_authenticate(self):
+        self.system.fail_membership = True
+        with self.assertRaisesRegex(ProvisionError, "deployment group"):
+            self.provision()
+        self.assertFalse((self.layout.authorized_keys / "ship-orders").exists())
+        self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], set())
 
     def test_second_application_is_isolated(self):
         self.provision("orders")
