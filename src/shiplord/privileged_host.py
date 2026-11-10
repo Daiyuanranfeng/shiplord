@@ -29,7 +29,7 @@ if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities
 MAX_NATIVE_BYTES = 1024 * 1024 * 1024
 UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to finish in time
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
-ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"]
+ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
 FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE]
 
@@ -86,8 +86,10 @@ def _submit(session: "AppSession", request: dict, action: str, payload: dict,
             discard()
         session.jobs.create(request_id, action, payload)
         return {"status": "accepted", "request_id": request_id, "job": job_view(session, existing)}, 0
-    if action == "deploy":
-        refusal = session.deployer().preflight({**payload, "request_id": request_id})
+    if action in ("deploy", "restart"):
+        deployer = session.deployer()
+        refusal = (deployer.preflight({**payload, "request_id": request_id}) if action == "deploy"
+                   else deployer.restart_preflight(request_id))
         if refusal is not None:
             if discard:
                 discard()

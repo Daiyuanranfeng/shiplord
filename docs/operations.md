@@ -83,6 +83,8 @@ units are enabled, but behavior after a power loss has not been verified.
 
 - `access denied`: the application is not provisioned for your key, or `provision` has not run.
 - `recovery_required`: an earlier job was interrupted; run `shiplord recover`.
+- `restart_failed`: the restart did not come back with the new environment and the journal was kept; fix the value,
+  then run `shiplord recover`. This is never reported as a rollback.
 - `stale_release`: a newer release is already deployed. Use `rollback` or `--allow-older` deliberately.
 - Public HTTPS check fails but the deploy succeeded: DNS or certificate issuance has not settled; `doctor` shows
   which. The server-side result separates local readiness, proxy routing, HTTPS, and DNS.

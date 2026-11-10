@@ -178,6 +178,38 @@ class Deployer:
         return {"action": "deploy", "restarts_application": current is not None, **storage, **shutdown,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
+    def restart(self, request_id: str) -> Outcome:
+        """Apply the application's current environment to the committed release, without a new release."""
+        try:
+            refusal = self._gate(request_id)
+            if refusal:
+                return refusal
+            committed = self.state.read_state()
+        except StateError as error:
+            return Outcome("failed", 1, {"error": "state_unreadable", "message": str(error)})
+        current = committed["current"]
+        if current is None:
+            return self._nothing_deployed()
+        return self._transition(request_id, current, committed, restart=True)
+
+    def restart_preflight(self, request_id: str) -> Outcome | None:
+        """Cheap synchronous checks before a restart job is created; None means the request may proceed."""
+        try:
+            refusal = self._gate(request_id)
+            if refusal:
+                return refusal
+            if self.state.read_state()["current"] is None:
+                return self._nothing_deployed()
+            return None
+        except StateError as error:
+            return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
+
+    @staticmethod
+    def _nothing_deployed() -> Outcome:
+        return Outcome("rejected", 2, {"error": "nothing_deployed",
+                                       "message": "no release is deployed, so there is nothing to restart; "
+                                                  "deploy a release first"})
+
     def rollback(self, request_id: str) -> Outcome:
         try:
             refusal = self._gate(request_id)
@@ -260,7 +292,7 @@ class Deployer:
                 "domain": self.registration["api_domain"]}
 
     # the transaction ---------------------------------------------------------
-    def _transition(self, request_id: str, candidate: dict, before: dict) -> Outcome:
+    def _transition(self, request_id: str, candidate: dict, before: dict, *, restart: bool = False) -> Outcome:
         try:
             self._validate_budget(candidate, before["current"])
         except StateError as error:
@@ -300,6 +332,8 @@ class Deployer:
             if isinstance(failure, RuntimeFailure) and failure.intervention_required:
                 # The outgoing process was signalled and may still be draining: restoring would restart or remove it.
                 return self._intervention(failure, probes)
+            if restart:
+                return self._restart_failed(failure, probes, candidate)
             return self._restore(failure, probes, candidate, before)
         try:
             committed = self.state.record_commit()
@@ -461,6 +495,20 @@ class Deployer:
         if target is None:
             return Outcome("failed", 1, failed)
         return Outcome("rolled_back", 5, failed)
+
+    def _restart_failed(self, failure: Exception, probes: dict, candidate: dict) -> Outcome:
+        """A restart that did not come back keeps its journal and asks for a person.
+
+        Restoring the "previous" release would run the same environment file that just failed, so reporting
+        ``rolled_back`` would claim a service restoration that did not happen. The runtime may already have been
+        replaced, so the journal stays until a verified recovery.
+        """
+        failed = {"error": "restart_failed", **self._describe(failure), "probes": probes}
+        failed.update(self._capture_candidate_logs(candidate))
+        failed.update(self._shutdown_report())
+        failed["recovery"] = ("the application did not come back with the new environment; fix the value and run "
+                              "`shiplord recover`")
+        return Outcome("intervention_required", 6, failed)
 
     @staticmethod
     def _describe(failure: Exception) -> dict:

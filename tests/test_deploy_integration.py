@@ -7,6 +7,7 @@ an unhealthy release, and a crashing release.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -26,15 +27,20 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fakes import FakeCaddy  # noqa: E402
 from shiplord import registry, release_state  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
+from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import Probes  # noqa: E402
+from shiplord.protocol import PROTOCOL_VERSION  # noqa: E402
+from shiplord.privileged_host import serve  # noqa: E402
 from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
 from shiplord.routing import RoutingError  # noqa: E402
 from shiplord.retire import make_retirer  # noqa: E402
 from shiplord.runtime import DockerRuntime, release_id  # noqa: E402
+from shiplord.services import HostServices  # noqa: E402
 from shiplord.system import HostSystem  # noqa: E402
+from shiplord.worker import run_job  # noqa: E402
 
 ENABLED = os.environ.get("SHIPLORD_TEST_DOCKER") == "1" and shutil.which("docker")
 REGISTRY_PORT = 5000
@@ -679,6 +685,93 @@ class RealDockerDeployTests(unittest.TestCase):
     def runtime_rollback(self, request_id):
         with self.lock.acquire():
             return self.deployer.rollback(request_id)
+
+    # the authorized helper path, for a test that must go through the dispatcher and the worker ----
+    def register_application(self):
+        """Write the registration the helper reads; it must match the record every deploy in this class used."""
+        self.layout.registrations.mkdir(parents=True, exist_ok=True)
+        self.layout.registrations.chmod(0o700)
+        descriptor = os.open(self.layout.registrations, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        with self.lock.acquire():
+            registration = registry.Registry(descriptor, self.lock).register(
+                self.app, deployment_uid=1001, deployment_user="ship-fixture", runtime="docker",
+                api_domain="fixture.example.test", image_repository=REPOSITORY,
+                probe=lambda port: port == self.port)
+        self.assertEqual(registration["host_port"], self.port)
+        return registration
+
+    def helper_services(self, registration):
+        """The worker's services: the real runtime and lock, a launcher that only records, no Caddy admin."""
+        launched = []
+
+        class Launcher:
+            def launch(self, application_id, request_id):
+                launched.append((application_id, request_id))
+
+            def is_active(self, application_id, request_id):
+                return True
+
+        services = HostServices(self.layout, HostSystem(), Launcher(), FakeCaddy(), probes=Probes(admin_port=1),
+                                runtime_factory=lambda services, value: self.runtime)
+        self.authorize = patch("shiplord.privileged_host.authorize_application", lambda application_id: registration)
+        self.authorize.start()
+        self.addCleanup(self.authorize.stop)
+        return services, launched
+
+    def helper_call(self, services, action, request_id, **arguments):
+        message = {"version": PROTOCOL_VERSION, "request_id": request_id, "action": action,
+                   "application_id": self.app, "commit": None, "arguments": arguments}
+        encoded = io.BytesIO()
+        write_frame(encoded, message)
+        output = io.BytesIO()
+        code = serve(io.BytesIO(encoded.getvalue()), output, lambda: services)
+        return read_frame(io.BytesIO(output.getvalue())), code
+
+    def test_restart_applies_a_changed_environment_without_a_new_release(self):
+        """An env change reaches the process through an authorized restart; a redeploy is not `unchanged`."""
+        env_file = self.layout.environments / self.app / "app.env"
+        env_file.write_text("CUSTOM_TOKEN=before\n")
+        env_file.chmod(0o600)
+        self.assertOutcome(self.deploy("req-e1", "v5", 4000), "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "before")
+        self.assertEqual(self.state.read_state()["current"]["commit"], "e" * 40)
+
+        # Writing the file changes nothing by itself: the running container was created with `before`.
+        env_file.write_text("CUSTOM_TOKEN=after\n")
+        env_file.chmod(0o600)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "before")
+
+        # Criterion 2: the same release record with a new request ID is applied, not reported `unchanged`.
+        again = self.deploy("req-e2", "v5", 4000)
+        self.assertOutcome(again, "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "after")
+        self.assertEqual(self.get("/version"), "v5")
+        state = self.state.read_state()
+        self.assertEqual((state["current"]["commit"], state["previous"]["commit"]), ("e" * 40, "a" * 40))
+
+        # Criterion 1: an authorized `restart` job applies a later change to the process already deployed.
+        env_file.write_text("CUSTOM_TOKEN=final\n")
+        env_file.chmod(0o600)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "after")
+        services, launched = self.helper_services(self.register_application())
+        before = self.containers()
+        response, code = self.helper_call(services, "restart", "req-e3")
+        self.assertEqual((code, response["status"], response["job"]["action"]), (0, "accepted", "restart"))
+        self.assertEqual(launched, [(self.app, "req-e3")])
+        self.assertEqual(run_job(services, self.app, "req-e3"), 0)
+        job = self.helper_call(services, "status", "req-e4", job_id="req-e3")[0]["result"]["job"]
+        self.assertEqual((job["state"], job["outcome"]["status"], job["outcome"]["exit_code"]),
+                         ("finished", "succeeded", 0))
+        self.assertEqual(job["outcome"]["detail"]["release"]["commit"], "e" * 40)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "final")
+        self.assertEqual(self.get("/version"), "v5")  # the recorded release never moved
+        self.assertNotEqual(self.containers(), before)  # the process was replaced, not just told to re-read
+        self.assertEqual(len(self.containers()), 1)
+        self.assertIsNone(self.state.read_journal())
+        state = self.state.read_state()
+        self.assertEqual((state["current"]["commit"], state["previous"]["commit"]), ("e" * 40, "a" * 40))
+        self.assertEqual(state["transaction_id"], "req-e3")
 
 
 if __name__ == "__main__":

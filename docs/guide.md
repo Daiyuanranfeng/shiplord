@@ -83,6 +83,7 @@ shiplord configure --server production --api-domain orders-api.example.com \
   --frontend https://orders.example.com           # or --no-frontend
 shiplord provision                                   # registers your SSH key for this application
 shiplord env set --from-file .env.production         # runtime secrets; values are never printed
+shiplord restart                                     # apply the environment to the running release
 shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
 
 # every release
@@ -240,6 +241,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
+| `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| (in an app directory)` | Prerequisites; helper probe (`--deep`: Caddy, sshd, Docker, disk, each application); access, helper, DNS. |
@@ -280,6 +282,19 @@ rolled back.
 
 If a worker is killed mid-deployment the journal remains, further deployments are refused with
 `recovery_required`, and `shiplord recover` restores the last committed release.
+
+### Applying an environment change
+
+`shiplord env set` writes the application's environment file; the running process keeps the values it was created
+with. `shiplord restart` applies the current file to the deployed release without a new commit: it runs the same
+journaled transaction (replace the runtime, re-apply the route, verify readiness), leaves the recorded release and
+its rollback target unchanged, and needs no artifact. It is refused when nothing is deployed (exit 2) and while an
+unfinished transaction exists (`recovery_required`). A redeploy of the same release is also applied rather than
+reported `unchanged` when the file no longer matches the running process.
+
+A restart that does not come back reports `intervention_required` (exit 6) and keeps the journal, because the
+runtime may already have been replaced. It is never reported as a rollback: the "previous" release record would run
+the same environment file that just failed. Fix the value and run `shiplord recover`.
 
 ## Security model
 

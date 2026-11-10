@@ -110,7 +110,8 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
             raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
         arguments["text"] = text
     result = admin.call("environment", manifest["name"], arguments)
-    note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
+    note = ("Takes effect when the application next starts; run `shiplord restart` to apply it to the running release."
+            if operation in ("set", "clear") else None)
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
 
 
@@ -307,6 +308,10 @@ def run_job_command(manifest: dict, client: HelperClient, action: str, *, reques
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
     arguments = {"force_stop": True} if force_stop else {}
+    if action == "restart" and "restart" not in client.call("capabilities")["actions"]:
+        # An older helper answers a bare "invalid action" with exit 2, which would blame the operator's input.
+        raise CommandError("the server helper does not support restart; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
     if force_stop and FORCE_STOP_FEATURE not in client.call("capabilities")["actions"]:
         raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
                            "to upgrade it, then retry", 4)

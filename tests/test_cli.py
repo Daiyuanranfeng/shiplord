@@ -147,7 +147,7 @@ class CLITests(unittest.TestCase):
 
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
-                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["restart", "--json"], ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
@@ -182,7 +182,7 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
             env = dict(os.environ, XDG_CONFIG_HOME=config)
-            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"]):
+            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"], ["restart", "--json"]):
                 with self.subTest(command=command):
                     self.assertEqual(self.invoke(directory, *command, env=env).returncode, 3)
             self.assertEqual(self.invoke(directory, "server", "bootstrap", "production", env=env).returncode, 3)
@@ -857,6 +857,19 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[2], "recover")
         plain = CliRunner().invoke(cli.app, ["recover", "--help"], color=True)
         self.assertIn("--force-stop", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
+
+    def test_restart_reaches_the_command_and_help_lists_it(self):
+        restarted = {"ok": True, "request_id": "rs-1", "status": "succeeded", "exit_code": 0,
+                     "release": {"commit": "a" * 40, "sequence": 1000}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, restarted)) as run:
+            result = CliRunner().invoke(cli.app, ["restart", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run.call_args.args[2], "restart")
+        self.assertIn("succeeded", json.loads(result.stdout)["status"])
+        plain = CliRunner().invoke(cli.app, ["--help"], color=True)
+        self.assertIn("restart", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
 
     def test_plan_renders_release_route_storage_and_shutdown_changes(self):
         plan_result = {
