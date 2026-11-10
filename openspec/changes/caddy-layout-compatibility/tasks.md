@@ -12,12 +12,22 @@
 
 ## 2. Import statements and snippet arguments
 
-- [x] 2.1 Make `_Inspection.scan` return import statements (pattern and arguments) and have
-  `RouteManager._scan_hostnames` refuse any statement with arguments as uninspectable, naming the snippet.
-  Verify with a unit test that `import sites orders.example.com` is refused and names `sites`, and that an
-  argument is no longer followed as a file path.
-- [x] 2.2 Keep a no-argument snippet import ignored and a no-argument file import followed. Verify with the
+- [x] 2.1 Make `_Inspection.scan` return import statements (pattern and arguments) and record each snippet
+  definition with its body, so an argument is never followed as a file path. Verify with a unit test that a
+  file named like an argument is not read, and that a snippet body declaring `{args[0]}` is compared.
+- [x] 2.2 Substitute `{args[N]}` into a snippet body and into a followed file pattern, comparing a body line's
+  tokens before its opening brace as addresses and treating a brace-less body line as a directive. Verify with
+  unit tests for a directive-only snippet imported with an argument (must not raise), a snippet argument that
+  is the managed hostname (conflict), one that is another hostname (applies), and a file pattern with an
+  argument (conflict).
+- [x] 2.3 Refuse only an address that cannot be determined: an argument the import does not provide, `{block}`,
+  an `{args[:]}` that is not one address, or a name that is neither a known snippet nor a file. Verify with
+  unit tests that name the snippet or pattern and never echo an argument value.
+- [x] 2.4 Keep a no-argument snippet import working and a no-argument file import followed. Verify with the
   existing import tests plus a case where a snippet name contains a dot.
+- [x] 2.5 Add a real-Caddy case for a directive-only snippet imported with an argument (route applies), and
+  for a snippet that declares the managed hostname from an argument (conflict). Verify with
+  `tests/linux/run.sh caddy`.
 
 ## 3. Service-variable site addresses
 

@@ -350,6 +350,9 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[bool], int]]:
 
 
 _VARIABLE = re.compile(r"\{\$([^}:]+)(?::([^}]*))?\}")
+_ARGUMENT = re.compile(r"\{args\[(\d+)\]\}")
+_ARGUMENTS_ALL = "{args[:]}"
+_BLOCK_ARGUMENT = "{block}"
 
 
 def _address_tokens(tokens: list[str], quoted: list[bool],
@@ -358,9 +361,9 @@ def _address_tokens(tokens: list[str], quoted: list[bool],
 
     A site block begins with its addresses and ends them at the opening brace, so a directive
     argument such as an upstream, a header value, or a request matcher is never an address, and a
-    hostname inside one does not claim the site. An address may read the service environment, so
-    ``expand`` resolves a variable before the token is classified; a token that still cannot be
-    classified is refused.
+    hostname inside one does not claim the site. An address may read the service environment or the arguments
+    of the ``import`` that reached this text, so ``expand`` resolves a token before it is classified; a token
+    that still cannot be classified is refused.
     """
     addresses: list[str] = []
     for token, was_quoted in zip(tokens, quoted):
@@ -399,24 +402,34 @@ class _Import:
     arguments: tuple[str, ...]
 
 
+@dataclass
+class _Snippet:
+    """A snippet definition, with each body line's depth relative to the definition line."""
+
+    name: str
+    lines: list[tuple[tuple[str, ...], tuple[bool, ...], int]]
+
+
 class _Inspection:
     def __init__(self, domain: str, own_glob: str, allow_wildcard_overlap: bool,
                  environment: Mapping[str, str] | None = None):
         self.domain, self.own_glob, self.allow_wildcard = domain, own_glob, allow_wildcard_overlap
         self.environment = environment  # None means the service environment could not be read
-        self.snippets: set[str] = set()  # definitions seen so far, so an import is named honestly
+        self.snippets: dict[str, _Snippet] = {}  # definitions seen so far, with the bodies to inspect
 
-    def scan(self, text: str) -> list[_Import]:
+    def scan(self, text: str, arguments: tuple[str, ...] = (), context: str = "") -> list[_Import]:
         """Check one file for hostname takeover; return its top-level imports.
 
         Only a site block declares addresses, so a hostname is compared only where one can be
         declared: on a depth-0 line, before its opening brace. A file whose single site block
         omits the braces reads its first line as the address list and the rest as directives.
+        ``arguments`` are the values the ``import`` that reached this file passed, which Caddy
+        substitutes into ``{args[N]}`` here and in no nested import; ``context`` names that import
+        in a refusal.
         """
         lines = list(_lines(text))
-        for _number, tokens, quoted, depth in lines:
-            if depth == 0 and tokens and not quoted[0] and tokens[0].startswith("(") and tokens[0].endswith(")"):
-                self.snippets.add(tokens[0][1:-1])  # collected first, so a later import names the snippet
+        self._collect_snippets(lines)
+        expand = self._expander(arguments, context)
         imports: list[_Import] = []
         body = continuing = False
         for _number, tokens, quoted, depth in lines:
@@ -427,19 +440,61 @@ class _Inspection:
                     raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
                 imports.append(_Import(tokens[1], tuple(tokens[2:])))  # a top-level import substitutes in place
                 continue
-            addresses, opened = _address_tokens(tokens, quoted, self._expand)
-            for token in addresses:
-                for address in _addresses(token):
-                    if address == self.domain:
-                        raise RoutingError("hostname is already served by another configuration", "conflict")
-                    if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
-                        raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
+            addresses, opened = _address_tokens(tokens, quoted, expand)
+            self._compare(addresses)
             continuing = not opened and tokens[-1].endswith(",")  # Caddy continues the address list
             body = not opened and not continuing  # braces are optional for a single site block
         return imports
 
-    def _expand(self, token: str) -> str:
-        """Resolve ``{$NAME}`` and ``{$NAME:default}`` from the Caddy service environment, never the caller's."""
+    def _collect_snippets(self, lines: list[tuple[int, list[str], list[bool], int]]) -> None:
+        """Record every snippet definition in this file before its imports are resolved, so an import can
+        inspect the body a later line defines even though Caddy itself requires a definition before its use.
+        """
+        body: list | None = None
+        for _number, tokens, quoted, depth in lines:
+            if body is not None and depth > 0:
+                body.append((tuple(tokens), tuple(quoted), depth - 1))
+                continue
+            body = None
+            if (depth == 0 and tokens and not quoted[0]
+                    and tokens[0].startswith("(") and tokens[0].endswith(")")):
+                snippet = self.snippets.setdefault(tokens[0][1:-1], _Snippet(tokens[0][1:-1], []))
+                body = snippet.lines
+
+    def inspect_snippet(self, statement: _Import) -> None:
+        """Compare the site addresses a snippet body declares, with this import's arguments substituted.
+
+        A snippet body is a directive set, so only a body line that opens a block declares addresses: the
+        tokens before its ``{`` are the address list, exactly as a site block in a file. A body line with no
+        opening brace is a directive and declares no site, which keeps a directive-only snippet such as
+        ``(common) { encode gzip }`` working when it is imported with an argument.
+        """
+        expand = self._expander(statement.arguments, f"the snippet {statement.pattern}")
+        for tokens, quoted, depth in self.snippets[statement.pattern].lines:
+            if depth != 0 or not tokens:
+                continue
+            addresses, opened = _address_tokens(list(tokens), list(quoted), expand)
+            if opened:
+                self._compare(addresses)
+
+    def _compare(self, addresses: list[str]) -> None:
+        for token in addresses:
+            for address in _addresses(token):
+                if address == self.domain:
+                    raise RoutingError("hostname is already served by another configuration", "conflict")
+                if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
+                    raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
+
+    def _expander(self, arguments: tuple[str, ...] = (), context: str = "") -> Callable[[str], str]:
+        """Resolve an address token's import arguments and service variables before it is classified."""
+        def expand(token: str) -> str:
+            return self._expand(token, arguments, context)
+        return expand
+
+    def _expand(self, token: str, arguments: tuple[str, ...] = (), context: str = "") -> str:
+        """Resolve ``{args[N]}`` from the import's arguments and ``{$NAME}`` from the Caddy service environment."""
+        if "{args[" in token:
+            token = self._expand_arguments(token, arguments, context)
         if "{$" not in token:
             return token
 
@@ -461,6 +516,28 @@ class _Inspection:
             return value
 
         return _VARIABLE.sub(replace, token)
+
+    @staticmethod
+    def _expand_arguments(token: str, arguments: tuple[str, ...], context: str) -> str:
+        """Substitute ``{args[N]}`` and ``{args[:]}`` the way Caddy does for the import that reached this text."""
+        where = f"the import of {context}" if context else "a site address"
+
+        def replace(match: re.Match) -> str:
+            index = int(match.group(1))
+            if index >= len(arguments):
+                raise RoutingError(
+                    f"{where} reads {{args[{index}]}}, but it provides no such argument; write the imported "
+                    "site addresses literally", "uninspectable")
+            return arguments[index]
+
+        token = _ARGUMENT.sub(replace, token)
+        if _BLOCK_ARGUMENT in token:
+            raise RoutingError(f"{where} reads {_BLOCK_ARGUMENT}, which cannot be inspected", "uninspectable")
+        if _ARGUMENTS_ALL in token:
+            if len(arguments) != 1:
+                raise RoutingError(f"{where} reads {_ARGUMENTS_ALL}, which is not a single address", "uninspectable")
+            token = token.replace(_ARGUMENTS_ALL, arguments[0])
+        return token
 
     def own_import_lines(self, text: str) -> list[int]:
         found = []
@@ -796,34 +873,39 @@ class RouteManager:
     def _scan_hostnames(self, inspection: _Inspection, main_text: str, others: dict[str, str]) -> None:
         for text in others.values():
             inspection.scan(text)
-        seen: set[str] = set()
-        queue = [(main_text, str(self.root), 0)]
-        while queue:
-            text, base, depth = queue.pop()
-            for statement in inspection.scan(text):
-                if statement.arguments:
-                    imported = (f"the snippet {statement.pattern}" if statement.pattern in inspection.snippets
-                                else statement.pattern)
-                    raise RoutingError(
-                        f"the Caddy configuration imports {imported} with arguments, which cannot be inspected; "
-                        "write the imported site addresses literally", "uninspectable")
-                argument = statement.pattern
-                if argument in inspection.snippets:
-                    continue  # a snippet body is a set of directives, not a site-address list
-                if "/" not in argument and "*" not in argument and "." not in argument:
+        self._scan_imports(inspection, main_text, str(self.root), 0, (), set())
+
+    def _scan_imports(self, inspection: _Inspection, text: str, base: str, depth: int,
+                      arguments: tuple[str, ...], seen: set[tuple[str, tuple[str, ...]]],
+                      context: str = "") -> None:
+        """Follow imports in textual order, as Caddy reads them, so a snippet is known when it is imported."""
+        for statement in inspection.scan(text, arguments, context):
+            name = statement.pattern
+            if name in inspection.snippets:
+                inspection.inspect_snippet(statement)  # compare the addresses its body declares
+                continue
+            if "/" not in name and "*" not in name and "." not in name:
+                if not statement.arguments:
                     continue  # no path shape and no definition: Caddy will try it as a file and fail validation
-                pattern = os.path.normpath(argument if os.path.isabs(argument) else os.path.join(base, argument))
-                if pattern == self.own_glob:
+                if not os.path.isfile(os.path.join(base, name)):
+                    raise RoutingError(
+                        f"the Caddy configuration imports {name} with arguments, but no snippet or file of "
+                        "that name was found; write the imported site addresses literally", "uninspectable")
+                pattern = os.path.normpath(os.path.join(base, name))
+            else:
+                pattern = os.path.normpath(name if os.path.isabs(name) else os.path.join(base, name))
+            if pattern == self.own_glob:
+                continue
+            if depth + 1 > MAX_IMPORT_DEPTH:
+                raise RoutingError("Caddy imports are nested too deeply to inspect", "uninspectable")
+            for path in sorted(glob.glob(pattern)):
+                if (path, statement.arguments) in seen:
                     continue
-                if depth + 1 > MAX_IMPORT_DEPTH:
-                    raise RoutingError("Caddy imports are nested too deeply to inspect", "uninspectable")
-                for path in sorted(glob.glob(pattern)):
-                    if path in seen:
-                        continue
-                    seen.add(path)
-                    if len(seen) > MAX_IMPORTED_FILES:
-                        raise RoutingError("Caddy imports too many files to inspect", "uninspectable")
-                    queue.append((_read_path(path), os.path.dirname(path), depth + 1))
+                seen.add((path, statement.arguments))
+                if len(seen) > MAX_IMPORTED_FILES:
+                    raise RoutingError("Caddy imports too many files to inspect", "uninspectable")
+                self._scan_imports(inspection, _read_path(path), os.path.dirname(path), depth + 1,
+                                  statement.arguments, seen, f"the file {name}")
 
     def _validate(self, root: int, main: _CaddyFile, import_line: int, imports: list[str]) -> None:
         lines = main.data.decode("utf-8", "replace").splitlines()

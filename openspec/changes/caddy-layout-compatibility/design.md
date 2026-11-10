@@ -25,13 +25,14 @@ See proposal.md - Why. The facts from the current code that shape the approach:
 **Goals:**
 
 - Inspect an imported symlink while keeping every other privileged file open `O_NOFOLLOW`.
-- Stop reading an import argument as a file path, and fail closed when the import cannot be understood.
+- Stop reading an import argument as a file path, and inspect a snippet or file import with its arguments
+  instead of refusing every one.
 - Compare a `{$VAR}` site address using the service environment only.
 - Resolve the Caddy binary through one function both bootstrap and validation use.
 
 **Non-Goals:**
 
-- Expanding snippet bodies, `{args[:]}`, `{block}`, or `{blocks.*}`.
+- Expanding `{block}` or `{blocks.*}`.
 - Supporting a multi-token or empty environment value as a site address.
 - Supporting Caddy in Docker, an override passed over SSH, or a per-application Caddy path.
 
@@ -47,14 +48,22 @@ needs a second path walk. The trust checks apply to every imported file, not onl
 smuggle in a file the trusted checks would refuse. `_read_file`, `_create`, `_publish`, and `_restore` are not
 touched.
 
-**Refuse a top-level import that passes arguments, naming the imported name.** `scan` now returns an import
-statement (pattern plus arguments) instead of raw tokens, so an argument is never mistaken for a path. A
-statement with arguments raises `uninspectable` naming the pattern (and calling it a snippet when the same
-text defines it). Expanding the snippet was the alternative; it is rejected because the previous change
-established that a snippet body is a directive set and treating its body as an address list caused false
-conflicts, because `{args[:]}`, `{block}`, and cross-file definition order would all need faithful handling,
-and because a false conflict blocks a deploy just as hard as a refusal while being harder to explain. The
-refusal is explicit and actionable: the operator writes the addresses literally or drops the arguments.
+**Inspect a top-level import that passes arguments instead of refusing it.** `scan` returns an import
+statement (pattern plus arguments), so an argument is never mistaken for a path. `_Inspection` records each
+snippet definition with its body lines, and an import of a known snippet is resolved against that body with
+`{args[N]}` substituted: a body line that opens a block declares the addresses before its `{`, and a body
+line with no opening brace is a directive and declares no site. That rule keeps the common
+`(common) { encode gzip }` + `import common 5s` layout working, which a blanket refusal broke, while still
+comparing the address a `(sites) { {args[0]} { ... } }` body declares. A file-pattern import is followed with
+the same substitution, which is what a real Caddy does (verified with `caddy validate` in the Linux image:
+a file whose first line is `{args[0]} {` is imported with the argument as its address). A directive-only
+snippet imported at top level is only valid in Caddy as a global option and must be the last statement; the
+real-Caddy suite covers exactly that. Imports are followed depth-first in textual order, as Caddy reads them,
+so a snippet defined by an earlier import is known when it is used; a snippet defined later is not (Caddy
+refuses that too). The refusal is now narrow and names the import: an argument the import does not provide,
+`{block}`, an `{args[:]}` that is not one address, or a name that is neither a known snippet nor a file.
+Treating every snippet body as an address list is still rejected, because a directive line such as
+`encode gzip` is not an address and doing so produced the false conflicts the previous change was about.
 
 **Expand a service variable token before classifying it as an address.** `_Inspection` gains an `environment`
 mapping. `_address_tokens` expands `{$NAME}` and `{$NAME:default}` in a non-structural address token (quoted or

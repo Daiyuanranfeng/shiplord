@@ -16,9 +16,12 @@ elsewhere cannot bootstrap.
   trusted checks require, no larger than the existing limit, and not group- or world-writable; anything else
   is still refused as uninspectable. The live Caddyfile, its prior copy, and every file the transaction
   writes keep `O_NOFOLLOW`.
-- A top-level `import` that passes arguments to a snippet or file is refused as uninspectable, with a message
-  naming the imported snippet. Shiplord does not expand snippet bodies: the previous change established that
-  a snippet body is a directive set, and treating it as a site-address list caused false conflicts.
+- A top-level `import` that passes arguments is inspected instead of refused. A snippet import has its body
+  inspected with the arguments substituted: a body line that opens a block declares the addresses before its
+  `{`, and a line without an opening brace is a directive and declares no site, so a directive-only snippet
+  keeps working. A file-pattern import is followed with `{args[N]}` substituted, as Caddy does. Shiplord
+  refuses only an address it cannot determine: an argument the import does not provide, `{block}`, an
+  `{args[:]}` that is not one address, or a name that is neither a known snippet nor a file.
 - A site address written as `{$VAR}` or `{$VAR:default}` is expanded from the Caddy **service** environment
   before it is compared, never from the caller's environment. A variable the service does not set is refused
   as uninspectable with a message naming the variable and never its value.
@@ -45,8 +48,8 @@ None; the project has no committed specs, so both capabilities are introduced by
 ## Impact
 
 - `src/shiplord/routing.py`: `_read_path` follows an imported symlink with the trust checks above;
-  `_Inspection.scan` returns import statements instead of raw tokens and expands `{$VAR}` addresses from an
-  injected service environment; `SubprocessCaddy` resolves its binary through `caddy_binary`.
+  `_Inspection` records snippet bodies and import statements, substitutes `{args[N]}` and `{$VAR}` in an
+  address before comparing it, and `SubprocessCaddy` resolves its binary through `caddy_binary`.
 - `src/shiplord/installer.py`: the bootstrap refusal names the resolved binary instead of a hardcoded path;
   `CADDY_BINARY` is replaced by the shared resolution.
 - `docs/guide.md`: documents the override and honestly states which processes read it.

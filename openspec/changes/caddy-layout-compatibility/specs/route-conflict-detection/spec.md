@@ -33,26 +33,50 @@ world-writable.
 - **WHEN** the live Caddyfile, its prior copy, or a managed route file is a symlink
 - **THEN** it is refused exactly as before; only an imported file may be a link
 
-### Requirement: A top-level import with arguments is refused explicitly
+### Requirement: A top-level import with arguments is inspected
 
-Shiplord SHALL refuse an inspected top-level `import` that passes arguments, rather than read the arguments as
-file paths. The refusal SHALL name the imported snippet or pattern and SHALL be reported as uninspectable.
+Shiplord SHALL inspect a top-level `import` that passes arguments instead of refusing it or reading an
+argument as a file path. For a snippet it SHALL substitute the arguments into the body and compare the
+addresses a body line declares before an opening brace; a line without one is a directive. For a file pattern
+it SHALL follow the matched files with `{args[N]}` substituted. It SHALL refuse only an address it cannot
+determine, naming the snippet or pattern, as uninspectable.
 
-#### Scenario: A snippet imported with arguments
+#### Scenario: A directive-only snippet imported with an argument still deploys
 
-- **WHEN** the main Caddyfile contains `(sites) { ... }` and `import sites orders.example.com`
-- **AND** Shiplord installs a route
-- **THEN** the install is refused as uninspectable and the message names `sites`
+- **WHEN** the main Caddyfile defines `(common) { encode gzip }` and imports `common` with an argument
+- **THEN** the route change is applied exactly as it was before this change
 
-#### Scenario: A file imported with arguments
+#### Scenario: A snippet body declares the managed hostname from an argument
 
-- **WHEN** the main Caddyfile imports a file pattern and passes extra tokens
-- **THEN** the install is refused as uninspectable and the message names the pattern
+- **WHEN** the main Caddyfile defines `(sites) { {args[0]} { ... } }` and imports `sites orders.example.com`
+- **AND** Shiplord installs a route for `orders.example.com`
+- **THEN** the install is refused with a conflict
+
+#### Scenario: A snippet argument for another hostname still applies
+
+- **WHEN** the same snippet is imported as `sites legacy.example.net`
+- **THEN** the route for `orders.example.com` is applied
+
+#### Scenario: A file pattern is followed with its argument substituted
+
+- **WHEN** an imported file declares `{args[0]}` as its address and the import passes `orders.example.com`
+- **THEN** the install is refused with a conflict
+
+#### Scenario: An argument the import does not provide is refused
+
+- **WHEN** a snippet or file body reads `{args[1]}` and the import provides no such argument
+- **THEN** the install is refused as uninspectable and the message names the snippet or pattern
+
+#### Scenario: A name that is neither a snippet nor a file is refused
+
+- **WHEN** a top-level import passes arguments to a name that is not a known snippet and not a file
+- **THEN** the install is refused as uninspectable and the message names that name
 
 #### Scenario: A snippet imported without arguments is unchanged
 
 - **WHEN** the main Caddyfile imports a snippet name with no arguments
-- **THEN** the import is ignored for site addresses exactly as before
+- **THEN** a directive-only body is still ignored for site addresses, and a body that declares an address is
+  compared
 
 ### Requirement: A site address that reads a service variable is resolved before comparison
 

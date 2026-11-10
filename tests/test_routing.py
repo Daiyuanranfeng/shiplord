@@ -428,9 +428,15 @@ class ConflictTests(RoutingTestCase):
             self.inspect("orders.example.com\n\nreverse_proxy 127.0.0.1:20000\n")
         self.assertEqual(caught.exception.kind, "conflict")
 
-    def test_a_quoted_placeholder_site_address_is_refused(self):
-        self.main_with('"{$SITE_ADDRESS}" {\n}')
+    def test_a_quoted_non_variable_placeholder_site_address_is_refused(self):
+        self.main_with('"{http.request.host}" {\n}')
         self.assertConflict("uninspectable")
+
+    def test_a_quoted_service_variable_address_is_compared(self):
+        # Caddy accepts a quoted address and the expansion is textual, so the quoted value is still the site.
+        self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
+        self.main_with('"{$SITE_ADDRESS}" {\n}')
+        self.assertConflict()
 
     def test_a_service_variable_address_is_a_conflict(self):
         self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
@@ -480,37 +486,99 @@ class ConflictTests(RoutingTestCase):
                     self.assertNotIn(value, caught.exception.detail)
                 self.assertEqual(self.snapshot(), before)
 
-    def test_an_import_with_arguments_is_refused_and_names_the_snippet(self):
+    def test_a_directive_only_snippet_imported_with_an_argument_is_skipped(self):
+        self.write_main(self.MAIN + "(common) {\n\tencode gzip\n}\nimport common 5s\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_snippet_that_declares_its_address_from_an_argument_is_a_conflict(self):
         self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites orders.example.com\n"
                         + f"import {self.root}/ship/*.caddy\n")
         before = self.snapshot()
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.apply(registration())
-        self.assertEqual(caught.exception.kind, "uninspectable")
-        self.assertIn("sites", str(caught.exception))
+        self.assertEqual(caught.exception.kind, "conflict")
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.caddy.validate_calls, [])
 
-    def test_an_import_argument_is_never_followed_as_a_file_path(self):
-        # The old scan read "orders.example.com" as a path; a file at that path must not decide the outcome.
+    def test_a_snippet_argument_for_another_hostname_still_applies(self):
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                        "import sites legacy.example.net\n" + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_snippet_body_address_from_a_service_variable_is_a_conflict(self):
+        self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
+        self.write_main(self.MAIN + "(sites) {\n\t{$SITE_ADDRESS} {\n\t}\n}\nimport sites\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
+
+    def test_a_snippet_argument_the_import_does_not_provide_is_refused_and_names_the_snippet(self):
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("the snippet sites", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_a_snippet_import_never_reads_an_argument_as_a_file_path(self):
+        # The old scan read "orders.example.com" as a path; the argument is the address the snippet declares.
         (self.root / "orders.example.com").write_text("unrelated.example.net {\n}\n")
         (self.root / "orders.example.com").chmod(0o644)
         self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites orders.example.com\n"
                         + f"import {self.root}/ship/*.caddy\n")
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.apply(registration())
-        self.assertEqual(caught.exception.kind, "uninspectable")
-        self.assertIn("sites", str(caught.exception))
+        self.assertEqual(caught.exception.kind, "conflict")
 
-    def test_a_file_import_with_arguments_is_refused_and_names_the_pattern(self):
-        (self.root / "legacy.conf").write_text("unrelated.example.net {\n}\n")
+    def test_a_file_import_substitutes_its_argument(self):
+        (self.root / "legacy.conf").write_text("{args[0]} {\n}\n")
         (self.root / "legacy.conf").chmod(0o644)
-        self.write_main(self.MAIN + f"import {self.root}/legacy.conf extra\n"
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf orders.example.com\n"
                         + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
+
+    def test_a_file_import_argument_for_another_hostname_still_applies(self):
+        (self.root / "legacy.conf").write_text("{args[0]} {\n\trespond \"legacy\"\n}\n")
+        (self.root / "legacy.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf legacy.example.net\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_file_import_argument_it_does_not_provide_is_refused_and_names_the_file(self):
+        (self.root / "legacy.conf").write_text("{args[1]} {\n}\n")
+        (self.root / "legacy.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf legacy.example.net\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        before = self.snapshot()
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.apply(registration())
         self.assertEqual(caught.exception.kind, "uninspectable")
         self.assertIn("legacy.conf", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_an_unknown_name_with_arguments_is_refused_and_names_it(self):
+        self.write_main(self.MAIN + "import missing_snippet orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("missing_snippet", str(caught.exception))
+
+    def test_a_snippet_defined_by_an_earlier_import_is_known(self):
+        (self.root / "defs.conf").write_text("(sites) {\n\t{args[0]} {\n\t}\n}\n")
+        (self.root / "defs.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/defs.conf\nimport sites orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
 
     def test_a_snippet_name_that_looks_like_a_path_is_not_followed(self):
         (self.root / "common.conf").write_text("orders.example.com {\n}\n")
