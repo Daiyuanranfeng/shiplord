@@ -302,13 +302,17 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertOutcome(unhealthy, "rolled_back")
         self.assertEqual(unhealthy.exit_code, 5)
         self.assertEqual(unhealthy.detail["kind"], "timeout")
+        self.assertIn("fixture started version=v3", unhealthy.detail["candidate_logs"]["output"])
         self.assertEqual(self.get("/version"), "v2")
         self.assertEqual(self.get("/counter"), "3")
 
         crashing = self.deploy("req-4", "v4", 1003)
         self.assertOutcome(crashing, "rolled_back")
         self.assertEqual(crashing.detail["kind"], "exited")
+        self.assertIn("fixture crashing on purpose", crashing.detail["candidate_logs"]["output"])
+        self.assertEqual(crashing.detail["candidate_logs"]["tail"], 100)
         self.assertEqual(self.get("/version"), "v2")
+        self.assertIn("fixture started version=v2", self.runtime.logs(self.registration, 50))  # the restored release
         self.assertEqual(self.state.read_state()["current"]["commit"], "b" * 40)
         self.assertIsNone(self.state.read_journal())
 
