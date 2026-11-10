@@ -58,8 +58,9 @@ _UNCATCHABLE = {9, 19}  # SIGKILL and SIGSTOP cannot be handled, so they are not
 POLL_SECONDS = 0.5
 
 
-def stop_signal(configured: str) -> str:
-    """Validate a container's stop signal (empty means SIGTERM); only catchable signals qualify as graceful."""
+def parse_stop_signal(configured: str) -> str:
+    """The signal name to send for a container's stop signal (empty means SIGTERM); only catchable signals
+    qualify as graceful. Raises ``ValueError`` when the value cannot be used."""
     text = configured.strip()
     if text in ("", "<no value>"):
         return "SIGTERM"
@@ -68,7 +69,16 @@ def stop_signal(configured: str) -> str:
         return name
     if name.upper() in _SIGNALS:
         return "SIG" + name.upper()
-    raise RuntimeFailure("the container's stop signal is not one that a process can handle gracefully", "stop")
+    raise ValueError(text)
+
+
+def stop_signal(configured: str) -> str:
+    """Validate a container's stop signal (empty means SIGTERM); only catchable signals qualify as graceful."""
+    try:
+        return parse_stop_signal(configured)
+    except ValueError:
+        raise RuntimeFailure("the container's stop signal is not one that a process can handle gracefully",
+                             "stop") from None
 
 
 def _digest(image: str) -> str:
@@ -130,16 +140,26 @@ class DockerRuntime:
         if pull.code != 0:
             raise RuntimeFailure("the image could not be pulled", "prepare", pull.output)
         inspect = self._docker(["image", "inspect", "--format",
-                                '{{.Os}}/{{.Architecture}}|{{index .Config.Labels "' + REVISION_LABEL + '"}}', image],
+                                '{{.Os}}/{{.Architecture}}|{{index .Config.Labels "' + REVISION_LABEL + '"}}|'
+                                '{{.Config.StopSignal}}', image],
                                "prepare")
         if inspect.code != 0:
             raise RuntimeFailure("the pulled image could not be inspected", "prepare", inspect.output)
-        image_platform, _, revision = inspect.output.strip().partition("|")
+        try:
+            image_platform, revision, configured_signal = inspect.output.strip().split("|", 2)
+        except ValueError:
+            raise RuntimeFailure("the pulled image could not be understood", "prepare") from None
         if image_platform != self.platform:
             raise RuntimeFailure(f"the image is {image_platform}, but the server needs {self.platform}", "prepare")
         revision = "" if revision == "<no value>" else revision
         if revision and revision != release["commit"]:
             raise RuntimeFailure("the image was built from a different commit than requested", "prepare")
+        try:  # every later transition stops the outgoing container first, so refuse this before recording it
+            parse_stop_signal(configured_signal)
+        except ValueError:
+            raise RuntimeFailure(f"the image sets STOPSIGNAL {configured_signal.strip()}, which no process can handle, "
+                                 f"so this release could never be stopped; nothing was changed ({image})",
+                                 "prepare") from None
         volume_provenance = self.check_volume(registration, create=False)  # read-only: a plan creates nothing
         result = {"platform": image_platform, "revision_label": revision or None}
         if volume_provenance is not None:

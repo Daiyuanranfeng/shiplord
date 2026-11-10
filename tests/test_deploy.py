@@ -12,10 +12,33 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import REGISTRATION, FakeCaddy, FakeProbes, FakeRuntime, configuration, record, request  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
+from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import ProbeFailure  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState, StateError  # noqa: E402
 from shiplord.routing import RouteManager, RoutingError  # noqa: E402
-from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
+from shiplord.runtime import DockerRuntime, RuntimeFailure, release_id  # noqa: E402
+from shiplord.system import CommandResult  # noqa: E402
+
+
+class FakeDockerCLI:
+    """The Docker CLI calls a prepare makes: pull, one image inspect, and the discard of a refused image."""
+
+    def __init__(self, stop_signal):
+        self.stop_signal = stop_signal
+        self.calls: list[list[str]] = []
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        self.calls.append(argv)
+        command = " ".join(argv[1:3]) if argv[1] == "image" else argv[1]
+        if command == "pull":
+            return CommandResult(0, "")
+        if command == "image inspect":
+            return CommandResult(0, f"linux/amd64|{'c' * 40}|{self.stop_signal}\n")
+        if command == "image rm":
+            return CommandResult(0, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
 
 class DeployTestCase(unittest.TestCase):
     def setUp(self):
@@ -187,6 +210,23 @@ class FailureTests(DeployTestCase):
         self.assertEqual(self.runtime.running, {release_id(record())})
         self.assertEqual(self.state.read_state(), before)
         self.assertIsNone(self.state.read_journal())
+
+    def test_an_image_that_cannot_be_stopped_gracefully_is_refused_before_the_journal_opens(self):
+        self.deploy()
+        before = self.state.read_state()
+        route = self.route_file.read_bytes()
+        docker = FakeDockerCLI("SIGKILL")
+        self.deployer.runtime = DockerRuntime(docker, Layout(Path(self.temp.name).resolve()),
+                                              platform_name="linux/amd64")
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]), ("failed", 1, "prepare_failed"))
+        self.assertIn("STOPSIGNAL SIGKILL", outcome.detail["message"])
+        self.assertIn("ghcr.io/example/orders@sha256:" + "d" * 64, outcome.detail["message"])
+        self.assertEqual(self.state.read_state(), before)
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.route_file.read_bytes(), route)
+        self.assertEqual([call[1:3] for call in docker.calls if call[1] == "image"],
+                         [["image", "inspect"], ["image", "rm"]])  # the refused image is discarded
 
     def test_candidate_failing_to_start_restores_the_previous_release(self):
         self.deploy()

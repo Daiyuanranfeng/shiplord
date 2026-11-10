@@ -180,26 +180,27 @@ class IdentityTests(unittest.TestCase):
 
 class PrepareTests(RuntimeTestCase):
     def test_pulls_by_digest_then_verifies_platform_and_revision(self):
-        self.docker.results["image inspect"] = CommandResult(0, f"linux/amd64|{'a' * 40}\n")
+        self.docker.results["image inspect"] = CommandResult(0, f"linux/amd64|{'a' * 40}|\n")
         result = self.runtime.prepare(REGISTRATION, release())
         self.assertEqual(result, {"platform": "linux/amd64", "revision_label": "a" * 40})
         self.assertEqual(self.docker.calls[0], ["/usr/bin/docker", "pull", "--quiet", "ghcr.io/example/orders@sha256:" + "b" * 64])
         self.assertEqual(self.docker.sub("rm"), [])  # nothing is stopped or removed while preparing
 
     def test_missing_revision_label_is_allowed_but_reported(self):
-        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|<no value>\n")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|<no value>|\n")
         self.assertIsNone(self.runtime.prepare(REGISTRATION, release())["revision_label"])
 
     def test_each_verification_failure_is_a_prepare_failure(self):
         cases = {
             "pull denied": ("pull", CommandResult(1, "denied: requested access")),
             "inspect fails": ("image inspect", CommandResult(1, "no such image")),
-            "wrong platform": ("image inspect", CommandResult(0, "linux/arm64|\n")),
-            "wrong revision": ("image inspect", CommandResult(0, f"linux/amd64|{'f' * 40}\n")),
+            "unreadable inspect output": ("image inspect", CommandResult(0, "linux/amd64\n")),
+            "wrong platform": ("image inspect", CommandResult(0, "linux/arm64||\n")),
+            "wrong revision": ("image inspect", CommandResult(0, f"linux/amd64|{'f' * 40}|\n")),
         }
         for label, (key, result) in cases.items():
             with self.subTest(label):
-                self.docker.results = {"image inspect": CommandResult(0, "linux/amd64|\n"), key: result}
+                self.docker.results = {"image inspect": CommandResult(0, "linux/amd64||\n"), key: result}
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.runtime.prepare(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, "prepare")
@@ -208,7 +209,7 @@ class PrepareTests(RuntimeTestCase):
         login = self.layout.registry_logins / "orders"
         login.mkdir(parents=True)
         (login / "config.json").write_text('{"auths": {}}')
-        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64||\n")
         self.runtime.prepare(REGISTRATION, release())
         self.assertEqual(self.docker.calls[0][:4], ["/usr/bin/docker", "--config", str(login), "pull"])
         self.docker.calls.clear()
@@ -230,7 +231,7 @@ class PrepareTests(RuntimeTestCase):
         self.assertEqual(caught.exception.phase, "prepare")
         self.assertEqual(self.docker.calls, [])
         with patch("shiplord.runtime.shutil.disk_usage", side_effect=OSError):  # unmeasurable: docker decides
-            self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+            self.docker.results["image inspect"] = CommandResult(0, "linux/amd64||\n")
             self.runtime.prepare(REGISTRATION, release())
         self.assertTrue(self.docker.calls)
 
@@ -239,6 +240,28 @@ class PrepareTests(RuntimeTestCase):
         with self.assertRaises(RuntimeFailure) as caught:
             self.runtime.prepare(REGISTRATION, release())
         self.assertEqual((caught.exception.phase, caught.exception.detail), ("prepare", "layer 3/9"))
+
+    def test_an_image_that_cannot_be_stopped_gracefully_is_refused_before_anything_else(self):
+        image = release()["artifact"]["image"]
+        for configured in ("SIGKILL", "KILL", "9", "SIGSTOP", "19", "SIGFOO"):
+            with self.subTest(configured):
+                self.docker.calls.clear()
+                self.docker.results["image inspect"] = CommandResult(0, f"linux/amd64|{'a' * 40}|{configured}\n")
+                with self.assertRaises(RuntimeFailure) as caught:
+                    self.runtime.prepare(REGISTRATION, release())
+                self.assertEqual(caught.exception.phase, "prepare")
+                self.assertIn(f"STOPSIGNAL {configured}", str(caught.exception))
+                self.assertIn(image, str(caught.exception))
+                # nothing is inspected, started or removed after the refusal
+                self.assertEqual((self.docker.sub("volume inspect"), self.docker.sub("run"), self.docker.sub("rm")),
+                                 ([], [], []))
+
+    def test_an_image_with_a_catchable_or_absent_stop_signal_still_prepares(self):
+        for configured in ("SIGTERM", "SIGINT", "SIGQUIT", "15", "", "<no value>"):
+            with self.subTest(configured):
+                self.docker.results["image inspect"] = CommandResult(0, f"linux/amd64|{'a' * 40}|{configured}\n")
+                result = self.runtime.prepare(REGISTRATION, release())
+                self.assertEqual(result, {"platform": "linux/amd64", "revision_label": "a" * 40})
 
 
 class StartTests(RuntimeTestCase):
@@ -470,7 +493,7 @@ class StorageMountTests(RuntimeTestCase):
 
     def test_prepare_never_creates_a_volume(self):
         self.docker.results["volume inspect"] = CommandResult(1, "Error: No such volume: x")
-        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64||\n")
         self.runtime.prepare(REGISTRATION, release())
         self.assertEqual(self.docker.sub("volume create"), [])
 
@@ -510,7 +533,7 @@ class StorageMountTests(RuntimeTestCase):
         self.docker.results["inspect"] = CommandResult(
             0, f"/shiplord-orders-{release_id}|orders|{release_id}|"
                "volume:shiplord-orders-artifacts:/app/src/.adk\n")
-        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64||\n")
 
         prepared = self.runtime.prepare(REGISTRATION, release())
         self.assertEqual(prepared["storage_provenance"]["volume_name"], "shiplord-orders-artifacts")
