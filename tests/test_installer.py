@@ -114,6 +114,8 @@ class InstallerTestCase(unittest.TestCase):
         sshd.mkdir(parents=True)
         self.sshd_config = sshd / "sshd_config"
         self.sshd_config.write_text("Include sshd_config.d/*.conf\n")
+        self.os_release = self.prefix / "etc" / "os-release"
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
 
@@ -268,6 +270,65 @@ class BootstrapTests(InstallerTestCase):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
         self.assertNotIn(["/usr/sbin/sshd", "-t"], self.system.calls)
+
+
+class OsBaselineTests(InstallerTestCase):
+    """An unsupported host is refused before the first side effect, not after a misleading failure."""
+
+    def assert_nothing_happened(self):
+        for path in (self.layout.var, self.layout.lib, self.layout.registrations, self.layout.sshd_dropin):
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(self.system.calls, [])
+        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (0, 0))
+        self.assertEqual((self.layout.caddy_root / "Caddyfile").read_text(), "example.org {\n}\n")
+
+    def test_a_supported_host_bootstraps(self):
+        self.os_release.write_text('ID=debian\nVERSION_ID="12"\n')
+        self.assertTrue(all(self.run_bootstrap()["changed"].values()))
+
+    def test_ubuntu_22_04_is_refused_before_any_side_effect(self):
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        with self.assertRaises(BootstrapError) as caught:
+            self.run_bootstrap()
+        message = str(caught.exception)
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", message)
+        self.assertIn("ubuntu 22.04", message)
+        self.assertNotIn("/", message)
+        self.assertNotIn(str(self.prefix), message)
+        self.assert_nothing_happened()
+
+    def test_debian_11_is_refused_before_any_side_effect(self):
+        self.os_release.write_text('ID=debian\nVERSION_ID="11"\n')
+        with self.assertRaisesRegex(BootstrapError, "debian 11 is older than the supported minimum"):
+            self.run_bootstrap()
+        self.assert_nothing_happened()
+
+    def test_an_unknown_distribution_is_refused(self):
+        self.os_release.write_text('ID=alpine\nVERSION_ID="3.20.3"\n')
+        with self.assertRaisesRegex(BootstrapError, "alpine 3.20.3 is not a supported distribution"):
+            self.run_bootstrap()
+        self.assert_nothing_happened()
+
+    def test_a_missing_or_malformed_release_file_is_refused(self):
+        cases = {"missing": None, "malformed": "this is not an os-release file\n"}
+        for name, content in cases.items():
+            with self.subTest(name):
+                if content is None:
+                    self.os_release.unlink()
+                else:
+                    self.os_release.write_text(content)
+                with self.assertRaisesRegex(BootstrapError, "Ubuntu 24.04 or later and Debian 12 or later"):
+                    self.run_bootstrap()
+                self.assert_nothing_happened()
+
+    def test_the_os_check_runs_before_the_caddy_probe(self):
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        self.caddy.unavailable_at = 1
+        with self.assertRaises(BootstrapError) as caught:
+            self.run_bootstrap()
+        self.assertIn("ubuntu 22.04", str(caught.exception))
+        self.assertNotIn("Caddy", str(caught.exception))
+        self.assertEqual(self.caddy.validated, 0)
 
 
 class SshdTests(InstallerTestCase):

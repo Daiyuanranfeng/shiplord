@@ -651,6 +651,28 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(quiet.exit_code, 0, quiet.output)
         self.assertNotIn("Ignored", quiet.stdout)
 
+    def test_doctor_deep_renders_the_os_baseline_with_the_detected_release(self):
+        refused = {"ok": False, "checks": {"os": {
+            "ok": False, "id": "ubuntu", "version_id": "22.04",
+            "message": "unsupported server operating system: ubuntu 22.04 is older than the supported minimum; "
+                       "Shiplord supports Ubuntu 24.04 or later and Debian 12 or later"}}}
+        supported = {"ok": True, "checks": {"os": {"ok": True, "id": "debian", "version_id": "12"}}}
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(3, refused)):
+                failed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, supported)):
+                passed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+        self.assertEqual(failed.exit_code, 3, failed.output)
+        self.assertIn("Server baseline:", failed.stdout)
+        self.assertIn("os: failed (id: ubuntu; version id: 22.04; message: unsupported server operating system:",
+                      failed.stdout)
+        self.assertEqual(passed.exit_code, 0, passed.output)
+        self.assertIn("os: passed (id: debian; version id: 12)", passed.stdout)
+
     def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"

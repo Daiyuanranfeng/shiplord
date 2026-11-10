@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import __version__
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .release_state import HostLock
 from .routing import CaddyCommands, RouteManager, RoutingError, probe_caddy
 from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
@@ -430,9 +431,15 @@ def _caddy_preflight(caddy: CaddyCommands) -> None:
 
 def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands, *,
               lock_timeout: float = 20) -> dict:
-    """Install or update the host. Safe to repeat; returns which steps changed something."""
+    """Install or update the host, refusing an unsupported operating system first.
+
+    Safe to repeat; returns which steps changed something.
+    """
     if layout.prefix == Path("/") and os.geteuid() != 0:
         raise BootstrapError("bootstrap must run as root")
+    supported = check_os(layout.path(OS_RELEASE))
+    if not supported["ok"]:
+        raise BootstrapError(supported["message"])
     _caddy_preflight(caddy)
     unit, socket = _sshd_preflight(layout, system)
     changed: dict[str, bool] = {}

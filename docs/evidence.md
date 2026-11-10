@@ -189,6 +189,41 @@ What it found:
   real Docker SIGKILL crash gap, shutdown timeout/interruption during rollback or failed-first-deploy cleanup
   against real Docker, and a seeded-baseline demonstration of the regression.
 
+## Supported server OS baseline (issue #66)
+
+Decision: Shiplord supports **Ubuntu 24.04 or later and Debian 12 or later**, with Caddy installed from its
+package repository (`/usr/bin/caddy`) and Python 3.11 or later at `/usr/bin/python3`. Anything else is refused
+instead of failing later in sshd, Caddy, or apt handling. This narrows the roadmap's H1, H3, and D5 items to
+the supported set instead of leaving an open compatibility matrix.
+
+Closed:
+
+- `installer.bootstrap` reads `/etc/os-release` as its first host check (after the root check) and refuses any
+  other distribution or an older version with a message naming the supported set and the detected
+  `ID`/`VERSION_ID`. The refusal happens before Caddy, sshd, accounts, directories, and packages: nothing is
+  written and no command runs. Unit: `tests/test_installer.py::OsBaselineTests` (Ubuntu 22.04, Debian 11, an
+  unknown distribution, a missing file, a malformed file, and proof the Caddy probe is not reached).
+  Parsing and the version decision: `tests/test_osbaseline.py` (accepted releases, refusals, malformed and
+  non-numeric versions, unsafe fields, an undecodable file).
+- `shiplord doctor --server --deep` reports an `os` check (`ok`, `id`, `version_id`, and the refusal message),
+  so a host outside the set is visible without attempting a bootstrap. Unit: `tests/test_serverdoctor.py`.
+- `docs/guide.md` and `README.md` state the supported operating systems and the Python 3.11 requirement.
+- `tests/linux/run.sh host` runs the existing host suite on Ubuntu 24.04 and now also runs
+  `UnsupportedOsTests` in a container whose `/etc/os-release` reports Ubuntu 22.04, asserting the refusal and
+  that no command, Caddy call, or Shiplord path was touched. Ran locally in Docker on arm64: 19 tests OK
+  (1 skipped, the unsupported-OS class) and then 1 test OK.
+
+Still open:
+
+- Debian 12 was not run on a real host or container; only the unit fixture covers it.
+- The refusal was exercised on the supported image with an `os-release` mounted over `/etc/os-release`, not on
+  an actual Ubuntu 22.04 base: that image ships Python 3.10 and cannot import the helper at all, so the
+  server-side check cannot run there. Such a host is refused earlier by the client's interpreter check.
+- The Linux suites for this change ran on arm64 containers, not on x86-64.
+- Caddy is still assumed to be the apt package at `/usr/bin/caddy`; its version is not checked, only that it
+  can run a fixed minimal configuration.
+- The real Hetzner server run recorded above did not record its Ubuntu version, and is not evidence for Debian.
+
 ## Not verified, and why
 
 - The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.
