@@ -242,7 +242,9 @@ def ssh_command(target: str, remote_command: str, options: SshOptions | None = N
 
 def _ssh_failure_message(target: str, stderr: bytes) -> str:
     """Explain a failed SSH check, repeating only the host-trust lines that are safe to show."""
-    text = sanitize(stderr, STDERR_LIMIT)
+    # OpenSSH writes CRLF to a stderr that is not a terminal, and sanitize renders a bare CR as "?", which
+    # would stop the allowlist from recognising the line. Line endings carry no meaning in this message.
+    text = sanitize(stderr.replace(b"\r\n", b"\n").replace(b"\r", b"\n"), STDERR_LIMIT)
     if _HOST_KEY_CHANGED in text:
         return ("SSH check failed: the host key for this server has changed since it was trusted; "
                 "remove the stale known-hosts entry, then retry")
