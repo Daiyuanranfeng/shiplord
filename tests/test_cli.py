@@ -215,6 +215,33 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key), "--json", env=env)
             self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
 
+    def test_env_edits_validate_before_any_server_lookup_and_never_echo_values(self):
+        secret = "postgres://u:s3cr3t@db/x"
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            cases = ((["env", "set", f"PORT={secret}"], "managed by Shiplord"),
+                     (["env", "set", f"BAD LINE {secret}"], "KEY=VALUE"),
+                     (["env", "set", f"A={secret}\nB=2"], "invalid"),
+                     (["env", "unset", "A B"], "variable name"),
+                     (["env", "set"], "exactly one"),
+                     (["env", "set", "A=1", "--from-file", "f"], "exactly one"))
+            for args, expected in cases:
+                with self.subTest(args=args[:2]):
+                    result = self.invoke(directory, *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, json.loads(result.stdout)["error"])
+                    self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            result = self.invoke(directory, "env", "set", f"DATABASE_URL={secret}", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            self.assertEqual(self.invoke(directory, "env", "unset", "OLD", "--json", env=env).returncode, 3)
+            env_file = Path(directory) / "runtime.env"
+            env_file.write_text(f"DATABASE_URL={secret}\n")
+            result = self.invoke(directory, "env", "set", "--from-file", str(env_file), "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # whole-file replacement still works
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+
     def test_github_commands_need_a_manifest_and_a_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             env = dict(os.environ, XDG_CONFIG_HOME=config)

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shiplord.admin import parse_request, run, serve
+from shiplord.environment import MAX_VALUE_BYTES
 from shiplord.framing import read_frame, write_frame
 from shiplord.layout import Layout
 from shiplord.protocol import ProtocolError
@@ -473,6 +474,113 @@ class EnvironmentTests(ProvisionTestCase):
         self.assertNotIn("s3cr3t", str(response))
         bad, code = run(encode(envelope("environment", arguments={"operation": "set", "text": "PORT=1\n", "x": 1})),
                         self.layout, self.system, {})
+        self.assertEqual(code, 2)
+
+    def test_set_key_changes_one_line_and_leaves_every_other_byte_identical(self):
+        self.provision()
+        original = ("# kept comment\r\n"
+                    "\r\n"
+                    "DATABASE_URL=postgres://old/db\r\n"
+                    "FLAG=\"quoted value\"\r\n"
+                    "OTHER=keep\r\n")
+        self.path().write_bytes(original.encode())
+        self.path().chmod(0o600)
+        result = manage_environment(self.layout, "orders", "set-key", key="DATABASE_URL", value=self.SECRET)
+        self.assertEqual(result, {"keys": ["DATABASE_URL", "FLAG", "OTHER"], "changed": True})
+        self.assertNotIn("s3cr3t", str(result))
+        self.assertEqual(self.path().read_bytes(), original.replace("postgres://old/db", self.SECRET).encode())
+        self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in self.path().parent.iterdir()], ["app.env"])
+
+    def test_set_key_appends_a_new_key_and_changes_nothing_when_the_value_matches(self):
+        self.provision()
+        self.assertTrue(manage_environment(self.layout, "orders", "set-key", key="A", value="1")["changed"])
+        self.assertEqual(self.path().read_text(), "A=1\n")
+        before = self.path().stat().st_ino
+        self.assertFalse(manage_environment(self.layout, "orders", "set-key", key="A", value="1")["changed"])
+        self.assertEqual(self.path().stat().st_ino, before)
+        self.assertTrue(manage_environment(self.layout, "orders", "set-key", key="B", value="")["changed"])
+        self.assertEqual(self.path().read_text(), "A=1\nB=\n")
+
+    def test_unset_removes_one_key_and_is_idempotent(self):
+        self.provision()
+        self.path().write_text("# keep\nA=1\nB=2\nC=3\n")
+        self.path().chmod(0o600)
+        self.assertEqual(manage_environment(self.layout, "orders", "unset", key="B"), {"keys": ["A", "C"], "changed": True})
+        self.assertEqual(self.path().read_text(), "# keep\nA=1\nC=3\n")
+        self.assertFalse(manage_environment(self.layout, "orders", "unset", key="B")["changed"])
+        self.assertFalse(manage_environment(self.layout, "orders", "unset", key="MISSING")["changed"])
+        self.assertEqual(self.path().read_text(), "# keep\nA=1\nC=3\n")
+
+    def test_unset_on_a_missing_file_is_a_no_op(self):
+        self.provision()
+        self.assertEqual(manage_environment(self.layout, "orders", "unset", key="A"), {"keys": [], "changed": False})
+        self.assertFalse(self.path().exists())
+
+    def test_invalid_one_key_edits_are_refused_and_never_echo_values(self):
+        self.provision()
+        self.path().write_text("KEEP=1\n")
+        self.path().chmod(0o600)
+        cases = (("set-key", {"key": "PORT", "value": self.SECRET}),
+                 ("set-key", {"key": "A-B", "value": self.SECRET}),
+                 ("set-key", {"key": "A", "value": self.SECRET + "\nB=2"}),
+                 ("set-key", {"key": "A", "value": self.SECRET + "\rB=2"}),
+                 ("set-key", {"key": "A", "value": "x" * (MAX_VALUE_BYTES + 1)}),
+                 ("set-key", {"key": "A", "value": None}),
+                 ("unset", {"key": "PORT"}),
+                 ("unset", {"key": "A B"}),
+                 ("unset", {"key": None}))
+        for operation, arguments in cases:
+            with self.subTest(operation=operation, arguments=str(arguments)[:30]), \
+                    self.assertRaises(ProvisionError) as caught:
+                manage_environment(self.layout, "orders", operation, **arguments)
+            self.assertNotIn("s3cr3t", str(caught.exception))
+        self.assertEqual(self.path().read_text(), "KEEP=1\n")
+        self.assertEqual([p.name for p in self.path().parent.iterdir()], ["app.env"])
+
+    def test_one_key_edits_validate_before_the_file_is_read(self):
+        self.provision()
+        self.path().write_text("A=1\n")
+        self.path().chmod(0o644)  # load_environment_text would refuse this file
+        with self.assertRaisesRegex(ProvisionError, "variable name"):
+            manage_environment(self.layout, "orders", "set-key", key="A B", value="x")
+        with self.assertRaisesRegex(ProvisionError, "managed by Shiplord"):
+            manage_environment(self.layout, "orders", "unset", key="PORT")
+
+    def test_one_key_edits_refuse_an_unreadable_file_instead_of_discarding_it(self):
+        self.provision()
+        for kind in ("mode", "encoding", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_unreadable(kind)
+                for operation, arguments in (("set-key", {"key": "A", "value": "1"}),
+                                             ("unset", {"key": "DATABASE_URL"})):
+                    with self.assertRaises(ProvisionError) as caught:
+                        manage_environment(self.layout, "orders", operation, **arguments)
+                    message = str(caught.exception)
+                    self.assertIn("shiplord env clear", message)
+                    self.assertNotIn("s3cr3t", message)
+                    self.assertNotIn(str(self.layout.environments), message)
+                self.assertTrue(self.path().exists() or self.path().is_symlink())
+
+    def test_through_the_admin_entry_point_one_key_edits_never_return_values(self):
+        self.provision()
+        set_key = envelope("environment", arguments={"operation": "set-key", "key": "DATABASE_URL",
+                                                     "value": self.SECRET})
+        response, code = run(encode(set_key), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": ["DATABASE_URL"], "changed": True}))
+        self.assertNotIn("s3cr3t", str(response))
+        unset = envelope("environment", arguments={"operation": "unset", "key": "DATABASE_URL"})
+        response, code = run(encode(unset), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": [], "changed": True}))
+        self.assertEqual(manage_environment(self.layout, "orders", "keys"), {"keys": []})
+        response, code = run(encode(unset), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": [], "changed": False}))
+        bad, code = run(encode(envelope("environment", arguments={"operation": "set-key", "key": "PORT",
+                                                                  "value": self.SECRET})), self.layout, self.system, {})
+        self.assertEqual((code, bad["status"]), (1, "error"))
+        self.assertNotIn("s3cr3t", str(bad))
+        bad, code = run(encode(envelope("environment", arguments={"operation": "set-key", "key": "A", "value": "1",
+                                                                  "extra": 1})), self.layout, self.system, {})
         self.assertEqual(code, 2)
 
 

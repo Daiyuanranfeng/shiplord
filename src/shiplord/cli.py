@@ -924,17 +924,36 @@ def recover(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @env_app.command("set")
-def env_set(from_file: Path = typer.Option(..., "--from-file", help="A KEY=VALUE file; use - for stdin."),
+def env_set(assignment: Optional[str] = typer.Argument(None, metavar="KEY=VALUE", help="Set one variable."),
+            from_file: Optional[Path] = typer.Option(None, "--from-file",
+                                                     help="Replace the whole environment from a KEY=VALUE file; use - for stdin."),
             json_output: bool = typer.Option(False, "--json")) -> None:
-    """Replace the application's runtime environment. Values are never printed."""
+    """Set one variable, or replace the runtime environment. Values are never printed."""
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
+        if (assignment is None) == (from_file is None):
+            raise CommandError("choose exactly one of a KEY=VALUE assignment and --from-file")
+        if assignment is not None:
+            commands.environment_edit_arguments("set-key", assignment=assignment)  # before any connection
+            return commands.edit_environment(manifest, _admin(manifest, json_output), "set-key", assignment=assignment)
         try:
             text = sys.stdin.read() if str(from_file) == "-" else from_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             raise CommandError("could not read the environment file") from None
         return commands.set_environment(manifest, _admin(manifest, json_output), "set", text)
+    _execute(action, json_output)
+
+
+@env_app.command("unset")
+def env_unset(key: str = typer.Argument(..., metavar="KEY", help="Remove one variable."),
+              json_output: bool = typer.Option(False, "--json")) -> None:
+    """Remove one variable; every other line is left unchanged. Values are never printed."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        commands.environment_edit_arguments("unset", key=key)  # before any connection
+        return commands.edit_environment(manifest, _admin(manifest, json_output), "unset", key=key)
     _execute(action, json_output)
 
 

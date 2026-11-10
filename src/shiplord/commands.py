@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .environment import EnvironmentError_, parse_environment
+from .environment import EnvironmentError_, parse_assignment, parse_environment, validate_key
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
@@ -112,6 +112,27 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
     result = admin.call("environment", manifest["name"], arguments)
     note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
+
+
+def environment_edit_arguments(operation: str, *, assignment: str | None = None, key: str | None = None) -> dict:
+    """Validate a one-key edit locally, so a mistake never opens a connection or changes a file."""
+    try:
+        if operation == "set-key":
+            name, value = parse_assignment(assignment)
+            return {"operation": operation, "key": name, "value": value}
+        if operation == "unset":
+            return {"operation": operation, "key": validate_key(key)}
+    except EnvironmentError_ as error:
+        raise CommandError(str(error)) from None
+    raise CommandError("unknown environment operation")
+
+
+def edit_environment(manifest: dict, admin: AdminClient, operation: str, *, assignment: str | None = None,
+                     key: str | None = None) -> tuple[int, dict]:
+    """Change one runtime variable; its value travels only in the request frame and is never returned."""
+    arguments = environment_edit_arguments(operation, assignment=assignment, key=key)
+    result = admin.call("environment", manifest["name"], arguments)
+    return 0, {"ok": True, **result, "note": "Takes effect the next time a release starts."}
 
 
 def native_artifact(binary: Path) -> dict:

@@ -64,6 +64,8 @@ shiplord configure --server production --api-domain orders-api.example.com \
   --frontend https://orders.example.com           # or --no-frontend
 shiplord provision                                   # registers your SSH key for this application
 shiplord env set --from-file .env.production         # runtime secrets; values are never printed
+shiplord env set FEATURE_FLAG=on                     # change one variable, leaving other lines as they are
+shiplord env unset OLD_FLAG                          # remove one variable; safe to repeat
 shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
 
 # every release
@@ -108,8 +110,8 @@ An image can serve both its website and API at the configured hostname.
 Both profiles receive `HOST`, `PORT`, and `LOG_LEVEL`. Only `google-adk` receives Shiplord's `AGENT_DIR`,
 `AGENT_NAME`, `RELOAD_AGENTS`, `SERVE_WEB_INTERFACE`, and `ALLOW_ORIGINS` settings. Generic images keep
 their own defaults for those five variables and must implement their own CORS behavior when needed.
-All managed variable names remain reserved in `shiplord env set`, including ADK names, because environment
-files belong to the application and can survive a profile change.
+All managed variable names remain reserved in `shiplord env set` and `shiplord env unset`, including ADK names,
+because environment files belong to the application and can survive a profile change.
 
 `configure` defaults to `google-adk` for compatibility. `init` still scaffolds only `google-adk`, and native
 binaries still require that profile. `github setup` generates the ADK template's workflow and refuses generic
@@ -215,7 +217,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
 | `provision` | Create the application's account, state, port, and key access on the server. |
-| `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
+| `env set --from-file F` / `env set KEY=VALUE` / `env unset KEY` / `env keys` / `env clear` | Manage runtime environment. Whole-file `set` refuses an empty file; one-key edits keep every other line byte-identical; `unset` is idempotent; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
@@ -266,7 +268,8 @@ If a worker is killed mid-deployment the journal remains, further deployments ar
 - Per-application deployment accounts; authorized keys are root-owned and carry `command=...,restrict`.
 - The dispatcher never evaluates the client's command line; sudo permits one fixed helper with no arguments.
 - Application ports bind to loopback only; Caddy is the only public entry point.
-- Runtime environment files are root-only; secrets never appear in argv, logs, results, or generated files.
+- Runtime environment files are root-only. Shiplord never prints or logs a value. `env set KEY=VALUE` puts that
+  value in your shell history and local process list; use `env set --from-file` (or `--from-file -`) for secrets.
 - Host keys are pinned (`StrictHostKeyChecking=yes`); a changed key fails closed.
 - Containers run with a memory limit, bounded logs, `no-new-privileges` and all capabilities dropped; native
   services run as a separate unprivileged account with `ProtectSystem=strict` and no capabilities.
