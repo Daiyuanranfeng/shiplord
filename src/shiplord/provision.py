@@ -60,6 +60,20 @@ def _account(system: System, name: str) -> dict | None:
     return {"name": fields[0], "uid": int(fields[2]), "comment": fields[4], "home": fields[5], "shell": fields[6]}
 
 
+def _is_ours(account: dict, marker: str, home: str, shell: str) -> bool:
+    """Whether an existing account is the one provisioning would have created for this application."""
+    return (account["comment"] == marker and account["home"] == home and account["shell"] == shell
+            and account["uid"] >= 1)
+
+
+def _existing_user(system: System, name: str, marker: str, home: str, shell: str) -> dict | None:
+    """Read an account without changing it, refusing one that is not ours; None when it does not exist."""
+    account = _account(system, name)
+    if account is not None and not _is_ours(account, marker, home, shell):
+        raise ProvisionError("an account with that name exists but is not a Shiplord account")
+    return account
+
+
 def _ensure_user(system: System, name: str, marker: str, home: str, shell: str) -> tuple[dict, bool]:
     """Create a system account, or verify that an existing one is ours; never adopt a foreign account."""
     account = _account(system, name)
@@ -71,10 +85,13 @@ def _ensure_user(system: System, name: str, marker: str, home: str, shell: str) 
             if _run(system, argv, step).code != 0:
                 raise ProvisionError(f"{step} failed for the account {name}")
         account, created = _account(system, name), True
-    if (account is None or account["comment"] != marker or account["home"] != home
-            or account["shell"] != shell or account["uid"] < 1):
+    if account is None or not _is_ours(account, marker, home, shell):
         raise ProvisionError("an account with that name exists but is not a Shiplord account")
     return account, created
+
+
+def _existing_account(system: System, application_id: str) -> dict | None:
+    return _existing_user(system, deployment_user(application_id), _marker(application_id), "/", "/bin/sh")
 
 
 def _ensure_account(system: System, application_id: str) -> tuple[dict, bool]:
@@ -100,9 +117,18 @@ def _ensure_group_membership(system: System, name: str) -> bool:
     return True
 
 
+def _runtime_marker(application_id: str) -> str:
+    return f"shiplord-runtime-{application_id}"
+
+
+def _existing_runtime_account(system: System, application_id: str) -> dict | None:
+    return _existing_user(system, runtime_user(application_id), _runtime_marker(application_id), "/nonexistent",
+                          "/usr/sbin/nologin")
+
+
 def _ensure_runtime(layout: Layout, system: System, application_id: str) -> dict[str, bool]:
     """A native application runs as its own unprivileged account, with writable data outside releases."""
-    account, created = _ensure_user(system, runtime_user(application_id), f"shiplord-runtime-{application_id}",
+    account, created = _ensure_user(system, runtime_user(application_id), _runtime_marker(application_id),
                                     "/nonexistent", "/usr/sbin/nologin")
     data = layout.data / application_id
     made = not data.exists()
@@ -186,6 +212,20 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
                                "image_repository": image_repository, "max_memory_mb": max_memory_mb})
     except StateError as error:
         raise ProvisionError(f"invalid application settings: {error}") from None
+    # Everything that can refuse this provisioning is checked before the first side effect, so a refused
+    # re-provision leaves no account, key, sudoers rule, directory, or registration behind.
+    account = _existing_account(system, app)
+    if runtime == "native":
+        _existing_runtime_account(system, app)
+    registry_fd = _open_directory(layout.registrations)
+    try:
+        existing = Registry(registry_fd, lock).check(
+            app, deployment_uid=None if account is None else account["uid"], deployment_user=deployment_user(app),
+            runtime=runtime, api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+    except StateError as error:
+        raise ProvisionError(f"registration failed: {error}") from None
+    finally:
+        os.close(registry_fd)
     created: dict[str, bool] = {}
     account, created["account"] = _ensure_account(system, app)
     created["deployment_group"] = _ensure_group_membership(system, account["name"])
@@ -213,12 +253,10 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     created["sudo_policy"] = _install_sudoers(layout, system, app, account["name"])
     registry_fd = _open_directory(layout.registrations)
     try:
-        registry = Registry(registry_fd, lock)
-        before = registry.read(app)
-        record = registry.register(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                   runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                   max_memory_mb=max_memory_mb)
-        created["registration"] = before is None
+        record = Registry(registry_fd, lock).register(
+            app, deployment_uid=account["uid"], deployment_user=account["name"], runtime=runtime,
+            api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+        created["registration"] = existing is None
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:

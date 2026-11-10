@@ -132,6 +132,11 @@ class ProvisionTestCase(unittest.TestCase):
         return {str(p.relative_to(self.layout.prefix)): p.read_bytes()
                 for p in self.layout.prefix.rglob("*") if p.is_file() and p.name != "host.lock"}
 
+    def host_state(self):
+        """Every file, account, and group membership: what a provisioning can create and a refusal must not."""
+        return {"files": self.snapshot(), "users": json.dumps(self.system.users, sort_keys=True),
+                "groups": json.dumps({name: sorted(members) for name, members in self.system.groups.items()})}
+
 
 class ProvisionTests(ProvisionTestCase):
     def test_first_provision_creates_every_resource(self):
@@ -167,7 +172,8 @@ class ProvisionTests(ProvisionTestCase):
         self.assertFalse(any(second["created"].values()), second["created"])
         self.assertEqual((second["host_port"], second["deployment_user"]), (first["host_port"], first["deployment_user"]))
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent", "getent"])
+        # Two reads in the pre-check (the account and the registry) and the account lookup that verifies it.
+        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent", "getent", "getent"])
 
     def test_a_new_deployment_account_joins_the_group_the_sshd_policy_matches(self):
         """An account created after bootstrap must be covered by the drop-in bootstrap already wrote."""
@@ -223,6 +229,34 @@ class ProvisionTests(ProvisionTestCase):
                        {"image_repository": "ghcr.io/example/other"}):
             with self.subTest(change=change), self.assertRaisesRegex(ProvisionError, "differs"):
                 self.provision(**change)
+
+    def test_a_refused_re_provision_changes_nothing_on_the_host(self):
+        """The key, the account, and the sudoers rule must not exist for a registration that was refused."""
+        self.provision()
+        before = self.host_state()
+        keys = self.layout.authorized_keys / "ship-orders"
+        for change in ({"api_domain": "other.example.com"}, {"runtime": "native", "image_repository": None},
+                       {"image_repository": "ghcr.io/example/other"}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ProvisionError, "differs"):
+                    self.provision(public_key=ed25519(2), key_label="ci", **change)
+                self.assertEqual(self.host_state(), before)
+                self.assertNotIn(ed25519(2).split()[1], keys.read_text())  # the new key was never added
+                self.assertEqual(list(self.layout.sudoers_dir.iterdir()), [self.layout.sudoers_dir / "shiplord-orders"])
+
+    def test_a_hostname_owned_by_another_application_leaves_nothing_behind(self):
+        self.provision("orders")
+        before = self.host_state()
+        with self.assertRaisesRegex(ProvisionError, "hostname is already registered"):
+            self.provision("billing", api_domain="orders.example.com", public_key=ed25519(2))
+        self.assertEqual(self.host_state(), before)
+        self.assertNotIn("ship-billing", self.system.users)
+        self.assertFalse((self.layout.authorized_keys / "ship-billing").exists())
+        self.assertFalse((self.layout.sudoers_dir / "shiplord-billing").exists())
+        self.assertFalse((self.layout.environments / "billing").exists())
+        self.assertFalse((self.layout.app_state / "billing").exists())
+        self.assertFalse((self.layout.registrations / "billing.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
 
     def test_invalid_inputs_are_rejected_before_creating_accounts(self):
         before_calls = len(self.system.calls)
@@ -283,9 +317,12 @@ class NativeProvisionTests(ProvisionTestCase):
 
     def test_a_foreign_runtime_account_is_never_adopted(self):
         self.system.users["app-orders"] = {"uid": 800, "comment": "other", "home": "/home/x", "shell": "/bin/bash"}
+        before = self.host_state()
         with self.assertRaisesRegex(ProvisionError, "not a Shiplord"):
             self.provision_native()
         self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.host_state(), before)  # no deployment account, key, or sudoers rule was created
+        self.assertNotIn("ship-orders", self.system.users)
 
     def test_deprovision_removes_binaries_and_the_unit_but_retains_data_and_says_so(self):
         self.provision_native()
