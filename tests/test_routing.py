@@ -615,7 +615,6 @@ class EnsureImportTests(RoutingTestCase):
         self.assertTrue(caught.exception.intervention_required)
 
 
-<<<<<<< HEAD
 class RemoveImportTests(RoutingTestCase):
     """Uninstall removes the managed import once, and only when it is the one Shiplord wrote."""
 
