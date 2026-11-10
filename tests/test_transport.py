@@ -242,7 +242,7 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(ServerError):
                 load_server("production")
 
-    def test_doctor_without_a_mode_needs_an_application_manifest(self):
+    def test_doctor_without_a_mode_reports_local_checks_when_no_manifest_is_present(self):
         with tempfile.TemporaryDirectory() as directory:
             original = os.getcwd()
             os.chdir(directory)
@@ -250,8 +250,10 @@ class TransportTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["doctor", "--json"])
             finally:
                 os.chdir(original)
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
+        self.assertIn(result.exit_code, (0, 3))
+        output = json.loads(result.stdout)
+        self.assertEqual(set(output), {"ok", "scope", "checks", "client"})
+        self.assertIn("server readiness was not checked", output["scope"])
 
     def test_server_capabilities_is_the_only_request_without_an_application(self):
         base = {"version": 1, "request_id": "request-1", "action": "capabilities", "application_id": None,

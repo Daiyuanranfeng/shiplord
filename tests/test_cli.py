@@ -139,7 +139,7 @@ class CLITests(unittest.TestCase):
 
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
-                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"], ["doctor", "--json"],
+                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
@@ -432,6 +432,46 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "doctor", "--local", env=env)
         self.assertEqual(result.returncode, 3)
         self.assertIn("ssh: missing", result.stdout)
+
+    def test_doctor_outside_an_application_runs_the_local_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "doctor")
+        self.assertIn(result.returncode, (0, 3))
+        self.assertIn("Target: local machine", result.stdout)
+        self.assertIn("Local tools:", result.stdout)
+        self.assertNotIn("ship.toml was not found", result.stdout)
+
+    def test_doctor_outside_an_application_reports_the_unchecked_scope_and_next_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "doctor")
+        self.assertIn("Server readiness was not checked", result.stdout)
+        self.assertIn("shiplord configure", result.stdout)
+        self.assertIn("shiplord doctor --server <alias>", result.stdout)
+
+    def test_doctor_outside_an_application_keeps_the_local_json_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fallback = self.invoke(directory, "doctor", "--json")
+            local = self.invoke(directory, "doctor", "--local", "--json")
+        self.assertEqual(fallback.returncode, local.returncode, fallback.stderr)
+        output = json.loads(fallback.stdout)
+        self.assertEqual(set(output), {"ok", "scope", "checks", "client"})
+        self.assertEqual(set(output), set(json.loads(local.stdout)))
+        self.assertIn("server readiness was not checked", output["scope"])
+        self.assertEqual(set(output["checks"]), {"ssh", "git", "gh"})
+
+    def test_doctor_outside_an_application_exits_three_when_a_tool_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, PATH=directory)
+            result = self.invoke(directory, "doctor", env=env)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("ssh: missing", result.stdout)
+
+    def test_doctor_reports_an_invalid_manifest_instead_of_falling_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "ship.toml").write_text("this is not toml")
+            result = self.invoke(directory, "doctor", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
 
     def test_version_and_help_use_shiplord(self):
         with tempfile.TemporaryDirectory() as directory:
