@@ -223,8 +223,8 @@ somewhere else yourself.
 
 On a default Docker install the volume's files are under
 `/var/lib/docker/volumes/shiplord-<application>-artifacts/_data`, and a native app's files are under
-`/var/lib/shiplord/data/<application>`. Both are owned by the user the application runs as, not by your login, so inspect them
-with the privileges you already use for that host.
+`/var/lib/shiplord/data/<application>`. Both are owned by the user the application runs as, not by your
+login, so inspect them with the privileges you already use for that host.
 
 ## Graceful replacement (Docker)
 
