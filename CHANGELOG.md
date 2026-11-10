@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `shiplord setup`, which runs configure, provision, env, registry login,
+  github setup, and check-ci in order and resumes at the first incomplete step.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

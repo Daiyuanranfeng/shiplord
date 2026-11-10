@@ -15,10 +15,11 @@ from typing import Callable, Optional
 import typer
 
 from . import __version__
-from . import commands, github, tailscale
+from . import commands, github, setup as setup_module, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
-from .configure import ConfigurationError, collect_answers, create_manifest
+from .configure import ConfigurationCancelled, ConfigurationError, configure_application
+from .environment import EnvironmentError_, parse_environment
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
@@ -732,6 +733,18 @@ def _ask(prompt: str, default: str | None) -> str:
     return typer.prompt(prompt, default=default, show_default=bool(default))
 
 
+def _confirm_manifest(answers: dict) -> bool:
+    """Show what will be written and ask; the summary is the last chance to stop before the file exists."""
+    typer.echo("\nship.toml will contain:")
+    for label, key in (("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime"),
+                       ("hostname", "api_domain"), ("frontend origins", "origins"),
+                       ("container port", "container_port"), ("health path", "readiness_path"),
+                       ("memory (MiB)", "memory_mb")):
+        value = answers[key]
+        typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
+    return typer.confirm("Write ship.toml?", default=True)
+
+
 @app.command(rich_help_panel="Setup")
 def configure(server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
               api_domain: Optional[str] = typer.Option(None, "--api-domain", help="Public hostname of the application."),
@@ -753,48 +766,23 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
              "origins": list(frontend) if frontend else ([] if no_frontend else None),
              "container_port": container_port, "readiness_path": health_path, "memory_mb": memory}
     directory = Path.cwd()
-    if _interactive():
-        if (directory / "ship.toml").exists() or (directory / "ship.toml").is_symlink():
-            typer.echo("error: ship.toml already exists; no file was replaced", err=True)
-            raise typer.Exit(2)
-        try:
-            servers = list_servers()[0] if server is None else []
-            answers = collect_answers(given, root=directory, servers=servers, ask=_ask, say=typer.echo)
-            typer.echo("\nship.toml will contain:")
-            for label, key in (("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime"),
-                               ("hostname", "api_domain"), ("frontend origins", "origins"),
-                               ("container port", "container_port"), ("health path", "readiness_path"),
-                               ("memory (MiB)", "memory_mb")):
-                value = answers[key]
-                typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
-            if not typer.confirm("Write ship.toml?", default=True):
-                raise typer.Abort()
-        except typer.Abort:
-            typer.echo("Cancelled; no file was created.", err=True)
-            raise typer.Exit(1) from None
-        except ServerError as error:
-            typer.echo(f"error: {error}", err=True)
-            raise typer.Exit(3) from None
-        except ConfigurationError as error:
-            typer.echo(f"error: {error}", err=True)
-            raise typer.Exit(2) from None
-    else:
-        if server is None or api_domain is None:
-            typer.echo("error: --server and --api-domain are required (run `shiplord configure` in a terminal to be "
-                       "asked instead)", err=True)
-            raise typer.Exit(2)
-        if given["origins"] is None:
-            typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
-            raise typer.Exit(2)
-        answers = dict(given, name=name or directory.name, runtime=runtime or "docker",
-                       template=template or "google-adk")
+    interactive = _interactive()
+
+    def servers() -> list[dict[str, str]]:
+        return list_servers()[0] if server is None else []
+
     try:
-        create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
-                        answers["runtime"], answers["template"],
-                        **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
-                           if answers[key] is not None})
-    except (ConfigurationError, ManifestError) as exc:
-        typer.echo(f"error: {exc}", err=True)
+        answers = configure_application(directory, given, interactive=interactive, servers=servers() if interactive else None,
+                                        ask=_ask if interactive else None, say=typer.echo,
+                                        confirm=_confirm_manifest if interactive else None)
+    except (ConfigurationCancelled, typer.Abort):
+        typer.echo("Cancelled; no file was created.", err=True)
+        raise typer.Exit(1) from None
+    except ServerError as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(3) from None
+    except (ConfigurationError, ManifestError) as error:
+        typer.echo(f"error: {error}", err=True)
         raise typer.Exit(2) from None
     try:
         registered = any(entry["alias"] == answers["server"] for entry in list_servers()[0])
@@ -1025,6 +1013,30 @@ def registry_status_command(json_output: bool = typer.Option(False, "--json")) -
     _execute(lambda: commands.registry_other(manifest, _admin(manifest, json_output), "list"), json_output)
 
 
+def _github_setup(manifest: dict, repository: str, *, json_output: bool, interactive: bool | None = None,
+                  ci_host: Optional[str] = None, tooling_ref: Optional[str] = None, platforms: str = "linux/amd64",
+                  tailscale_client_id: Optional[str] = None, tailscale_audience: Optional[str] = None,
+                  tailscale_tags: Optional[str] = None, force_workflow: bool = False) -> tuple[int, dict]:
+    """Create the CI key, secret, variables, and workflow for an application. Shared by `github setup` and `setup`."""
+    github.validate_setup_profile(manifest)
+    given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
+    gh = github.GitHub()
+    if interactive is None:
+        interactive = sys.stdin.isatty() and not json_output
+    try:
+        settings, origin = tailscale.resolve(
+            given, ask=_ask_tailscale if interactive else None,
+            guide=lambda: github.tailscale_guidance(gh, repository, manifest))
+    except tailscale.TailscaleError as error:
+        raise CommandError(str(error)) from None
+    target = load_server(manifest["server"])
+    result = github.github_setup(manifest, repository, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
+                                 admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
+                                 tailscale=settings, force_workflow=force_workflow)
+    result["tailscale"] = origin
+    return 0, result
+
+
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
@@ -1037,25 +1049,195 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          json_output: bool = typer.Option(False, "--json")) -> None:
     """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow."""
     manifest = _manifest(json_output)
+    _execute(lambda: _github_setup(manifest, repo, json_output=json_output, ci_host=ci_host, tooling_ref=tooling_ref,
+                                   platforms=platforms, tailscale_client_id=tailscale_client_id,
+                                   tailscale_audience=tailscale_audience, tailscale_tags=tailscale_tags,
+                                   force_workflow=force_workflow), json_output)
+
+
+@app.command(rich_help_panel="Setup")
+def setup(server: Optional[str] = typer.Option(None, "--server", help="Registered server alias; only when ship.toml is missing."),
+          api_domain: Optional[str] = typer.Option(None, "--api-domain", help="Public hostname; only when ship.toml is missing."),
+          frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
+          no_frontend: bool = typer.Option(False, "--no-frontend"),
+          name: Optional[str] = typer.Option(None, "--name"),
+          runtime: Optional[str] = typer.Option(None, "--runtime", help="docker (default) or native."),
+          template: Optional[str] = typer.Option(None, "--template", help="google-adk (default) or generic."),
+          container_port: Optional[int] = typer.Option(None, "--container-port"),
+          health_path: Optional[str] = typer.Option(None, "--health-path"),
+          memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB."),
+          public_key: Optional[Path] = typer.Option(None, "--public-key", help="Public key to register."),
+          image_repository: Optional[str] = typer.Option(None, "--image-repository"),
+          max_memory_mb: Optional[int] = typer.Option(None, "--max-memory-mb"),
+          env_file: Optional[Path] = typer.Option(None, "--env-file",
+                                                  help="Runtime environment file; omitted leaves the environment unchanged."),
+          registry: str = typer.Option("ghcr.io", "--registry"),
+          registry_username: Optional[str] = typer.Option(None, "--registry-username"),
+          token_file: Optional[Path] = typer.Option(None, "--token-file"),
+          token_stdin: bool = typer.Option(False, "--token-stdin"),
+          repo: Optional[str] = typer.Option(None, "--repo", help="owner/repository; default: ship.toml's [github]."),
+          ci_host: Optional[str] = typer.Option(None, "--ci-host"),
+          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref"),
+          platforms: str = typer.Option("linux/amd64", "--platforms"),
+          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
+          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
+          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
+          force_workflow: bool = typer.Option(False, "--force-workflow"),
+          ci_timeout: int = typer.Option(1200, "--ci-timeout", help="Seconds to wait for the final check."),
+          skip_ci: bool = typer.Option(False, "--skip-ci", help="Stop after the local steps; CI is not configured or checked."),
+          rerun: bool = typer.Option(False, "--rerun", help="Repeat the repeatable steps; ship.toml is never replaced."),
+          json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
+    """Run the first-run steps in order and resume at the first incomplete one.
+
+    The steps are configure, provision, env, registry login, github setup, and check-ci.
+    Completed steps are observed, not remembered, so an interrupted run continues where it stopped."""
+    if frontend and no_frontend:
+        _fail("specify --frontend or explicitly choose --no-frontend", 2, json_output)
+    directory = Path.cwd()
+    existing = None
+    if (directory / "ship.toml").exists() or (directory / "ship.toml").is_symlink():
+        try:
+            existing = load_manifest()
+        except ManifestError as error:
+            _fail(str(error), 2, json_output)
+    repository = repo or (existing or {}).get("github", {}).get("repository")
+    if existing is not None and "github" in existing and repo and repo != existing["github"]["repository"]:
+        _fail(f"ship.toml already names {existing['github']['repository']}; edit it first to change repositories",
+              2, json_output)
+    template_hint = existing["template"] if existing is not None else (template or "google-adk")
+    runtime_hint = existing["runtime"] if existing is not None else (runtime or "docker")
+    if not skip_ci:
+        if repository is None:
+            _fail("pass --repo owner/repository; CI setup and the final check need a GitHub repository "
+                  "(or pass --skip-ci)", 2, json_output)
+        try:
+            github.validate_repository(repository)
+            if existing is not None:
+                github.validate_setup_profile(existing)
+        except github.GitHubError as error:
+            _fail(str(error), error.code, json_output)
+        if template_hint == "generic":
+            _fail("--template generic needs --skip-ci; github setup generates an ADK workflow", 2, json_output)
+        if runtime_hint != "docker" and not (directory / github.WORKFLOW_PATH).is_file():
+            _fail(f"--runtime native needs your own {github.WORKFLOW_PATH} or --skip-ci; github setup does not "
+                  "generate one", 2, json_output)
+    provision_image = image_repository or (f"ghcr.io/{repository.lower()}" if repository else None)
+    if runtime_hint == "docker" and provision_image is None:
+        _fail("pass --repo owner/repository or --image-repository so provision knows the image repository",
+              2, json_output)
+    if env_file is not None:
+        if not env_file.is_file():
+            _fail("the environment file was not found", 2, json_output)
+        try:
+            values = parse_environment(env_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            _fail("could not read the environment file", 2, json_output)
+        except EnvironmentError_ as error:
+            _fail(str(error), 2, json_output)
+        if not values:
+            _fail("the environment file defines no variables", 2, json_output)
+    if public_key is not None:
+        try:
+            commands.read_public_key(public_key)
+        except CommandError as error:
+            _fail(str(error), error.code, json_output)
+    token = None
+    if registry_username is None:
+        if token_file is not None or token_stdin:
+            _fail("--token-file and --token-stdin require --registry-username", 2, json_output)
+    else:
+        if token_stdin == (token_file is not None):
+            _fail("provide the token with exactly one of --token-file and --token-stdin", 2, json_output)
+        try:
+            token = (sys.stdin.read() if token_stdin else token_file.read_text(encoding="utf-8")).strip()
+        except (OSError, UnicodeDecodeError):
+            _fail("could not read the token", 2, json_output)
+        try:
+            commands.validate_registry_login(registry, registry_username, token)
+        except CommandError as error:
+            _fail(str(error), error.code, json_output)
+
+    # stdin carries the registry token when --token-stdin is used, so configure must not prompt from it too.
+    interactive = _interactive() and not json_output and not token_stdin
+    given = {"server": server, "api_domain": api_domain, "name": name, "runtime": runtime, "template": template,
+             "origins": list(frontend) if frontend else ([] if no_frontend else None),
+             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory}
+    state: dict = {"manifest": existing, "admin": None}
+
+    def manifest() -> dict:
+        if state["manifest"] is None:
+            state["manifest"] = load_manifest()
+        return state["manifest"]
+
+    def admin() -> AdminClient:
+        if state["admin"] is None:
+            state["admin"] = _admin(manifest(), json_output)
+        return state["admin"]
+
+    def run_github(current: dict) -> tuple[int, dict]:
+        code, result = _github_setup(current, repository, json_output=json_output, interactive=interactive,
+                                     ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
+                                     tailscale_client_id=tailscale_client_id, tailscale_audience=tailscale_audience,
+                                     tailscale_tags=tailscale_tags, force_workflow=force_workflow)
+        state["manifest"] = None  # github setup writes [github] into ship.toml
+        return code, result
+
+    steps = [
+        setup_module.configure_step(directory, given, interactive=interactive,
+                                    servers=lambda: list_servers()[0] if server is None else [],
+                                    ask=_ask, say=typer.echo, confirm=_confirm_manifest),
+        setup_module.provision_step(manifest, admin, public_key=public_key, image_repository=provision_image,
+                                    max_memory_mb=max_memory_mb),
+        setup_module.environment_step(manifest, admin, env_file),
+        setup_module.registry_step(manifest, admin, registry=registry, username=registry_username, token=token),
+    ]
+    if skip_ci:
+        steps.append(setup_module.Step("github", run=lambda: (0, {}),
+                                       skip_reason="--skip-ci given; CI was not configured"))
+        steps.append(setup_module.Step("check-ci", run=lambda: (0, {}),
+                                       skip_reason="--skip-ci given; CI was not checked"))
+    else:
+        steps.append(setup_module.github_step(
+            manifest, run=run_github,
+            complete=lambda current: github.setup_complete(current, project=directory, repository=repository)))
+        steps.append(setup_module.check_ci_step(
+            manifest, lambda current: github.check_ci(current, gh=github.GitHub(), timeout=ci_timeout)))
+
+    def report(index: int, total: int, step: str, status: str) -> None:
+        if not json_output and status == "running":
+            typer.echo(f"Step {index}/{total} {step}: running", err=True)
 
     def action() -> tuple[int, dict]:
-        github.validate_setup_profile(manifest)
-        given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
-        gh = github.GitHub()
-        interactive = sys.stdin.isatty() and not json_output
+        code, result = setup_module.run_setup(steps, rerun=rerun, report=report)
+        if not result["ok"] and result.get("error"):
+            result["error"] = _recovery_hint(result["error"])
         try:
-            settings, origin = tailscale.resolve(
-                given, ask=_ask_tailscale if interactive else None,
-                guide=lambda: github.tailscale_guidance(gh, repo, manifest))
-        except tailscale.TailscaleError as error:
-            raise CommandError(str(error)) from None
-        target = load_server(manifest["server"])
-        result = github.github_setup(manifest, repo, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
-                                     admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
-                                     tailscale=settings, force_workflow=force_workflow)
-        result["tailscale"] = origin
-        return 0, result
-    _execute(action, json_output)
+            current = manifest()
+            result = {"application": current["name"], "server": current["server"], **result}
+        except ManifestError:
+            pass
+        return code, result
+    _execute(action, json_output, lambda code, result: _render_setup(result))
+
+
+def _render_setup(result: dict) -> None:
+    if result.get("application"):
+        typer.echo(f"Target: {result['application']} on {result['server']}")
+    labels = {"ran": "done"}
+    for item in result.get("steps", []):
+        line = f"{item['step']}: {labels.get(item['status'], item['status'])}"
+        if item.get("detail"):
+            line += f" ({item['detail']})"
+        typer.echo(line)
+        check = item.get("result")
+        if item["step"] == "check-ci" and isinstance(check, dict) and check.get("run"):
+            typer.echo(f"  CI run: {check['run']}")
+    if result.get("ok"):
+        typer.echo("Outcome: ready")
+    else:
+        typer.echo(f"Outcome: stopped at {result.get('failed_step')}")
+        if result.get("error"):
+            typer.echo(f"Error: {result['error']}")
 
 
 @github_app.command("check-ci", rich_help_panel="Administration")

@@ -148,12 +148,21 @@ class GitHub:
 # --- local state -----------------------------------------------------------------
 
 def ci_directory(application_id: str, home: Path | None = None) -> Path:
-    base = (home / "shiplord") if home else (_config_home() / "shiplord")
+    base = _ci_base(home)
     directory = base / "ci" / application_id
     directory.mkdir(parents=True, exist_ok=True)
     for path in (base, base / "ci", directory):
         os.chmod(path, 0o700)
     return directory
+
+
+def _ci_base(home: Path | None = None) -> Path:
+    return (home / "shiplord") if home else (_config_home() / "shiplord")
+
+
+def ci_state(application_id: str, home: Path | None = None) -> dict:
+    """The recorded CI setup state for an application, without creating anything."""
+    return _load_state(_ci_base(home) / "ci" / application_id)
 
 
 def _load_state(directory: Path) -> dict:
@@ -256,6 +265,27 @@ def validate_setup_profile(manifest: dict) -> None:
                           "workflow invoking `shiplord deploy`", 2, "configuration")
 
 
+def validate_repository(repository: str) -> str:
+    """Reject a repository that is not an ``owner/repository`` pair before anything is changed."""
+    if not _REPOSITORY.fullmatch(repository):
+        raise GitHubError("--repo must be owner/repository", 2)
+    return repository
+
+
+def setup_complete(manifest: dict, *, project: Path, repository: str, home: Path | None = None) -> bool:
+    """Local evidence that ``github setup`` finished for this repository.
+
+    It reads the manifest, the generated workflow, and the local CI state; it does not query GitHub, so a secret
+    deleted in the repository is not noticed here (``shiplord github status`` and the final check do notice it).
+    """
+    if manifest.get("github", {}).get("repository") != repository:
+        return False
+    if manifest["runtime"] == "docker" and not (project / WORKFLOW_PATH).is_file():
+        return False
+    state = ci_state(manifest["name"], home)
+    return bool(state.get("secret_set")) and state.get("repository") == repository
+
+
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
                       keys: list[tuple[str, str]], runner=run_ssh) -> None:
     """Prove the CI key works against the pinned host keys, exactly as the workflow will use it.
@@ -279,8 +309,7 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                  resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
     validate_setup_profile(manifest)
-    if not _REPOSITORY.fullmatch(repository):
-        raise GitHubError("--repo must be owner/repository", 2)
+    validate_repository(repository)
     if "github" in manifest and manifest["github"]["repository"] != repository:
         raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
     app = manifest["name"]

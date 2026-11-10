@@ -84,6 +84,36 @@ x86-64 and arm64 are supported), for example in CI. The binary is uploaded over 
 verified by size, SHA-256 and ELF header on the server, and run as an unprivileged account under a confined
 systemd unit.
 
+## One command for the first run
+
+After the server is registered and bootstrapped, `shiplord setup` runs the per-application steps in order:
+
+```sh
+shiplord setup --server production --api-domain orders-api.example.com \
+  --frontend https://orders.example.com \
+  --env-file .env.production \
+  --registry-username bot --token-file token \
+  --repo owner/orders
+```
+
+It configures the application (when `ship.toml` is missing), provisions the account, sets the environment,
+creates the registry pull login, writes the CI key, secret, variables and workflow, and finishes with
+`github check-ci`. Omitted inputs are skipped: without `--env-file` the environment is left unchanged, and
+without `--registry-username` no pull login is created. `--skip-ci` stops after the local steps; pass `--repo` or
+`--image-repository` too, because provision still needs to know where the image will live.
+
+Completed steps are observed, not remembered. A re-run skips a step whose result is already present (the
+manifest, the application's registration, the named environment keys, the recorded registry login, the CI
+state) and starts at the first one that is not. An observation that cannot be read counts as incomplete; every
+step is idempotent, so repeating it is safe. `--rerun` repeats the repeatable steps. `configure` is never
+repeated because `ship.toml` is never replaced.
+
+`setup` does not commit or push. `github setup` writes the workflow, but `check-ci` can only dispatch it once
+`.github/workflows/shiplord-release.yml` and `ship.toml` are on the deployment branch. On a first run, commit
+and push them, then run `shiplord setup` again; it resumes at `check-ci`. The final check exits non-zero when
+CI cannot reach the server. `github setup` refuses generic Docker applications (see below), so use `--skip-ci`
+and a custom workflow for those.
+
 ## Existing Docker applications
 
 Use the generic profile to deploy an existing image without Google ADK settings. In a terminal, run
@@ -214,6 +244,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
+| `setup` | Run configure, provision, env, registry login, github setup, and check-ci in order; resume at the first incomplete step. |
 | `provision` | Create the application's account, state, port, and key access on the server. |
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |

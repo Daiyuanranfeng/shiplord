@@ -145,6 +145,13 @@ class CLITests(unittest.TestCase):
                         self.assertIn("ship.toml", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_setup_without_a_manifest_asks_for_a_repository_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "setup", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--repo", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_deprovision_requires_explicit_confirmation_before_any_connection(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)

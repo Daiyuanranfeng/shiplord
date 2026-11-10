@@ -22,7 +22,7 @@ from .routing import CaddyCommands, RouteManager, RoutingError
 from .system import CommandError, System
 
 CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
-                            "tailscale.py", "template.py", "transport.py", "workflow.py"})
+                            "setup.py", "tailscale.py", "template.py", "transport.py", "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
