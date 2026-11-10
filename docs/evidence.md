@@ -3,7 +3,25 @@
 This is an audit of `ship-cli-plan.md` §13 against what was actually run. "Verified" names the test or suite that
 exercised the behavior. Anything not run is listed as not verified; nothing here is inferred.
 
-State of the tree when this was written: the working tree on `main`, uncommitted. All numbers are from the runs described below.
+State of the tree when this audit was written: the working tree on `main`, uncommitted. All numbers in this
+section are from the runs described below; they are historical. The current release decision is
+[`docs/release-gate.md`](release-gate.md).
+
+## 1.0 release gate (issue #76)
+
+[`docs/release-gate.md`](release-gate.md) is the authoritative, criterion-by-criterion record for the seven 1.0
+gate criteria. It names the exact run or test behind each status and what is missing; this table is only the index
+into it. A row here is not a pass.
+
+| Gate criterion | Status | Where it is mapped |
+| --- | --- | --- |
+| 1. `tests/linux/run.sh all` is green in CI on every pull request | Partly verified | `release-gate.md` criterion 1; `.github/workflows/test.yml` |
+| 2. Fresh-VM journey from `server add` to public HTTPS for three app types, each released by GitHub Actions | Not verified | `release-gate.md` criterion 2; the one native app in *Real server run* below |
+| 3. Rollback with crash output, reboot recovery, and `env set` then `restart` for each app | Partly verified | `release-gate.md` criterion 3; `test_deploy_integration`, `test_deploy`, `test_e2e_systemd` |
+| 4. A second machine can run `status`, `logs`, `rollback`, and `github rotate-key` | Partly verified | `release-gate.md` criterion 4; `test_cli`, `test_github`, e2e 17 |
+| 5. Every command has readable output and `--json`; the `AGENTS.md` exit-code table is true | Partly verified | `release-gate.md` criterion 5; `test_cli`, `test_client` |
+| 6. `README.md` covers PyPI install, the three application types, and supported server operating systems | Partly verified | `release-gate.md` criterion 6; `README.md` |
+| 7. `docs/evidence.md` maps each criterion to the run or test that proves it | Not verified | This pull request adds the map; `release-gate.md` criterion 7 |
 
 ## How it was verified
 
@@ -18,8 +36,13 @@ State of the tree when this was written: the working tree on `main`, uncommitted
 | The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy` | `tests/linux/run.sh systemd` | 13/13 passed |
 | The generated project, against the template's own 1,200-test suite | `uv run pytest tests` in a project made by `shiplord init` | 1,196 passed; 5 failed, of which 2 also fail on the untouched template on this machine and 3 passed when rerun alone (load flakes) |
 
-The Linux suites run in containers on Docker Desktop (a Linux VM on arm64). GitHub-hosted Ubuntu 24.04 x86-64
-runners were **not** used; `.github/workflows/test.yml` defines the corresponding jobs but they have not run.
+These counts are from that audit. The unit baseline on `main` at `97047f1` is 1126 tests, 94 skipped
+(macOS arm64, Python 3.14.3, 2026-11-11).
+
+The Linux suites above ran in containers on Docker Desktop (a Linux VM on arm64). GitHub-hosted Ubuntu 24.04
+x86-64 runners were not used for those runs. The `Tests` workflow now runs the real-host suites on ubuntu-24.04;
+the latest completed `main` run (42913399156, `97047f1`) had all 12 jobs green. Those CI jobs are not a
+`tests/linux/run.sh all` run; see [`release-gate.md`](release-gate.md) criterion 1.
 
 ## Definition of Done (§13)
 
@@ -43,7 +66,7 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Deployment privileges scoped to the registered application and helper | Verified | Real sudo/sshd: `test_host_integration` (account cannot write its own access, cannot use admin), e2e 15 and 24 (each login refused for the other application). |
 | Secret values absent from repository files, normal output, artifacts | Verified for the paths tested | Env, registry token, CI key, sudo password: never in argv, results, state, or errors (`test_provision`, `test_commands`, `test_github`, `test_client`). The generated workflow passes secrets only through `env:`. |
 | Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
-| Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | All but the live workflow, as above. |
+| Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | CI now runs the real-host suites and the latest observed `main` run is green; the live workflow was one native app. This is not a `tests/linux/run.sh all` run; see `release-gate.md` criterion 1. |
 | README and AGENTS.md let a fresh agent release and interpret failures | Written, not field-tested | `README.md`, `AGENTS.md`, the generated `SHIPLORD.md`; no fresh agent was run against them. |
 | No additional continuously running deployment service | Verified by construction | Only jobs run, as transient units that exit; there is no daemon. |
 
@@ -70,7 +93,8 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Private-key upload to GitHub fails | `test_github` (setup resumes; rotation leaves the old key working) |
 | Rollback itself fails | `test_deploy` (exit 5, previous restored; exit 6 when restoration fails) |
 
-A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is unverified.
+A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is
+unverified. This is still true on `main`; see [`release-gate.md`](release-gate.md) criterion 3.
 
 ## What running it for real found
 
@@ -197,7 +221,7 @@ What it found:
 - Private registry authentication end to end (the login file is accepted by the real `docker --config`; a registry that
   demands credentials was not run).
 - The real ADK application's CORS, readiness under load, and memory needs: the 512 MiB default is an example, not a measurement.
-- x86-64 for the real-host container suites: they ran on arm64 VMs; GitHub's x86-64 runners run them in this repository's CI.
+- x86-64 for the real-host container suites: the recorded runs above were on arm64 VMs. GitHub's x86-64 runners now run them in this repository's CI (latest completed main run 42913399156, all 12 jobs green).
 - CI installs Shiplord's own dependencies unpinned (`pip install -e .`); a new release of one could change CI results.
 - Native services can still connect to other loopback services (only binding is restricted), and Docker applications share
   the default bridge network; see the README's *Limits of the confinement*.
