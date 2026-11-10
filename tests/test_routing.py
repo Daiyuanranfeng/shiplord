@@ -764,6 +764,26 @@ class RemoveImportTests(RoutingTestCase):
         self.assertEqual([p.name for p in self.root.rglob(".tmp-*")], [])
         self.assertEqual([p.name for p in self.root.rglob(".shiplord-validate-*")], [])
 
+    def test_a_redundant_prior_is_settled_and_the_import_is_removed(self):
+        self.write_main(self.MAIN + self.line)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertNoTransactionLeftovers()
+
+    def test_a_prior_from_a_change_that_never_published_is_settled_without_a_rewrite(self):
+        self.write_main(self.MAIN)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertEqual((self.caddy.reload_calls, self.caddy.validate_calls), (0, []))
+
     def test_validation_failure_leaves_the_caddyfile_untouched(self):
         self.caddy.fail_validate = {1}
         before = self.snapshot()

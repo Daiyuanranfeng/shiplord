@@ -386,11 +386,8 @@ class RouteManager:
             raise RoutingError("Caddy directory is unavailable", "precondition") from None
         try:
             _directory(root)
-            prior, token = ".prior-Caddyfile", secrets.token_hex(8)
-            if os.path.lexists(self.root / prior):
-                raise RoutingError("an interrupted Caddyfile change requires manual inspection", "interrupted",
-                                   intervention_required=True)
-            main = _read_file(root, "Caddyfile", trusted=True)
+            token = secrets.token_hex(8)
+            main, _completed = self._settle_prior(root)
             if main is None:
                 raise RoutingError("the main Caddyfile is missing", "precondition")
             text = main.data.decode("utf-8", "replace")
@@ -413,15 +410,15 @@ class RouteManager:
                 self._unlink(root, name)
             temp = _TEMP_PREFIX + "Caddyfile-" + token
             self._create(root, temp, candidate, preserve=main)
-            os.link("Caddyfile", prior, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+            os.link("Caddyfile", _PRIOR_MAIN, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
             self._publish(root, temp, "Caddyfile")
             try:
                 self.commands.reload()
             except RoutingError as error:
-                self._restore(root, "Caddyfile", prior, True, error)
+                self._restore(root, "Caddyfile", _PRIOR_MAIN, True, error)
                 raise RoutingError("Caddy rejected the Caddyfile without the managed import; it was restored",
                                    "reload", detail=error.detail) from None
-            self._unlink(root, prior)
+            self._unlink(root, _PRIOR_MAIN)
             return RouteResult(changed=True)
         finally:
             os.close(root)
