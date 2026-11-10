@@ -114,6 +114,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
                     typer.echo(_upgrade_message(result))
                 else:
                     _render_apps(result.get("applications", []), result.get("error"))
+                    _render_ignored_files(result.get("ignored_files", []))
             if invalid:
                 typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
         if partial:
@@ -147,6 +148,7 @@ def apps(server: Optional[str] = typer.Argument(None, metavar="SERVER"),
     else:
         typer.echo(f"Server: {selected['alias']}  Outcome: {'complete' if inventory['ok'] else 'incomplete'}")
         _render_apps(inventory.get("applications", []), inventory.get("error"))
+        _render_ignored_files(inventory.get("ignored_files", []))
         if invalid:
             typer.echo(f"Ignored {invalid} invalid server {'entry' if invalid == 1 else 'entries'}.")
     if code:
@@ -183,6 +185,14 @@ def _inventory_error(error: Exception, alias: str) -> str:
         message += (f"; the server helper may not support inventory. Run `shiplord doctor --server {alias} --deep` "
                     f"to inspect it, or `shiplord server bootstrap {alias}` to update the helper.")
     return message
+
+
+def _render_ignored_files(names: list[str]) -> None:
+    """Report registry files that were skipped, so a stray backup never disappears silently."""
+    if not names:
+        return
+    noun = "file" if len(names) == 1 else "files"
+    typer.echo(f"  Ignored {len(names)} {noun} in the registry that is not a registration: " + ", ".join(names))
 
 
 def _render_apps(applications: list[dict], error: str | None = None) -> None:
