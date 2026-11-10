@@ -402,7 +402,10 @@ class HostIntegrationTests(unittest.TestCase):
         data.parent.mkdir(parents=True, exist_ok=True)
         data.write_text("application data\n")
 
-        result = self.admin("uninstall", None, {})
+        # The admin entry point builds a systemd-backed Caddy runner; the container has no systemd, so use the
+        # live Caddy this suite started, exactly as the bootstrap tests do.
+        with mock.patch("shiplord.admin.SubprocessCaddy", return_value=self.caddy):
+            result = self.admin("uninstall", None, {})
         self.assertEqual(result["status"], "uninstalled")
         self.assertIn("the state directory that holds the host lock", result["retained"])
         for path in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.dispatch):
@@ -420,7 +423,6 @@ class HostIntegrationTests(unittest.TestCase):
         again = self.admin("uninstall", None, {})
         self.assertEqual(again["removed"]["wrappers"], [])
         self.assertEqual(again["removed"]["versions"], 0)
-
 
 if __name__ == "__main__":
     unittest.main()
