@@ -15,9 +15,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import shiplord
 from shiplord.admin import run as admin_run
+from shiplord.client import ClientError, require_server_python
 from shiplord.framing import read_frame, write_frame
 from shiplord.installer import DEPLOY_GROUP, bootstrap
 from shiplord.layout import Layout, deployment_user
@@ -163,6 +165,33 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertIn("import /etc/caddy/ship/*.caddy", Path("/etc/caddy/Caddyfile").read_text())
         self.assertTrue(subprocess.run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter",
                                         "caddyfile"], capture_output=True).returncode == 0)
+
+    def test_the_interpreter_probe_runs_on_the_real_host(self):
+        """The probe's exact command string must work in a shell where the helper will run."""
+        commands = []
+
+        def runner(command, payload, timeout):
+            commands.append(command)
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], input=payload, capture_output=True,
+                                    timeout=timeout)
+            return result.stdout, result.stderr, result.returncode
+
+        self.assertIsNone(require_server_python(runner, "root@127.0.0.1"))
+        self.assertEqual(len(commands), 1)
+        self.assertIn("sys.version_info", commands[0][-1])
+
+    def test_an_absent_interpreter_is_refused_before_anything_is_uploaded(self):
+        def runner(command, payload, timeout):
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], input=payload, capture_output=True,
+                                    timeout=timeout)
+            return result.stdout, result.stderr, result.returncode
+
+        with mock.patch("shiplord.client.SERVER_PYTHON", "/usr/bin/python3.9"):
+            with self.assertRaises(ClientError) as caught:
+                require_server_python(runner, "root@127.0.0.1")
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("/usr/bin/python3.9", str(caught.exception))
+        self.assertIn("Python 3.11 or later", str(caught.exception))
 
     def test_bootstrap_discovers_the_installed_sshd_unit(self):
         for unit in ("ssh.service", "sshd.service"):

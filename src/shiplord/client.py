@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Callable
 
 from .framing import read_frame, write_frame
-from .installer import helper_modules
+from .installer import (PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON, helper_modules, python_supported,
+                        python_version)
 from .layout import ADMIN_PATH, DISPATCH_PATH, deployment_user
 from .protocol import MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProtocolError
 from .servers import SshOptions, ssh_command
@@ -27,6 +28,7 @@ from .servers import SshOptions, ssh_command
 Runner = Callable[[list[str], bytes, float], tuple[bytes, bytes, int]]
 POLL_INTERVAL_SECONDS = 2.0
 POLL_FAILURE_LIMIT = 5
+PYTHON_PROBE_TIMEOUT = 60.0
 
 
 class ClientError(Exception):
@@ -243,6 +245,19 @@ class AdminClient:
 _INSTALL_DIRECTORY = re.compile(r"/tmp/shiplord-install\.[A-Za-z0-9]{6,12}\Z")
 
 
+def require_server_python(runner: Runner, server_target: str) -> None:
+    """Refuse a server whose interpreter cannot run the helper, before anything is uploaded or switched."""
+    command = shlex.join([SERVER_PYTHON, "-I", "-S", "-B", "-c", PYTHON_PROBE])
+    stdout, _stderr, status = runner(ssh_command(server_target, command), b"", PYTHON_PROBE_TIMEOUT)
+    answer = stdout.decode("utf-8", "replace")
+    if status == 0 and python_supported(answer):
+        return
+    version = python_version(answer)
+    found = f"it is Python {version[0]}.{version[1]}" if version else "it is missing or did not report a version"
+    raise ClientError(f"{SERVER_PYTHON} on the server must be Python {REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]} or "
+                      f"later because the helper imports tomllib; {found}", 3)
+
+
 def package_helper(source: Path) -> bytes:
     """A tar archive of exactly the modules the server runs, with fixed ownership and modes."""
     buffer = io.BytesIO()
@@ -257,7 +272,8 @@ def package_helper(source: Path) -> bytes:
 
 def bootstrap_server(server_target: str, source: Path, *, prompt: Callable[[str], str] = getpass.getpass,
                      runner: Runner = run_ssh) -> dict:
-    """Upload the helper, run the installer as root, and remove the upload."""
+    """Check the server's interpreter, upload the helper, run the installer as root, and remove the upload."""
+    require_server_python(runner, server_target)
     stdout, stderr, status = runner(ssh_command(server_target, "umask 077 && d=$(mktemp -d /tmp/shiplord-install.XXXXXXXX)"
                                                 " && tar -x -C \"$d\" && echo \"$d\""), package_helper(source), 120)
     directory = stdout.decode("utf-8", "replace").strip()
@@ -265,7 +281,7 @@ def bootstrap_server(server_target: str, source: Path, *, prompt: Callable[[str]
         raise ClientError("could not upload the helper to the server", 3)
     try:
         admin = AdminClient(server_target, prompt, runner)
-        stdout, _, _ = admin._sudo(["/usr/bin/python3", "-I", "-S", "-B", "-c",  # -B: root must not write bytecode into the upload
+        stdout, _, _ = admin._sudo([SERVER_PYTHON, "-I", "-S", "-B", "-c",  # -B: root must not write bytecode into the upload
                                     "import sys;sys.path.insert(0,sys.argv[1]);from shiplord.installer import main;main()",
                                     directory], b"", 300)
         response = _parse(stdout)

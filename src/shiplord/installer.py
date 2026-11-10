@@ -67,6 +67,9 @@ SSHD_INCLUDE_DEPTH = 8
 SSHD_CONFIG = "sshd_config"
 GROUPADD, GETENT, USERMOD = "/usr/sbin/groupadd", "/usr/bin/getent", "/usr/sbin/usermod"
 ACCOUNT_DATABASE_BYTES = 1 << 20  # room for a whole passwd or group dump; a cut-short one is refused, not guessed
+SERVER_PYTHON = "/usr/bin/python3"  # the interpreter the installed launchers run, and the one bootstrap checks
+REQUIRED_PYTHON = (3, 11)  # manifest.py imports tomllib, which exists only from Python 3.11
+PYTHON_PROBE = "import sys;print(sys.version_info[0],sys.version_info[1])"  # two integers, whatever the locale
 
 
 class BootstrapError(Exception):
@@ -76,6 +79,20 @@ class BootstrapError(Exception):
 def helper_modules(source: Path) -> list[str]:
     """Modules installed on the server: everything except client-only modules."""
     return sorted(path.name for path in source.glob("*.py") if path.name not in CLIENT_MODULES)
+
+
+def python_version(answer: str) -> tuple[int, int] | None:
+    """The major and minor version a ``PYTHON_PROBE`` answer reports, or None when it reports none."""
+    fields = answer.split()
+    if len(fields) != 2 or not all(field.isdigit() and len(field) <= 2 for field in fields):
+        return None
+    return int(fields[0]), int(fields[1])
+
+
+def python_supported(answer: str) -> bool:
+    """Whether the interpreter that answered ``PYTHON_PROBE`` is new enough to run the helper."""
+    version = python_version(answer)
+    return version is not None and version >= REQUIRED_PYTHON
 
 
 def _chown_root(path: Path | int) -> None:
@@ -188,7 +205,7 @@ def _install_wrappers(layout: Layout) -> bool:
                 layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
     for target, launcher in wrappers.items():
         _ensure_dir(target.parent, 0o755)
-        text = f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B {layout.lib}/current/{launcher} "$@"\n'
+        text = f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'
         changed |= _write_atomic(target, text.encode(), 0o755)
     return changed
 
