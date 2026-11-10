@@ -606,13 +606,104 @@ class EnsureImportTests(RoutingTestCase):
         self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 2))
         self.assertNoTransactionLeftovers()
 
-    def test_interrupted_change_and_missing_lock_are_refused(self):
+    def write_prior(self, text):
+        path = self.root / ".prior-Caddyfile"
+        path.write_text(text)
+        path.chmod(0o644)
+        return path
+
+    def test_an_unmatched_prior_and_a_missing_lock_are_refused(self):
         with self.assertRaisesRegex(RoutingError, "lock"):
             self.manager.ensure_import()
-        (self.root / ".prior-Caddyfile").write_text("old")
+        self.write_prior("old")
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.ensure_import()
         self.assertTrue(caught.exception.intervention_required)
+
+    def test_a_crash_before_the_publish_drops_the_prior_and_appends_the_import(self):
+        # Crash between the link and the replace: the live Caddyfile is still the prior, hard link intact.
+        os.link(self.root / "Caddyfile", self.root / ".prior-Caddyfile")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.ensure_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN + self.line)
+        self.assertEqual(self.caddy.reload_calls, 1)
+        self.assertNoTransactionLeftovers()
+
+    def test_a_crash_after_the_publish_reports_the_import_as_present(self):
+        # Crash between the replace and the unlink: the live Caddyfile is the candidate, the prior the old file.
+        self.write_main(self.MAIN + self.line)
+        self.write_prior(self.MAIN)
+        with self.lock.acquire():
+            self.assertFalse(self.manager.ensure_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN + self.line)
+        self.assertEqual((self.caddy.validate_calls, self.caddy.reload_calls), ([], 0))
+        self.assertNoTransactionLeftovers()
+
+    def test_a_prior_that_cannot_be_proven_redundant_is_refused_with_the_recovery_step(self):
+        cases = {
+            "a different Caddyfile": lambda: self.write_prior("example.net {\n}\n"),
+            "a prior that imports the managed routes": lambda: self.write_prior(self.MAIN + self.line),
+            "a symbolic link": lambda: (self.root / ".prior-Caddyfile").symlink_to(self.root / "Caddyfile"),
+            "a directory": lambda: (self.root / ".prior-Caddyfile").mkdir(),
+            "a prior another account can write": lambda: self.write_prior(self.MAIN).chmod(0o666),
+        }
+        for name, leave in cases.items():
+            with self.subTest(name):
+                leave()
+                before = (self.root / "Caddyfile").read_bytes()
+                with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+                    self.manager.ensure_import()
+                error = caught.exception
+                self.assertEqual(error.kind, "interrupted")
+                self.assertTrue(error.intervention_required)
+                self.assertIn(".prior-Caddyfile", str(error))
+                self.assertIn("compare .prior-Caddyfile with the Caddyfile", str(error))
+                self.assertIn("remove .prior-Caddyfile", str(error))
+                self.assertEqual((self.root / "Caddyfile").read_bytes(), before)
+                self.assertTrue(os.path.lexists(self.root / ".prior-Caddyfile"))
+                self.assertEqual((self.caddy.validate_calls, self.caddy.reload_calls), ([], 0))
+                prior = self.root / ".prior-Caddyfile"
+                if prior.is_dir() and not prior.is_symlink():
+                    prior.rmdir()
+                else:
+                    prior.unlink()
+
+    def test_a_crash_after_the_publish_reconstructs_a_missing_final_newline(self):
+        self.write_main("example.org {\n}\n" + self.line)
+        self.write_prior("example.org {\n}")
+        with self.lock.acquire():
+            self.assertFalse(self.manager.ensure_import().changed)
+        self.assertNoTransactionLeftovers()
+
+    def test_an_identical_pair_that_already_imports_is_refused(self):
+        # The transaction only links a Caddyfile that lacks the import, so this pair was not produced by a crash.
+        self.write_main(self.MAIN + self.line)
+        self.write_prior(self.MAIN + self.line)
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+
+    def test_a_missing_caddyfile_beside_a_prior_is_refused(self):
+        self.write_prior(self.MAIN)
+        (self.root / "Caddyfile").unlink()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "interrupted")
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+        self.assertFalse((self.root / "Caddyfile").exists())
+        self.assertTrue((self.root / ".prior-Caddyfile").exists())
+
+    def test_an_untrusted_caddyfile_beside_a_prior_is_refused(self):
+        self.write_prior(self.MAIN)
+        (self.root / "Caddyfile").chmod(0o666)
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "interrupted")
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+        self.assertTrue((self.root / ".prior-Caddyfile").exists())
 
 
 class RemoveImportTests(RoutingTestCase):

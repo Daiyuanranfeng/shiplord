@@ -223,6 +223,31 @@ class RealCaddyTests(unittest.TestCase):
         self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"hardened")
         self.assertEqual(stat.S_IMODE(self.caddyfile.stat().st_mode), 0o640)
 
+    def test_a_crash_between_the_link_and_the_publish_is_reconciled_and_serves(self):
+        import_line = f"import {self.root}/ship/*.caddy\n"
+        text = self.caddyfile.read_text()
+        self.caddyfile.write_text(text[:-len(import_line)])
+        os.link(self.caddyfile, self.root / ".prior-Caddyfile")
+        port = self.start_upstream(b"recovered")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.ensure_import().changed)
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"recovered")
+        self.assertEqual([p.name for p in self.root.rglob(".*")], [])
+
+    def test_a_crash_after_the_publish_is_reconciled_and_serves(self):
+        import_line = f"import {self.root}/ship/*.caddy\n"
+        text = self.caddyfile.read_text()
+        prior = self.root / ".prior-Caddyfile"
+        prior.write_text(text[:-len(import_line)])
+        prior.chmod(0o644)
+        port = self.start_upstream(b"still served")
+        with self.lock.acquire():
+            self.assertFalse(self.manager.ensure_import().changed)
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"still served")
+        self.assertEqual([p.name for p in self.root.rglob(".*")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

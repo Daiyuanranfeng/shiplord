@@ -38,6 +38,7 @@ COMMAND_TIMEOUT_SECONDS = 30
 ROUTE_FILE_MODE = 0o644
 _TEMP_PREFIX = ".tmp-"
 _PRIOR_PREFIX = ".prior-"
+_PRIOR_MAIN = ".prior-Caddyfile"
 _VALIDATE_PREFIX = ".shiplord-validate-"
 
 
@@ -242,9 +243,16 @@ def _read_file(directory: int, name: str, *, trusted: bool) -> _CaddyFile | None
         return None
     except OSError:
         raise RoutingError("could not open a Caddy file safely", "uninspectable") from None
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise RoutingError("a Caddy file cannot be read", "uninspectable") from None
+    if not stat.S_ISREG(info.st_mode):  # a directory opens fine; fdopen would raise and leak the descriptor
+        os.close(descriptor)
+        raise RoutingError("a Caddy file is not safe to use", "uninspectable")
     with os.fdopen(descriptor, "rb") as file:
-        info = os.fstat(file.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES
+        if (info.st_size > MAX_CONFIG_BYTES
                 or (trusted and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022))):
             raise RoutingError("a Caddy file is not safe to use", "uninspectable")
         # Taken from the descriptor that was read, so a replacement cannot swap the identity between the two.
@@ -271,6 +279,17 @@ def _discard(directory: int, name: str) -> None:
         os.unlink(name, dir_fd=directory)
     except OSError:
         pass
+
+
+def _unreconciled_prior() -> RoutingError:
+    """The one refusal a leftover prior produces when the live Caddyfile cannot be proven to match it.
+
+    It names the file and the step that unblocks the host, and nothing else from the host's filesystem.
+    """
+    return RoutingError(
+        "an interrupted Caddyfile change left .prior-Caddyfile behind and the live Caddyfile is neither the previous "
+        "file nor that file with the managed import; compare .prior-Caddyfile with the Caddyfile, keep the one to "
+        "serve, remove .prior-Caddyfile, and retry", "interrupted", intervention_required=True)
 
 
 class RouteManager:
@@ -319,11 +338,10 @@ class RouteManager:
             raise RoutingError("host lock is required", "precondition")
         root, ship = self._open()
         try:
-            prior, token = ".prior-Caddyfile", secrets.token_hex(8)
-            if os.path.lexists(self.root / prior):
-                raise RoutingError("an interrupted Caddyfile change requires manual inspection", "interrupted",
-                                   intervention_required=True)
-            main = _read_file(root, "Caddyfile", trusted=True)
+            token = secrets.token_hex(8)
+            main, completed = self._settle_prior(root)
+            if completed:
+                return RouteResult(changed=False)
             if main is None:
                 raise RoutingError("the main Caddyfile is missing", "precondition")
             text = main.data.decode("utf-8", "replace")
@@ -332,7 +350,7 @@ class RouteManager:
                 raise RoutingError("the main Caddyfile imports the managed routes more than once", "precondition")
             if found:
                 return RouteResult(changed=False)
-            candidate = (text + ("" if not text or text.endswith("\n") else "\n") + f"import {self.own_glob}\n").encode()
+            candidate = self._with_import(main.data)
             name = _VALIDATE_PREFIX + token
             self._create(root, name, candidate, preserve=main)
             try:
@@ -344,15 +362,15 @@ class RouteManager:
                 self._unlink(root, name)
             temp = _TEMP_PREFIX + "Caddyfile-" + token
             self._create(root, temp, candidate, preserve=main)
-            os.link("Caddyfile", prior, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+            os.link("Caddyfile", _PRIOR_MAIN, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
             self._publish(root, temp, "Caddyfile")
             try:
                 self.commands.reload()
             except RoutingError as error:
-                self._restore(root, "Caddyfile", prior, True, error)
+                self._restore(root, "Caddyfile", _PRIOR_MAIN, True, error)
                 raise RoutingError("Caddy rejected the managed import; the Caddyfile was restored", "reload",
                                    detail=error.detail) from None
-            self._unlink(root, prior)
+            self._unlink(root, _PRIOR_MAIN)
             return RouteResult(changed=True)
         finally:
             os.close(root)
@@ -409,6 +427,50 @@ class RouteManager:
             os.close(root)
 
     # implementation
+    def _with_import(self, data: bytes) -> bytes:
+        """The main Caddyfile as ``ensure_import`` publishes it: the same text with the managed import appended."""
+        text = data.decode("utf-8", "replace")
+        return (text + ("" if not text or text.endswith("\n") else "\n") + f"import {self.own_glob}\n").encode()
+
+    def _settle_prior(self, root: int) -> tuple[_CaddyFile | None, bool]:
+        """Read the live Caddyfile and drop a leftover ``.prior-Caddyfile`` when it proves where the change stopped.
+
+        The transaction links the live Caddyfile to the prior and then replaces the live file with the candidate
+        built from it, so a crash leaves the live file either byte-identical to the prior (the replace never ran) or
+        exactly that candidate (the replace ran). Both are settled here: the first drops the prior and lets the
+        append run, the second reports the import as already present. A pair that cannot be compared is refused
+        rather than guessed at, and the live Caddyfile is never rewritten from the prior.
+
+        Returns the live Caddyfile (``None`` when it is missing) and whether it already carries the managed import.
+        """
+        try:
+            prior = _read_file(root, _PRIOR_MAIN, trusted=True)
+        except RoutingError:
+            raise _unreconciled_prior() from None
+        try:
+            main = _read_file(root, "Caddyfile", trusted=True)
+        except RoutingError:
+            if prior is not None:
+                raise _unreconciled_prior() from None
+            raise
+        if prior is None:
+            return main, False
+        try:
+            redundant = not _Inspection("", self.own_glob, False).own_import_lines(
+                prior.data.decode("utf-8", "replace"))
+        except RoutingError:
+            redundant = False
+        if not redundant or main is None or main.data not in (prior.data, self._with_import(prior.data)):
+            raise _unreconciled_prior()
+        try:
+            os.unlink(_PRIOR_MAIN, dir_fd=root)
+        except FileNotFoundError:
+            pass  # another writer removed it, which is the state this path is trying to reach
+        except OSError:
+            raise RoutingError("could not remove .prior-Caddyfile; remove it and retry", "interrupted",
+                               intervention_required=True) from None
+        return main, main.data != prior.data
+
     def _open(self) -> tuple[int, int]:
         try:
             root = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
