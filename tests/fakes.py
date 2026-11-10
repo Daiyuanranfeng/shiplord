@@ -37,9 +37,15 @@ class FakeRuntime:
     def __init__(self):
         self.running: set[str] = set()
         self.calls: list[tuple] = []
+        self.pull_error = None
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
         self.discarded: list[str] = []
+
+    def pull(self, registration, release):
+        self.calls.append(("pull", release_id(release)))
+        if self.pull_error:
+            raise self.pull_error
 
     def prepare(self, registration, release):
         self.calls.append(("prepare", release_id(release)))
