@@ -231,29 +231,45 @@ def manage_key(layout: Layout, application_id: str, operation: str, *, label: st
 def manage_environment(layout: Layout, application_id: str, operation: str, *, text: str | None = None) -> dict:
     """Set, clear, or list the key names of an application's runtime environment file.
 
-    Values are never returned. They take effect the next time a release is started.
+    Values are never returned. They take effect the next time a release is started. A file that cannot
+    be read is still replaced or removed, so a corrupt file never needs a manual root shell to repair.
     """
     app = validate_app_name(application_id)
     directory = layout.environments / app
     if not directory.is_dir() or directory.is_symlink():
         raise ProvisionError("the application is not provisioned")
     path = directory / "app.env"
-    try:
-        current = load_environment_file(path) or {}
-        if operation == "keys":
-            return {"keys": sorted(current)}
-        if operation == "clear":
-            existed = path.exists()
+    if operation == "clear":
+        try:
+            load_environment_file(path)  # only to report that the file it removes could not be read
+            notice: dict = {}
+        except EnvironmentError_:
+            notice = {"warnings": ["the previous environment file was unreadable; it was removed"]}
+        existed = path.exists() or path.is_symlink()
+        try:
             path.unlink(missing_ok=True)
-            return {"keys": [], "changed": existed}
-        if operation != "set":
-            raise ProvisionError("unknown environment operation")
-        if not isinstance(text, str):
-            raise ProvisionError("environment text is required")
+        except OSError:
+            raise ProvisionError("could not remove the environment file") from None
+        return {"keys": [], "changed": existed, **notice}
+    if operation == "keys":
+        try:
+            return {"keys": sorted(load_environment_file(path) or {})}
+        except EnvironmentError_ as error:
+            raise ProvisionError(f"{error}; use `shiplord env clear` to replace it") from None
+    if operation != "set":
+        raise ProvisionError("unknown environment operation")
+    if not isinstance(text, str):
+        raise ProvisionError("environment text is required")
+    try:
         values = parse_environment(text)
     except EnvironmentError_ as error:
         raise ProvisionError(str(error)) from None
-    if values == current and path.exists():
+    discarded = False
+    try:
+        current = load_environment_file(path)
+    except EnvironmentError_:
+        current, discarded = None, True
+    if not discarded and values == current and path.exists():
         return {"keys": sorted(values), "changed": False}
     temporary = path.with_name(f".app.env.tmp-{secrets.token_hex(6)}")
     try:
@@ -270,7 +286,9 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
         raise ProvisionError("could not write the environment file") from None
     finally:
         temporary.unlink(missing_ok=True)
-    return {"keys": sorted(values), "changed": True}
+    notice = ({"warnings": ["the previous environment file was unreadable; its contents were discarded"]}
+              if discarded else {})
+    return {"keys": sorted(values), "changed": True, **notice}
 
 
 REGISTRY_HOSTS = ("ghcr.io",)

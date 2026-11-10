@@ -326,6 +326,26 @@ class EnvironmentTests(ProvisionTestCase):
     def path(self):
         return self.layout.environments / "orders" / "app.env"
 
+    def make_unreadable(self, kind: str):
+        """Write the secret to app.env in a way load_environment_file refuses; return a symlink target."""
+        line = f"DATABASE_URL={self.SECRET}\n"
+        self.path().unlink(missing_ok=True)
+        if kind == "mode":
+            self.path().write_text(line)
+            self.path().chmod(0o644)
+        elif kind == "encoding":
+            self.path().write_bytes(line.encode() + b"\xff\n")
+            self.path().chmod(0o600)
+        elif kind == "symlink":
+            target = self.path().parent / "elsewhere.env"
+            target.write_text(line)
+            target.chmod(0o600)
+            os.symlink(target, self.path())
+            return target
+        else:
+            raise AssertionError(f"unknown kind {kind}")
+        return None
+
     def test_set_writes_a_private_sorted_file_and_returns_only_key_names(self):
         self.provision()
         result = manage_environment(self.layout, "orders", "set", text=f"# note\nZ_KEY=1\nDATABASE_URL={self.SECRET}\n")
@@ -365,6 +385,85 @@ class EnvironmentTests(ProvisionTestCase):
     def test_an_unprovisioned_application_is_refused(self):
         with self.assertRaisesRegex(ProvisionError, "not provisioned"):
             manage_environment(self.layout, "orders", "keys")
+
+    def test_clear_removes_an_unreadable_file_and_reports_it(self):
+        self.provision()
+        for kind in ("mode", "encoding", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_unreadable(kind)
+                result = manage_environment(self.layout, "orders", "clear")
+                self.assertEqual((result["keys"], result["changed"]), ([], True))
+                self.assertIn("unreadable", result["warnings"][0])
+                self.assertNotIn("s3cr3t", str(result))
+                self.assertFalse(self.path().exists() or self.path().is_symlink())
+                self.assertFalse(manage_environment(self.layout, "orders", "clear")["changed"])
+
+    def test_set_replaces_an_unreadable_file_and_warns_that_the_old_contents_were_discarded(self):
+        self.provision()
+        for kind in ("mode", "encoding", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_unreadable(kind)
+                result = manage_environment(self.layout, "orders", "set", text="A=1\n")
+                self.assertEqual((result["keys"], result["changed"]), (["A"], True))
+                self.assertIn("discarded", result["warnings"][0])
+                self.assertNotIn("s3cr3t", str(result))
+                self.assertFalse(self.path().is_symlink())
+                self.assertEqual(self.path().read_text(), "A=1\n")
+                self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+                self.assertEqual(manage_environment(self.layout, "orders", "keys"), {"keys": ["A"]})
+                manage_environment(self.layout, "orders", "clear")
+
+    def test_a_repair_never_writes_through_a_symlinked_environment_file(self):
+        self.provision()
+        target = self.make_unreadable("symlink")
+        manage_environment(self.layout, "orders", "set", text="A=1\n")
+        self.assertFalse(self.path().is_symlink())
+        self.assertEqual(self.path().read_text(), "A=1\n")
+        self.assertEqual(target.read_text(), f"DATABASE_URL={self.SECRET}\n")
+
+    def test_keys_on_an_unreadable_file_is_a_clear_error_that_names_the_recovery(self):
+        self.provision()
+        for kind in ("mode", "encoding", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_unreadable(kind)
+                with self.assertRaises(ProvisionError) as caught:
+                    manage_environment(self.layout, "orders", "keys")
+                message = str(caught.exception)
+                self.assertIn("environment file", message)
+                self.assertIn("shiplord env clear", message)
+                self.assertNotIn("s3cr3t", message)
+                self.assertNotIn(str(self.layout.environments), message)
+                self.assertTrue(self.path().exists() or self.path().is_symlink())
+
+    def test_a_directory_where_the_environment_file_belongs_is_a_clear_error(self):
+        self.provision()
+        self.path().mkdir()
+        with self.assertRaisesRegex(ProvisionError, "could not remove"):
+            manage_environment(self.layout, "orders", "clear")
+
+    def test_through_the_admin_entry_point_an_unreadable_file_is_an_error_not_a_traceback(self):
+        self.provision()
+        self.make_unreadable("mode")
+        response, code = run(encode(envelope("environment", arguments={"operation": "keys"})), self.layout,
+                             self.system, {})
+        self.assertEqual((code, response["status"]), (1, "error"))
+        self.assertIn("shiplord env clear", response["message"])
+        self.assertNotIn("s3cr3t", str(response))
+
+    def test_through_the_admin_entry_point_a_repair_reports_what_it_discarded(self):
+        self.provision()
+        self.make_unreadable("mode")
+        response, code = run(encode(envelope("environment", arguments={"operation": "set", "text": "A=1\n"})),
+                             self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["keys"]), (0, ["A"]))
+        self.assertIn("discarded", response["result"]["warnings"][0])
+        self.assertNotIn("s3cr3t", str(response))
+        self.make_unreadable("mode")
+        response, code = run(encode(envelope("environment", arguments={"operation": "clear"})), self.layout,
+                             self.system, {})
+        self.assertEqual((code, response["result"]["changed"]), (0, True))
+        self.assertIn("unreadable", response["result"]["warnings"][0])
+        self.assertNotIn("s3cr3t", str(response))
 
     def test_through_the_admin_entry_point_the_secret_travels_only_in_the_frame(self):
         self.provision()
