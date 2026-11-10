@@ -113,9 +113,8 @@ class DockerRuntime:
             raise RuntimeFailure(f"docker could not complete ({error.kind})", phase, error.output) from None
 
     # operations -----------------------------------------------------------
-    def prepare(self, registration: dict, release: dict) -> dict:
-        """Pull the image by digest and verify its platform and revision before anything is stopped."""
-        image = release["artifact"]["image"]
+    def _require_free_disk(self) -> None:
+        """Refuse to work when the disk is nearly full: a full disk fails a deploy halfway."""
         probe = DOCKER_ROOT if self.layout.prefix == Path("/") and DOCKER_ROOT.exists() else self.layout.var
         try:
             free = shutil.disk_usage(probe).free
@@ -124,16 +123,45 @@ class DockerRuntime:
         if free < MIN_FREE_BYTES:
             raise RuntimeFailure(f"not enough free disk space to pull an image ({free // 2**20} MiB free, "
                                  f"{MIN_FREE_BYTES // 2**20} MiB needed); nothing was changed", "prepare")
+
+    def _inspect_image(self, image: str):
+        """Read the platform and revision label of a local image; a non-zero code means it is not on this host."""
+        return self._docker(["image", "inspect", "--format",
+                             '{{.Os}}/{{.Architecture}}|{{index .Config.Labels "' + REVISION_LABEL + '"}}', image],
+                            "prepare")
+
+    def pull(self, registration: dict, release: dict) -> None:
+        """Fetch the pinned image with this application's own read-only login.
+
+        This is the slow, network-bound step, so the worker runs it before taking the host-wide lock: a slow
+        registry may delay this job, never every other application and every admin command. ``prepare`` verifies
+        the result under the lock and only fetches again when the image is not there at all.
+        """
+        self._require_free_disk()
+        image = release["artifact"]["image"]
         login = self.layout.registry_logins / registration["application_id"]
         config = ["--config", str(login)] if (login / "config.json").is_file() else []  # this app's read-only login
-        pull = self._docker([*config, "pull", "--quiet", image], "prepare", timeout=PULL_TIMEOUT_SECONDS)
-        if pull.code != 0:
-            raise RuntimeFailure("the image could not be pulled", "prepare", pull.output)
-        inspect = self._docker(["image", "inspect", "--format",
-                                '{{.Os}}/{{.Architecture}}|{{index .Config.Labels "' + REVISION_LABEL + '"}}', image],
-                               "prepare")
+        pulled = self._docker([*config, "pull", "--quiet", image], "prepare", timeout=PULL_TIMEOUT_SECONDS)
+        if pulled.code != 0:
+            raise RuntimeFailure("the image could not be pulled", "prepare", pulled.output)
+
+    def prepare(self, registration: dict, release: dict) -> dict:
+        """Verify the image on this host, its platform, and its revision before anything is stopped.
+
+        The worker has already pulled the pinned digest, so the usual path only inspects a local image and never
+        waits on a registry. A caller that did not pre-pull - a direct ``Deployer`` use, or a pre-pull that failed -
+        still works: the image is fetched here, exactly as before, rather than failing for a reason that is not the
+        caller's fault.
+        """
+        image = release["artifact"]["image"]
+        self._require_free_disk()  # a nearly full disk must fail the deploy before the running release is touched
+        inspect = self._inspect_image(image)
         if inspect.code != 0:
-            raise RuntimeFailure("the pulled image could not be inspected", "prepare", inspect.output)
+            self.pull(registration, release)
+            inspect = self._inspect_image(image)
+        if inspect.code != 0:
+            raise RuntimeFailure("the image is not available on this host; nothing was changed", "prepare",
+                                 inspect.output)
         image_platform, _, revision = inspect.output.strip().partition("|")
         if image_platform != self.platform:
             raise RuntimeFailure(f"the image is {image_platform}, but the server needs {self.platform}", "prepare")

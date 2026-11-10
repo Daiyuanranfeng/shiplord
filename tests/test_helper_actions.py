@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import FakeCaddy, FakeProbes, FakeRuntime, configuration, record, request  # noqa: E402
+from shiplord.admin import run as admin_run  # noqa: E402
 from shiplord.host import HostDeadline  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.jobs import JobError  # noqa: E402
@@ -19,7 +21,7 @@ from shiplord.layout import Layout  # noqa: E402
 from shiplord.privileged_host import dispatch, job_view, serve  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION, ProtocolError  # noqa: E402
 from shiplord.registry import Registry  # noqa: E402
-from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
+from shiplord.release_state import HostLock, ReleaseState, StateError  # noqa: E402
 from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
 from shiplord.services import AppSession, HostServices  # noqa: E402
 from shiplord.worker import run_job  # noqa: E402
@@ -254,6 +256,109 @@ class WorkerTests(HelperTestCase):
     def finished(self, request_id="req-1"):
         return self.call("status", job_id=request_id)[0]["result"]["job"]
 
+    def lock_state(self):
+        """Is the host-wide lock held right now? Probed with a real flock, as another process would see it."""
+        descriptor = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with HostLock(descriptor).acquire(timeout=0):
+                return "free"
+        except StateError:
+            return "held"
+        finally:
+            os.close(descriptor)
+
+    def test_the_image_is_pulled_before_the_host_lock_is_taken(self):
+        seen = []
+        self.runtime.pull = lambda registration, release: seen.append(("pull", self.lock_state()))
+        original_prepare = self.runtime.prepare
+        self.runtime.prepare = lambda registration, release: (seen.append(("prepare", self.lock_state())),
+                                                              original_prepare(registration, release))[1]
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        self.assertEqual(seen[0], ("pull", "free"))  # a slow registry must never hold the host-wide lock
+        self.assertEqual(seen[1], ("prepare", "held"))
+
+    def test_a_slow_pull_does_not_block_a_read_only_admin_action(self):
+        """A registry that takes minutes must not stop an operator reading the host's state."""
+        started, release = threading.Event(), threading.Event()
+
+        def slow_pull(registration, release_value):
+            started.set()
+            release.wait(10)
+
+        self.runtime.pull = slow_pull
+        self.submit_deploy()
+        worker = threading.Thread(target=lambda: run_job(self.services, "orders", "req-1"))
+        answered = []
+        message = {"version": PROTOCOL_VERSION, "request_id": "read-1", "action": "apps", "application_id": None,
+                   "commit": None, "arguments": {}}
+        reader = None
+        try:
+            worker.start()
+            self.assertTrue(started.wait(5), "the pull never started")
+            reader = threading.Thread(target=lambda: answered.append(admin_run(message, self.layout, None, {})))
+            reader.start()
+            reader.join(2)
+            # Without the fix this blocks on the host lock until the pull finishes, which is the whole bug.
+            self.assertEqual(len(answered), 1, "a read-only admin action blocked behind a slow pull")
+            self.assertEqual(answered[0][0]["status"], "ok", answered[0])
+            self.assertEqual(answered[0][1], 0)
+        finally:
+            release.set()
+            worker.join(10)
+            if reader is not None:
+                reader.join(10)
+
+    def test_a_rollback_pulls_the_release_it_restores_before_the_lock(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.submit_deploy("req-2", commit="c", image="d", sequence=1001)
+        run_job(self.services, "orders", "req-2")
+        seen = []
+        self.runtime.pull = lambda registration, release: seen.append((release_id(release), self.lock_state()))
+        self.call("rollback", "rb-1")
+        self.assertEqual(run_job(self.services, "orders", "rb-1"), 0)
+        self.assertEqual(seen, [(release_id(record()), "free")])  # the previous committed release, unlocked
+
+    def test_a_request_that_became_stale_pulls_nothing(self):
+        self.submit_deploy("req-1", sequence=1001)  # queued while it was still the newest release
+        with AppSession(self.services, "orders") as session:
+            with session.lock.acquire():
+                session.deployer().deploy(request(request_id="req-2", commit="c", image="d", sequence=2000))
+        self.runtime.calls.clear()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 1)
+        self.assertEqual(self.finished("req-1")["outcome"]["detail"]["error"], "stale_release")
+        self.assertEqual(self.runtime.names(), [])  # a refused request never reaches a registry
+
+    def test_a_failed_pull_is_reported_by_the_locked_transaction_as_a_prepare_failure(self):
+        self.runtime.pull_error = RuntimeFailure("the image could not be pulled", "prepare")
+        self.runtime.prepare_error = RuntimeFailure("the image is not available on this host; nothing was changed",
+                                                    "prepare")
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 1)
+        self.assertEqual(self.finished()["outcome"]["detail"]["error"], "prepare_failed")
+        self.assertEqual(self.runtime.names(), ["pull", "prepare"])  # nothing was started
+
+    def test_every_state_transition_happens_under_the_host_lock(self):
+        transitions = []
+
+        def spy(name, original):
+            def call(*args, **kwargs):
+                transitions.append((name, self.lock_state()))
+                return original(*args, **kwargs)
+            return call
+
+        for name in ("begin", "advance", "record_commit", "clear_after_reconciliation"):
+            patcher = patch.object(ReleaseState, name, spy(name, getattr(ReleaseState, name)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        self.assertEqual([name for name, _ in transitions],
+                         ["begin", "advance", "advance", "advance", "advance", "record_commit",
+                          "clear_after_reconciliation"])
+        self.assertTrue(all(state == "held" for _, state in transitions), transitions)
+
     def test_the_worker_runs_the_deploy_and_records_the_outcome_for_a_reconnecting_client(self):
         self.submit_deploy()
         self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
@@ -264,7 +369,7 @@ class WorkerTests(HelperTestCase):
         self.assertEqual(self.runtime.running, {release_id(record())})
         # a duplicate worker, or a status poll, never reruns or alters a finished job
         self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
-        self.assertEqual(self.runtime.names(), ["prepare", "start"])
+        self.assertEqual(self.runtime.names(), ["pull", "prepare", "start"])
 
     def test_a_deploy_resent_after_success_is_answered_without_a_new_job(self):
         self.submit_deploy()
@@ -306,7 +411,8 @@ class WorkerTests(HelperTestCase):
             self.assertEqual(run_job(self.services, "orders", "req-1"), 1)
         job = self.finished()
         self.assertEqual(job["outcome"]["detail"]["error"], "host_busy")
-        self.assertEqual(self.runtime.calls, [])
+        # the image is already on the host when the lock is found busy: the pull is not part of the transaction
+        self.assertEqual(self.runtime.names(), ["pull"])
 
     def test_an_unexpected_error_before_any_change_is_a_plain_failure(self):
         self.runtime.prepare = lambda registration, release: (_ for _ in ()).throw(KeyError("surprise"))

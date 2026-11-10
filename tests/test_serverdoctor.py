@@ -209,6 +209,59 @@ class ServerDoctorTests(DoctorTestCase):
             self.assertNotIn(forbidden, text)
 
 
+class AdminLockTests(DoctorTestCase):
+    """The host-wide lock is taken for an action that changes host state, and never for a read-only one."""
+
+    def short_wait(self):
+        """A lock that gives up quickly, so a busy-lock assertion does not wait for the production timeout."""
+        class ShortWait(HostLock):
+            def acquire(lock, timeout=0.05):
+                return super(ShortWait, lock).acquire(timeout)
+        return ShortWait
+
+    def call(self, action):
+        hostwide = action in ("doctor", "apps")
+        return run(envelope(action, application_id=None if hostwide else "orders", arguments={}),
+                   self.layout, self.system, {})
+
+    def hold_lock(self):
+        descriptor = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        return HostLock(descriptor).acquire()
+
+    def test_read_only_actions_answer_while_another_operation_holds_the_lock(self):
+        self.provision()
+        with self.hold_lock():
+            for action in ("doctor", "apps"):
+                with self.subTest(action):
+                    response, code = self.call(action)
+                    self.assertEqual((code, response["status"]), (0, "ok"), response)
+
+    def test_mutating_actions_take_the_lock_and_report_it_busy(self):
+        self.provision()
+        with patch("shiplord.admin.HostLock", self.short_wait()), self.hold_lock():
+            for action in ("provision", "keys", "environment", "registry", "deprovision"):
+                with self.subTest(action):
+                    response, code = self.call(action)
+                    self.assertEqual((code, response["message"]), (1, "host lock is busy"))
+
+    def test_the_read_only_set_is_enumerated_and_covers_every_admin_action(self):
+        from shiplord.admin import READ_ONLY_ACTIONS
+        from shiplord.protocol import ADMIN_ACTIONS
+        self.assertEqual(READ_ONLY_ACTIONS, frozenset({"doctor", "apps"}))
+        self.assertEqual(READ_ONLY_ACTIONS | frozenset({"provision", "keys", "environment", "registry", "deprovision"}),
+                         ADMIN_ACTIONS)
+
+    def test_a_registered_deployment_account_is_denied_a_read_only_action_too(self):
+        self.provision()
+        uid = self.system.users["ship-orders"]["uid"]
+        for action in ("doctor", "apps"):
+            with self.subTest(action):
+                response, code = run(envelope(action, application_id=None, arguments={}), self.layout, self.system,
+                                     {"SUDO_UID": str(uid)})
+                self.assertEqual((code, response["error"]), (3, "denied"))
+
+
 class DoctorProtocolTests(DoctorTestCase):
     def test_only_the_doctor_may_omit_the_application(self):
         self.assertEqual(parse_request(envelope("doctor", application_id=None, arguments={}))["action"], "doctor")

@@ -178,21 +178,78 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(base, release_id(release(port=9000)))  # configuration is not part of the identity
 
 
+class PullTests(RuntimeTestCase):
+    def test_pulls_by_digest_and_changes_nothing_else(self):
+        self.runtime.pull(REGISTRATION, release())
+        self.assertEqual(self.docker.calls, [["/usr/bin/docker", "pull", "--quiet",
+                                              "ghcr.io/example/orders@sha256:" + "b" * 64]])
+        self.assertEqual(self.docker.sub("rm"), [])  # nothing is stopped or removed while fetching
+
+    def test_a_private_image_is_pulled_with_that_applications_own_login_and_nothing_else_uses_it(self):
+        login = self.layout.registry_logins / "orders"
+        login.mkdir(parents=True)
+        (login / "config.json").write_text('{"auths": {}}')
+        self.runtime.pull(REGISTRATION, release())
+        self.assertEqual(self.docker.calls[0][:4], ["/usr/bin/docker", "--config", str(login), "pull"])
+        other = dict(REGISTRATION, application_id="billing")  # another application has no login and uses none
+        self.docker.calls.clear()
+        self.runtime.pull(other, release())
+        self.assertNotIn("--config", self.docker.calls[0])
+        self.docker.calls.clear()
+        self.docker.results["ps"] = CommandResult(0, "")
+        self.runtime.start(REGISTRATION, release())
+        self.assertTrue(all("--config" not in call for call in self.docker.calls))
+
+    def test_a_refused_pull_is_a_prepare_failure_with_its_output(self):
+        self.docker.results["pull"] = CommandResult(1, "denied: requested access")
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.pull(REGISTRATION, release())
+        self.assertEqual((caught.exception.phase, caught.exception.detail), ("prepare", "denied: requested access"))
+
+    def test_a_nearly_full_disk_stops_the_pull_before_anything_is_pulled(self):
+        with patch("shiplord.runtime.shutil.disk_usage", return_value=type("U", (), {"free": 10 * 2**20})()):
+            with self.assertRaisesRegex(RuntimeFailure, "not enough free disk space.*10 MiB free") as caught:
+                self.runtime.pull(REGISTRATION, release())
+        self.assertEqual(caught.exception.phase, "prepare")
+        self.assertEqual(self.docker.calls, [])
+        with patch("shiplord.runtime.shutil.disk_usage", side_effect=OSError):  # unmeasurable: docker decides
+            self.runtime.pull(REGISTRATION, release())
+        self.assertTrue(self.docker.calls)
+
+    def test_a_timed_out_pull_is_reported_with_its_output(self):
+        self.docker.raise_for["pull"] = CommandError("timed out", "timeout", "layer 3/9")
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.pull(REGISTRATION, release())
+        self.assertEqual((caught.exception.phase, caught.exception.detail), ("prepare", "layer 3/9"))
+
+
 class PrepareTests(RuntimeTestCase):
-    def test_pulls_by_digest_then_verifies_platform_and_revision(self):
+    def test_verifies_the_pulled_image_by_digest_without_pulling_again(self):
         self.docker.results["image inspect"] = CommandResult(0, f"linux/amd64|{'a' * 40}\n")
         result = self.runtime.prepare(REGISTRATION, release())
         self.assertEqual(result, {"platform": "linux/amd64", "revision_label": "a" * 40})
-        self.assertEqual(self.docker.calls[0], ["/usr/bin/docker", "pull", "--quiet", "ghcr.io/example/orders@sha256:" + "b" * 64])
+        self.assertEqual(self.docker.sub("pull"), [])  # a locked transaction never waits on a registry
+        self.assertEqual(self.docker.calls[0][:3], ["/usr/bin/docker", "image", "inspect"])
+        self.assertIn("ghcr.io/example/orders@sha256:" + "b" * 64, self.docker.calls[0])
         self.assertEqual(self.docker.sub("rm"), [])  # nothing is stopped or removed while preparing
 
     def test_missing_revision_label_is_allowed_but_reported(self):
         self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|<no value>\n")
         self.assertIsNone(self.runtime.prepare(REGISTRATION, release())["revision_label"])
 
+    def test_an_image_that_is_not_on_the_host_is_a_prepare_failure_that_changes_nothing(self):
+        # A caller that did not pre-pull (or whose pre-pull failed) gets one fetch, never a bare refusal.
+        self.docker.results["image inspect"] = CommandResult(1, "Error: No such image: ghcr.io/example/orders")
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.prepare(REGISTRATION, release())
+        self.assertEqual(caught.exception.phase, "prepare")
+        self.assertIn("not available on this host", str(caught.exception))
+        self.assertIn("nothing was changed", str(caught.exception))
+        self.assertEqual(len(self.docker.sub("pull")), 1)  # one fetch attempt, then the same failure
+        self.assertEqual((self.docker.sub("rm"), self.docker.sub("run")), ([], []))
+
     def test_each_verification_failure_is_a_prepare_failure(self):
         cases = {
-            "pull denied": ("pull", CommandResult(1, "denied: requested access")),
             "inspect fails": ("image inspect", CommandResult(1, "no such image")),
             "wrong platform": ("image inspect", CommandResult(0, "linux/arm64|\n")),
             "wrong revision": ("image inspect", CommandResult(0, f"linux/amd64|{'f' * 40}\n")),
@@ -204,26 +261,7 @@ class PrepareTests(RuntimeTestCase):
                     self.runtime.prepare(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, "prepare")
 
-    def test_a_private_image_is_pulled_with_that_applications_own_login_and_nothing_else_uses_it(self):
-        login = self.layout.registry_logins / "orders"
-        login.mkdir(parents=True)
-        (login / "config.json").write_text('{"auths": {}}')
-        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
-        self.runtime.prepare(REGISTRATION, release())
-        self.assertEqual(self.docker.calls[0][:4], ["/usr/bin/docker", "--config", str(login), "pull"])
-        self.docker.calls.clear()
-        self.docker.results["ps"] = CommandResult(0, "")
-        self.runtime.start(REGISTRATION, release())
-        self.assertTrue(all("--config" not in call for call in self.docker.calls))
-        other = dict(REGISTRATION, application_id="billing")  # another application has no login and uses none
-        self.docker.calls.clear()
-        self.docker.results["volume inspect"] = CommandResult(
-            0, 'local|null|{"shiplord.app":"billing"}|2026-10-30T00:00:00Z|'
-               '/var/lib/docker/volumes/shiplord-billing-artifacts/_data\n')
-        self.runtime.prepare(other, release())
-        self.assertNotIn("--config", self.docker.calls[0])
-
-    def test_a_nearly_full_disk_stops_the_deploy_before_anything_is_pulled_or_changed(self):
+    def test_a_nearly_full_disk_stops_the_deploy_before_the_running_release_is_touched(self):
         with patch("shiplord.runtime.shutil.disk_usage", return_value=type("U", (), {"free": 10 * 2**20})()):
             with self.assertRaisesRegex(RuntimeFailure, "not enough free disk space.*10 MiB free") as caught:
                 self.runtime.prepare(REGISTRATION, release())
@@ -233,12 +271,6 @@ class PrepareTests(RuntimeTestCase):
             self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
             self.runtime.prepare(REGISTRATION, release())
         self.assertTrue(self.docker.calls)
-
-    def test_a_timed_out_pull_is_reported_with_its_output(self):
-        self.docker.raise_for["pull"] = CommandError("timed out", "timeout", "layer 3/9")
-        with self.assertRaises(RuntimeFailure) as caught:
-            self.runtime.prepare(REGISTRATION, release())
-        self.assertEqual((caught.exception.phase, caught.exception.detail), ("prepare", "layer 3/9"))
 
 
 class StartTests(RuntimeTestCase):
