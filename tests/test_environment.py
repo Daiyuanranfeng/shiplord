@@ -75,6 +75,11 @@ class LoadTests(unittest.TestCase):
         with self.assertRaises(EnvironmentError_):
             load_environment_file(self.path)
 
+    def test_a_directory_in_place_of_the_file_is_refused_as_an_environment_error(self):
+        self.path.mkdir()
+        with self.assertRaises(EnvironmentError_):
+            load_environment_file(self.path)
+
 
 if __name__ == "__main__":
     unittest.main()

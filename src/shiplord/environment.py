@@ -62,7 +62,12 @@ def load_environment_file(path: Path) -> dict[str, str] | None:
         return None
     except OSError:
         raise EnvironmentError_("could not open the environment file safely") from None
-    with os.fdopen(descriptor, "rb") as file:
+    try:
+        file = os.fdopen(descriptor, "rb")
+    except OSError:  # a directory in place of the file opens but cannot be read
+        os.close(descriptor)
+        raise EnvironmentError_("could not open the environment file safely") from None
+    with file:
         info = os.fstat(file.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
                 or info.st_size > MAX_ENVIRONMENT_BYTES):
