@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from shiplord import routing
 from shiplord.release_state import HostLock
-from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, render_route
+from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_caddy, render_route
 from shiplord.system import TRUNCATION_MARKER, CommandError, CommandResult
 
 
@@ -28,6 +28,7 @@ class FakeCaddy:
         self.validate_calls: list[dict] = []
         self.reload_calls = 0
         self.fail_validate: set[int] = set()
+        self.unavailable_validate: set[int] = set()
         self.fail_reload: set[int] = set()
         self.on_reload = None
 
@@ -36,6 +37,8 @@ class FakeCaddy:
         self.validate_calls.append({"config": config, "text": config.read_text(),
                                     "mode": stat.S_IMODE(config.stat().st_mode),
                                     "live": {p.name: p.read_bytes() for p in self.ship.glob("*.caddy")}})
+        if number in self.unavailable_validate:
+            raise RoutingError("could not start /usr/bin/caddy", "unavailable")
         if number in self.fail_validate:
             raise RoutingError("Caddy command failed", "validation", detail="bad config")
 
@@ -216,6 +219,17 @@ class FailureTests(RoutingTestCase):
         with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "already invalid"):
             self.manager.apply(registration())
         self.assertEqual(self.caddy.reload_calls, 0)
+
+    def test_an_unavailable_caddy_is_not_blamed_on_the_route_or_the_existing_configuration(self):
+        self.caddy.unavailable_validate = {1, 2}  # candidate and baseline both cannot run Caddy
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertNotIn("already invalid", str(caught.exception))
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertNoTransactionLeftovers()
 
     def test_reload_failure_restores_the_previous_route_and_reconciles(self):
         with self.lock.acquire():
@@ -598,6 +612,15 @@ class EnsureImportTests(RoutingTestCase):
         self.assertEqual(caught.exception.kind, "validation")
         self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
 
+    def test_an_unavailable_caddy_is_not_reported_as_a_rejected_caddyfile(self):
+        self.caddy.unavailable_validate = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+
     def test_reload_failure_restores_the_caddyfile_and_reloads_again(self):
         self.caddy.fail_reload = {1}
         before = self.snapshot()
@@ -768,14 +791,19 @@ class SubprocessCaddyTests(unittest.TestCase):
         marker = self.directory / "survived"
         caddy = self.script("caddy", f"sleep 5\ntouch {marker}\n")
         started = __import__("time").monotonic()
-        with self.assertRaisesRegex(RoutingError, "timed out"):
+        with self.assertRaisesRegex(RoutingError, "timed out") as caught:
             SubprocessCaddy(caddy, timeout=0.5).validate(Path("/x"))
+        self.assertEqual(caught.exception.kind, "validation")  # a slow Caddy is not an absent one
         self.assertLess(__import__("time").monotonic() - started, 4)
         self.assertFalse(marker.exists())
 
-    def test_missing_executable_is_a_routing_error(self):
-        with self.assertRaises(RoutingError):
-            SubprocessCaddy(str(self.directory / "absent")).validate(Path("/x"))
+    def test_missing_executable_is_unavailable_not_a_rejected_configuration(self):
+        absent = str(self.directory / "absent")
+        with self.assertRaises(RoutingError) as caught:
+            SubprocessCaddy(absent).validate(Path("/x"))
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn(absent, str(caught.exception))
+        self.assertNotIn("rejected", str(caught.exception))
 
     def test_reload_failure_has_reload_kind(self):
         systemctl = self.script("systemctl", "exit 1\n")
@@ -897,6 +925,42 @@ class ServiceEnvironmentTests(unittest.TestCase):
         os.environ["SHIPLORD_SECRET_TEST"] = "do-not-leak"
         self.addCleanup(os.environ.pop, "SHIPLORD_SECRET_TEST", None)
         self.assertEqual(routing.service_environment(FakeSystem("Environment=\nEnvironmentFiles=\n"), ()), {})
+
+
+class ProbeTests(unittest.TestCase):
+    def test_the_probe_validates_a_fixed_minimal_configuration(self):
+        seen = {}
+
+        class Recorder:
+            def validate(self, config):
+                seen["path"], seen["text"] = config, config.read_text()
+
+            def reload(self):
+                raise AssertionError("the probe must not reload")
+
+        probe_caddy(Recorder())
+        self.assertEqual(seen["text"], routing.CADDY_PROBE.decode())
+        self.assertFalse(seen["path"].exists())  # the throwaway file is removed, never left on the host
+
+    def test_the_probe_reports_an_absent_binary_as_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            absent = str(Path(directory) / "absent")
+            with self.assertRaises(RoutingError) as caught:
+                probe_caddy(SubprocessCaddy(absent))
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn(absent, str(caught.exception))
+
+    def test_the_probe_propagates_any_other_refusal(self):
+        class Broken:
+            def validate(self, config):
+                raise RoutingError("Caddy command failed", "validation", detail="bad config")
+
+            def reload(self):
+                raise AssertionError("the probe must not reload")
+
+        with self.assertRaises(RoutingError) as caught:
+            probe_caddy(Broken())
+        self.assertEqual(caught.exception.kind, "validation")
 
 
 if __name__ == "__main__":

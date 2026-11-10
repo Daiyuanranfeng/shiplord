@@ -24,7 +24,10 @@ verified: the plan's controlled install on *your* production server (§12E). See
 ## Requirements
 
 - **The server:** a Linux host with systemd, OpenSSH, and Caddy, and **Python 3.11 or later at
-  `/usr/bin/python3`**. The helper reads TOML with `tomllib`, which only exists from Python 3.11, so Ubuntu
+  `/usr/bin/python3`**. Install Caddy from its official package repository (the `caddy` package) so the binary is
+  at `/usr/bin/caddy`; `shiplord server bootstrap` validates a fixed minimal Caddyfile before it installs or
+  switches the helper, and refuses a host without Caddy with a message naming the package and that path. The
+  helper reads TOML with `tomllib`, which only exists from Python 3.11, so Ubuntu
   22.04 (Python 3.10) and Debian 11 (Python 3.9) are too old. `shiplord server bootstrap` checks that
   interpreter over SSH before it builds or uploads anything, and refuses the server with a message naming the
   path and the version instead of failing later with an unreadable response.
