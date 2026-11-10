@@ -321,7 +321,7 @@ def server_add(alias: str, ssh: str = typer.Option(..., "--ssh")) -> None:
         typer.echo(f"error: {exc}", err=True)
         code = 2 if isinstance(exc, (ManifestError, InvalidTarget)) else 3 if isinstance(exc, SSHCheckError) else 1
         raise typer.Exit(code) from None
-    typer.echo("Server alias saved. Run `shiplord server bootstrap` next. CI host-key setup is not implemented yet.")
+    typer.echo("Server alias saved. Run `shiplord server bootstrap` next.")
 
 
 @server_app.command("list", rich_help_panel="Administration")
