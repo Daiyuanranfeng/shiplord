@@ -9,12 +9,22 @@ import re
 import secrets
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from .manifest import validate_app_name
 from .protocol import _invalid_constant, _unique_keys
+from .system import sanitize
+
+STDERR_LIMIT = 4096
+_HOST_TRUST_LINE = re.compile(
+    r"(?:Host key verification failed\.|"
+    r"No \S+ host key is known for \S+ and you have requested strict checking\.|"
+    r"The authenticity of host .+ can't be established\.|"
+    r"\S+ key fingerprint is \S+\.)")
+_HOST_KEY_CHANGED = "REMOTE HOST IDENTIFICATION HAS CHANGED"
 
 
 class ServerError(ValueError):
@@ -230,15 +240,33 @@ def ssh_command(target: str, remote_command: str, options: SshOptions | None = N
     return command
 
 
+def _ssh_failure_message(target: str, stderr: bytes) -> str:
+    """Explain a failed SSH check, repeating only the host-trust lines that are safe to show."""
+    text = sanitize(stderr, STDERR_LIMIT)
+    if _HOST_KEY_CHANGED in text:
+        return ("SSH check failed: the host key for this server has changed since it was trusted; "
+                "remove the stale known-hosts entry, then retry")
+    detail = " ".join(line.strip() for line in text.splitlines() if _HOST_TRUST_LINE.fullmatch(line.strip()))
+    if not detail:
+        return "SSH check failed; verify host trust, login, and any locked SSH key"
+    host = target.split("@", 1)[1]
+    return (f"SSH check failed: the host key for {host} is not trusted yet. "
+            f"Run `ssh {target}` once to review and accept it, then retry. ssh said: {detail}")
+
+
 def register_server(alias: str, target: str) -> None:
     alias = validate_app_name(alias)
     target = validate_target(target)
     command = ssh_command(target, "true")
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=15, check=False)
+        with tempfile.TemporaryFile() as stderr:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=stderr, timeout=15, check=False)
+            stderr.seek(0, os.SEEK_END)
+            stderr.seek(max(0, stderr.tell() - STDERR_LIMIT))
+            output = stderr.read(STDERR_LIMIT)
     except (OSError, subprocess.TimeoutExpired):
         raise SSHCheckError("SSH check could not be completed; verify OpenSSH and your connection") from None
     if result.returncode != 0:
-        raise SSHCheckError("SSH check failed; verify host trust, login, and any locked SSH key")
+        raise SSHCheckError(_ssh_failure_message(target, output))
     _save_server(alias, target)
