@@ -18,7 +18,7 @@ from shiplord.layout import Layout  # noqa: E402
 from shiplord.manifest import ManifestError, validate_manifest  # noqa: E402
 from shiplord.release_state import StateError, validate_release  # noqa: E402
 from shiplord.retire import make_retirer  # noqa: E402
-from shiplord.runtime import DockerRuntime, RuntimeFailure, stop_signal  # noqa: E402
+from shiplord.runtime import DockerRuntime, RuntimeFailure, parse_stop_signal, stop_signal  # noqa: E402
 from shiplord.shutdown import check_budget, check_recovery_budget, policy, ShutdownError, worst_case_seconds  # noqa: E402
 from shiplord.system import CommandResult  # noqa: E402
 from test_client import ClientTestCase  # noqa: E402
@@ -105,6 +105,13 @@ class SignalTests(unittest.TestCase):
         for configured in ("SIGKILL", "KILL", "9", "SIGSTOP", "19", "0", "32", "SIGFOO", "TERM;rm", "-15"):
             with self.subTest(configured), self.assertRaises(RuntimeFailure):
                 stop_signal(configured)
+
+    def test_the_shared_rule_normalises_a_catchable_signal_and_rejects_an_unusable_one(self):
+        for configured, expected in (("", "SIGTERM"), ("<no value>", "SIGTERM"), ("sigquit", "SIGQUIT"), ("15", "15")):
+            self.assertEqual(parse_stop_signal(configured), expected)
+        for configured in ("SIGKILL", "KILL", "9", "SIGSTOP", "19", "0", "32", "SIGFOO", "TERM;rm", "-15"):
+            with self.subTest(configured), self.assertRaises(ValueError):
+                parse_stop_signal(configured)
 
 
 class ScriptedDocker:
