@@ -152,26 +152,41 @@ class RegistryTests(unittest.TestCase):
                 self.registry.register("orders", probe=lambda port: False, **request())
         self.assertEqual(os.listdir(self.directory), [])
 
-    def test_corrupt_unexpected_or_unsafe_entries_fail_closed(self):
+    def test_corrupt_or_unsafe_records_fail_closed(self):
         with self.lock.acquire():
             self.register()
             path = self.directory / "orders.json"
-            for label, damage in {
-                "corrupt json": lambda: path.write_text("{"),
-                "wrong app inside": lambda: path.write_text(json.dumps(record(application_id="billing"))),
-                "group writable": lambda: (path.write_text(json.dumps(record())), path.chmod(0o660)),
-            }.items():
+            unrelated = self.directory / "Not An App.json"
+            cases = [
+                ("corrupt json", lambda: path.write_text("{"), lambda: None),
+                ("wrong app inside", lambda: path.write_text(json.dumps(record(application_id="billing"))),
+                 lambda: None),
+                ("name that cannot be an application", lambda: unrelated.write_text(json.dumps(record())),
+                 unrelated.unlink),
+                ("group writable", lambda: (path.write_text(json.dumps(record())), path.chmod(0o660)), lambda: None),
+            ]
+            for label, damage, cleanup in cases:
                 with self.subTest(label):
                     damage()
-                    with self.assertRaises(StateError):
-                        self.registry.list()
-                    with self.assertRaises(StateError):
-                        self.register("billing", deployment_uid=1002, deployment_user="ship-billing")
-        path.chmod(0o600)
-        path.write_text(json.dumps(record()))
-        (self.directory / "stray.txt").write_text("x")
-        with self.assertRaisesRegex(RegistryError, "unexpected"):
-            self.registry.list()
+                    try:
+                        with self.assertRaises(StateError):
+                            self.registry.list()
+                        with self.assertRaises(StateError):
+                            self.register("billing", deployment_uid=1002, deployment_user="ship-billing")
+                    finally:
+                        cleanup()
+
+    def test_stray_files_are_skipped_and_named(self):
+        with self.lock.acquire():
+            self.register()
+            for name in ("app.json~", ".app.json.swp", "stray.txt"):
+                (self.directory / name).write_text("x")
+            self.assertEqual([entry["application_id"] for entry in self.registry.list()], ["orders"])
+            self.assertEqual(self.registry.stray, [".app.json.swp", "app.json~", "stray.txt"])
+            # A stray file must not block a new registration either.
+            self.register("billing", deployment_uid=1002, deployment_user="ship-billing")
+        self.assertEqual(sorted(os.listdir(self.directory)),
+                         [".app.json.swp", "app.json~", "billing.json", "orders.json", "stray.txt"])
 
     def test_symlinked_registration_is_not_followed(self):
         os.symlink("/etc/hosts", self.directory / "orders.json")

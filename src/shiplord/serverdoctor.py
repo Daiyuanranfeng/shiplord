@@ -45,7 +45,9 @@ def application_inventory(layout: Layout, lock: HostLock) -> dict:
     try:
         descriptor = os.open(layout.registrations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            registrations = Registry(descriptor, lock).list()
+            registry = Registry(descriptor, lock)
+            registrations = registry.list()
+            ignored = list(registry.stray)
         finally:
             os.close(descriptor)
     except (OSError, StateError):
@@ -71,7 +73,10 @@ def application_inventory(layout: Layout, lock: HostLock) -> dict:
         except (OSError, StateError):
             entry.update(ok=False, error="application state is unreadable")
         applications.append(entry)
-    return {"ok": all(entry["ok"] for entry in applications), "applications": applications}
+    result = {"ok": all(entry["ok"] for entry in applications), "applications": applications}
+    if ignored:
+        result["ignored_files"] = ignored
+    return result
 
 
 def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-10
+goal: Skip stray files in the registration directory and report them by name,
+  instead of failing every administrative command

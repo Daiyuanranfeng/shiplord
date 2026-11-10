@@ -86,6 +86,7 @@ class Registry:
         _directory(directory)
         self.directory = directory
         self.lock = lock
+        self.stray: list[str] = []
 
     def read(self, application_id: str) -> dict | None:
         app = validate_app_name(application_id)
@@ -93,14 +94,24 @@ class Registry:
         return None if value is None else validate_registration(value, app)
 
     def list(self) -> list[dict]:
-        """Return every registration, failing closed on anything unexpected."""
+        """Return every registration; files that cannot be registrations are skipped and named in ``stray``.
+
+        A stray file (an editor backup, a swap file, anything not ending in ``.json``) must not take out every
+        administrative command. It is reported by name instead. A ``.json`` record that is corrupt or unsafe still
+        fails closed: only noise is skipped, never a registration.
+        """
         records = []
+        self.stray = []
         for name in sorted(os.listdir(self.directory)):
             if name.startswith(".tmp-"):
                 continue
             if not name.endswith(".json"):
-                raise RegistryError("unexpected file in the registry")
-            record = self.read(name[: -len(".json")])
+                self.stray.append(name)
+                continue
+            try:
+                record = self.read(name[: -len(".json")])
+            except ManifestError:
+                raise RegistryError("unexpected file in the registry") from None
             if record is None:
                 raise RegistryError("registration disappeared while listing")
             records.append(record)

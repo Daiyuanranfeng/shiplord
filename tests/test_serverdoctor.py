@@ -109,6 +109,19 @@ class ServerDoctorTests(DoctorTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(response["result"]["applications"][0]["unfinished_transaction"]["phase"], "prepared")
 
+    def test_stray_registry_file_is_reported_without_breaking_the_inventory(self):
+        from shiplord.serverdoctor import application_inventory
+        self.provision()
+        (self.layout.registrations / "orders.json~").write_text("x")
+        report = application_inventory(self.layout, self.lock)
+        self.assertTrue(report["ok"])
+        self.assertEqual([entry["application"] for entry in report["applications"]], ["orders"])
+        self.assertEqual(report["ignored_files"], ["orders.json~"])
+        request = {"version": 1, "request_id": "apps-stray", "action": "apps", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["ignored_files"]), (0, ["orders.json~"]))
+
     def test_admin_apps_action_rejects_application_identity_and_arguments(self):
         request = {"version": 1, "request_id": "apps-1", "action": "apps", "application_id": None,
                    "commit": None, "arguments": {}}
