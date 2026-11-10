@@ -37,8 +37,10 @@ class NoSystemd(HostSystem):
 
     def __init__(self, units=frozenset({"ssh.service", "sshd.service"})):
         self.units = set(units)
+        self.calls = []
 
     def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
         if argv[0].endswith("systemctl"):
             if argv[1] == "list-unit-files":
                 listed = [unit for unit in argv[2:] if unit in self.units]
