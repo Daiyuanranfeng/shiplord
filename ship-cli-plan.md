@@ -594,7 +594,8 @@ Each application has exactly one persistent location, and Shiplord already owns 
 
 - **Docker:** the named volume `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` or at
   `[storage].container_path`.
-- **Native:** `/var/lib/shiplord/data/<application>`, the service's working directory and only writable path.
+- **Native:** `/var/lib/shiplord/data/<application>`, the service's working directory and only persistent
+  writable path.
 
 The supported database inside that location is SQLite: one file (plus its WAL and shared-memory files)
 opened by the application's single process. Shiplord guarantees the location survives a deploy, a failed

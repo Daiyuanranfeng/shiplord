@@ -172,7 +172,7 @@ container is not part of it.
 - **Docker:** the named volume `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` by default or at
   `[storage].container_path`.
 - **Native:** `/var/lib/shiplord/data/<application>`, which is the service's working directory and its only
-  writable path.
+  persistent writable path.
 
 A SQLite database and any files the app writes belong there. Shiplord creates the location (the volume at the
 first deploy, the directory at provision), mounts it at the same path on every release, and never deletes it:
@@ -183,7 +183,8 @@ The application is responsible for:
 
 - Keeping the database and its files under the mount. Anything written elsewhere in a container is lost when
   the container is replaced.
-- Opening SQLite in WAL mode with a busy timeout. There is one writer, and WAL keeps a reader from blocking it.
+- Opening SQLite in WAL mode with a busy timeout. There is one writer; WAL lets readers and the writer
+  work at the same time.
 - Owning the mount, or creating its files as the user the image runs as. Shiplord does not initialise
   ownership: `[storage] owner_uid` / `owner_gid` are validated and then refused (#64). An image that runs as
   non-root should create the directory with the right owner in its build.
