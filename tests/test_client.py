@@ -139,6 +139,13 @@ class HelperClientTests(ClientTestCase):
         self.assertEqual(str(caught.exception), "disk is full")
         self.assertTrue(self.process.killed)  # the process was still running, so it is stopped
 
+    def test_follow_reports_a_rejected_request_as_invalid_rather_than_a_failure(self):
+        # An older helper rejects the follow arguments as unknown, which is exit code 2, not a failure.
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "error", "request_id": "r1", "error": "invalid_request"}))
+        self.assertEqual((caught.exception.code, str(caught.exception)),
+                         (2, "the server stopped the log stream (invalid_request)"))
+
     def test_follow_rejects_an_uncorrelated_frame(self):
         with self.assertRaises(ClientError) as caught:
             self.follow(frame({"status": "ok", "request_id": "other", "result": {}}))

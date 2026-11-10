@@ -230,8 +230,9 @@ class HelperClient:
                         raise ClientError("the server returned an invalid log stream", 1)
                     return result
                 if status == "error":
-                    raise ClientError(response.get("message") or
-                                      f"the server stopped the log stream ({response.get('error')})", 1)
+                    error = response.get("error")
+                    raise ClientError(response.get("message") or f"the server stopped the log stream ({error})",
+                                      2 if error in ("invalid_request", "invalid_payload") else 1)
                 if status == "incompatible":
                     raise ClientError("the server helper speaks a different protocol version; upgrade one side", 4)
                 raise ClientError("the server returned an invalid log stream", 1)

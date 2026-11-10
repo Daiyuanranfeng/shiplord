@@ -114,18 +114,32 @@ class StreamCommandTests(unittest.TestCase):
         self.assertEqual((reason, "".join(chunks)), ("ended", "one\ntwo\n"))
 
     def test_the_deadline_stops_a_stream_that_never_ends(self):
+        # The deadline starts after the process is spawned, so a longer one still proves the stop
+        # is caused by the timeout rather than by the stream ending.
         started = time.monotonic()
         chunks = []
-        reason = stream_command([self.script('printf "start\\n"; while true; do sleep 0.05; done\n')], timeout=0.3,
+        reason = stream_command([self.script('printf "start\\n"; while true; do sleep 0.05; done\n')], timeout=2,
                                 on_chunk=chunks.append)
         self.assertEqual((reason, "".join(chunks)), ("timeout", "start\n"))
         self.assertLess(time.monotonic() - started, 5)
 
     def test_the_deadline_kills_the_whole_process_group(self):
-        marker = self.directory / "survived"
-        tool = self.script(f"(sleep 2; touch {marker}) &\nwhile true; do sleep 0.05; done\n")
-        self.assertEqual(stream_command([tool], timeout=0.3, on_chunk=lambda chunk: None), "timeout")
-        time.sleep(2.5)
+        # The background child outlives the deadline by far, so it can only touch the marker if the
+        # kill missed it; the child's own PID is what the test waits to see disappear.
+        marker, pidfile = self.directory / "survived", self.directory / "child.pid"
+        tool = self.script(f"(sleep 10; touch {marker}) &\necho $! > {pidfile}\n"
+                           "while true; do sleep 0.05; done\n")
+        self.assertEqual(stream_command([tool], timeout=2, on_chunk=lambda chunk: None), "timeout")
+        child = int(pidfile.read_text())  # the script ran far enough to record its background child
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the background process survived the deadline")
         self.assertFalse(marker.exists())
 
     def test_control_characters_are_replaced_but_newlines_are_kept(self):
