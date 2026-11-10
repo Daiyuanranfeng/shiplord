@@ -67,7 +67,8 @@ shiplord env set --from-file .env.production         # runtime secrets; values a
 shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
 
 # every release
-shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only
+shiplord release                                        # build, push, and deploy this checkout
+shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only, prebuilt image
 shiplord deploy --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>
 shiplord status
 shiplord logs --tail 100
@@ -218,6 +219,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
+| `release [--image-repository R] [--tag T] [--platform P]` | Build and push this checkout, then deploy the pushed digest. Refuses a dirty tree. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |

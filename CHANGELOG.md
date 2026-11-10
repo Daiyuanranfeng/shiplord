@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `shiplord release` to build and push a Docker image from a clean checkout,
+  then deploy the pushed digest without copying it by hand.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

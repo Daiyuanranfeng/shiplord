@@ -61,6 +61,13 @@ shiplord deploy \
 
 `plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
 
+To build and deploy in one step from the application's checkout, run `shiplord release`. It refuses a dirty
+working tree, builds and pushes the image for the server's platform with the commit recorded in the image's
+`org.opencontainers.image.revision` label, reads the pushed digest, and deploys that digest. Nothing has to be
+copied by hand. The platform defaults to `linux/amd64`; pass `--platform linux/arm64` for an arm64 server. Use
+`--image-repository` when `ship.toml` has no `[github]` section, and `--tag` to override the default tag (the
+commit SHA).
+
 If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data.
 
 ## Check or undo a deployment
