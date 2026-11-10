@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import typer
 
 from . import __version__
-from . import commands, github, tailscale
+from . import commands, github, tailscale, workflow
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
 from .configure import (ConfigurationError, collect_answers, create_manifest, resolve_image_repository,
@@ -1132,7 +1132,7 @@ def keys_remove_command(label: str = typer.Option(..., "--label", help="The labe
 
 
 @github_app.command("setup", rich_help_panel="Administration")
-def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
+def github_setup_command(repo: Optional[str] = typer.Option(None, "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
                          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
@@ -1144,13 +1144,25 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          no_quality_workflow: bool = typer.Option(False, "--no-quality-workflow",
                                                                   help="Do not run a quality job before deploy."),
                          force_workflow: bool = typer.Option(False, "--force-workflow"),
+                         upgrade_workflow: bool = typer.Option(False, "--upgrade-workflow",
+                                                               help="Only refresh the action pins in the generated "
+                                                                    "workflows; the other options are ignored."),
                          json_output: bool = typer.Option(False, "--json")) -> None:
-    """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow."""
+    """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow.
+
+    With --upgrade-workflow, rewrite only the action pins in the workflows Shiplord already generated.
+    """
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
         if quality_workflow is not None and no_quality_workflow:
             raise CommandError("choose either --quality-workflow or --no-quality-workflow")
+        if upgrade_workflow:
+            if repo is not None:
+                github.validate_setup_request(manifest, repo)
+            return 0, github.upgrade_workflow(manifest, project=Path.cwd())
+        if repo is None:
+            raise CommandError("--repo owner/repository is required unless --upgrade-workflow is given")
         github.validate_setup_request(manifest, repo)
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
@@ -1177,6 +1189,17 @@ def github_check_ci_command(timeout: int = typer.Option(1200, "--timeout", help=
     """Run the release workflow in check-only mode: join Tailscale, log in with the CI key, deploy nothing."""
     manifest = _manifest(json_output)
     _execute(lambda: github.check_ci(manifest, gh=github.GitHub(), timeout=timeout), json_output)
+
+
+@github_app.command("check-pins", rich_help_panel="Administration")
+def github_check_pins_command(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Confirm every action Shiplord pins still resolves in its own repository.
+
+    Needs the GitHub API: a token is read from GITHUB_TOKEN or GH_TOKEN, never from an argument. A pin the API
+    cannot be asked about is reported as unverified, never as resolving.
+    """
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or None
+    _execute(lambda: workflow.check_action_pins(token=token), json_output)
 
 
 @github_app.command("status", rich_help_panel="Administration")

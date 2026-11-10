@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -20,10 +21,10 @@ from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, ci_key_labels, fetch_host_keys,  # noqa: E402
                              generate_ci_key, github_setup, github_status, known_hosts_lines, label_for, parse_host_key,
-                             resolve_ssh_host, rotate_key)
+                             resolve_ssh_host, rotate_key, upgrade_workflow)
 from shiplord.keys import parse_public_key  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
-from shiplord.workflow import DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH, render_deploy_workflow, render_workflow  # noqa: E402
+from shiplord.workflow import DEPLOY_WORKFLOW_PATH, PINS, WORKFLOW_PATH, render_deploy_workflow, render_workflow  # noqa: E402
 
 REF = "cd" * 20
 HOST = "server.example.com"
@@ -700,6 +701,108 @@ class KeyGenerationTests(unittest.TestCase):
             self.assertNotIn("super-secret-value", " ".join(argv))
             self.assertNotIn("multi", " ".join(argv))
         self.assertEqual([stdin for _, stdin in calls], [b"super-secret-value", b"multi\nline"])
+
+
+STALE = "9" * 40
+
+
+class UpgradeWorkflowTests(GitHubTestCase):
+    """`github setup --upgrade-workflow`: only the pins change, and only in a file Shiplord wrote."""
+
+    def pipeline(self, *, branch="main", quality=None, stale=("checkout",)):
+        value = manifest(with_github=True) | {"github": {"repository": "Example/orders", "deployment_branch": branch}}
+        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(value, tooling_ref=REF),
+                 WORKFLOW_PATH: render_workflow(value, tooling_ref=REF, quality_workflow=quality)}
+        for name in stale:
+            texts[DEPLOY_WORKFLOW_PATH] = texts[DEPLOY_WORKFLOW_PATH].replace(PINS[name].commit, STALE)
+        for path, text in texts.items():
+            target = self.project / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        return texts
+
+    def upgrade(self, **overrides):
+        value = overrides.pop("manifest", manifest(with_github=True))
+        return upgrade_workflow(value, project=self.project, home=self.home, **overrides)
+
+    def read(self, path):
+        return (self.project / path).read_text()
+
+    def test_a_stale_pin_is_refreshed_and_every_other_line_is_preserved(self):
+        texts = self.pipeline()
+        (self.project / DEPLOY_WORKFLOW_PATH).write_text(texts[DEPLOY_WORKFLOW_PATH] + "# a local note\n")
+        result = self.upgrade()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["changed"], [DEPLOY_WORKFLOW_PATH])
+        self.assertEqual(result["unchanged"], [WORKFLOW_PATH])
+        self.assertEqual(result["pins"], [{"path": DEPLOY_WORKFLOW_PATH, "action": "actions/checkout",
+                                           "from": STALE, "to": PINS["checkout"].commit, "version": "v4"}])
+        self.assertEqual(self.read(DEPLOY_WORKFLOW_PATH),
+                         texts[DEPLOY_WORKFLOW_PATH].replace(STALE, PINS["checkout"].commit) + "# a local note\n")
+        self.assertEqual(self.read(WORKFLOW_PATH), texts[WORKFLOW_PATH])
+
+    def test_a_hand_written_workflow_is_refused_before_anything_is_written(self):
+        texts = self.pipeline()
+        hand_written = ("name: Mine\non: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                        f"      - uses: actions/checkout@{STALE}\n")
+        (self.project / WORKFLOW_PATH).write_text(hand_written)  # the stale deploy workflow is accepted first
+        with self.assertRaises(GitHubError) as caught:
+            self.upgrade()
+        self.assertEqual((caught.exception.code, caught.exception.step), (2, "workflow"))
+        self.assertIn(WORKFLOW_PATH, str(caught.exception))
+        self.assertEqual(self.read(WORKFLOW_PATH), hand_written)
+        self.assertEqual(self.read(DEPLOY_WORKFLOW_PATH), texts[DEPLOY_WORKFLOW_PATH])  # not written either
+
+    def test_the_deployment_branch_and_the_quality_job_survive(self):
+        texts = self.pipeline(branch="release/prod", quality=QUALITY_WORKFLOW)
+        self.assertEqual(self.upgrade()["changed"], [DEPLOY_WORKFLOW_PATH])
+        self.assertEqual(self.read(WORKFLOW_PATH), texts[WORKFLOW_PATH])
+        self.assertIn('branches: ["release/prod"]', self.read(WORKFLOW_PATH))
+        self.assertIn(f"uses: ./{QUALITY_WORKFLOW}", self.read(WORKFLOW_PATH))
+        self.assertIn("refs/heads/release/prod", self.read(DEPLOY_WORKFLOW_PATH))
+        self.assertNotIn(STALE, self.read(DEPLOY_WORKFLOW_PATH))
+
+    def test_a_missing_pipeline_file_is_refused(self):
+        self.pipeline()
+        (self.project / DEPLOY_WORKFLOW_PATH).unlink()
+        with self.assertRaisesRegex(GitHubError, "github setup"):
+            self.upgrade()
+        self.assertFalse((self.project / DEPLOY_WORKFLOW_PATH).exists())
+
+    def test_a_second_upgrade_has_nothing_left_to_do(self):
+        self.pipeline()
+        self.upgrade()
+        result = self.upgrade()
+        self.assertEqual((result["changed"], result["pins"]), ([], []))
+        self.assertIn("already pin", result["note"])
+
+    def test_a_native_application_has_no_generated_workflow_to_upgrade(self):
+        with self.assertRaisesRegex(GitHubError, "binary"):
+            self.upgrade(manifest=manifest("native", with_github=True))
+        self.assertFalse((self.project / WORKFLOW_PATH).exists())
+
+    def record(self, digests):
+        directory = self.state_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "state.json").write_text(json.dumps({"workflows": digests}))
+
+    def test_the_recorded_digest_follows_a_file_shiplord_wrote(self):
+        texts = self.pipeline()
+        self.record({path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()})
+        self.upgrade()
+        recorded = self.state()["workflows"]
+        for path in (DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH):
+            with self.subTest(path=path):
+                self.assertEqual(recorded[path], hashlib.sha256((self.project / path).read_bytes()).hexdigest())
+
+    def test_an_edited_file_is_not_recorded_as_shiplords_so_setup_still_refuses_it(self):
+        texts = self.pipeline()
+        clean = hashlib.sha256(texts[DEPLOY_WORKFLOW_PATH].encode()).hexdigest()
+        self.record({DEPLOY_WORKFLOW_PATH: clean, WORKFLOW_PATH: hashlib.sha256(texts[WORKFLOW_PATH].encode()).hexdigest()})
+        (self.project / DEPLOY_WORKFLOW_PATH).write_text(texts[DEPLOY_WORKFLOW_PATH] + "# a local note\n")
+        self.upgrade()
+        self.assertIn("# a local note", self.read(DEPLOY_WORKFLOW_PATH))
+        self.assertEqual(self.state()["workflows"][DEPLOY_WORKFLOW_PATH], clean)  # still "the user edited it"
 
 
 if __name__ == "__main__":
