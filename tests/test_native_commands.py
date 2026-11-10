@@ -31,6 +31,12 @@ def native_manifest():
     return validate_manifest(native_configuration())
 
 
+def corrupt(payload: bytes) -> bytes:
+    if not payload:
+        raise ValueError("payload must not be empty")
+    return payload[:-1] + bytes([payload[-1] ^ 0xFF])
+
+
 class NativeCommandTests(ClientTestCase):
     RUNTIME = "native"
 
@@ -125,13 +131,21 @@ class NativeCommandTests(ClientTestCase):
 
         def corrupting(command, header, path, timeout):
             damaged = Path(self.work.name) / "damaged"
-            damaged.write_bytes(path.read_bytes()[:-1] + b"X")
+            payload = path.read_bytes()
+            damaged.write_bytes(corrupt(payload))
+            self.assertNotEqual(damaged.read_bytes(), payload)
             return original(command, header, damaged, timeout)
         self.client.payload_runner = corrupting
         with self.assertRaises(ClientError) as caught:
             self.deploy()
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("checksum", str(caught.exception))
+
+    def test_the_corruption_changes_the_last_byte_for_every_value(self):
+        for last in range(256):
+            payload = b"\x7fELF" + bytes([last])
+            self.assertEqual(corrupt(payload), payload[:-1] + bytes([last ^ 0xFF]))
+            self.assertNotEqual(corrupt(payload), payload)
 
 
 if __name__ == "__main__":
