@@ -19,6 +19,8 @@ class ManifestError(ValueError):
 _NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_BUILD_COMMAND = re.compile(r"[\x20-\x7e]{1,2048}\Z")
+_BINARY_PATH = re.compile(r"[A-Za-z0-9._/-]{1,512}\Z")
 GENERIC_DOCKER_FEATURE = "docker_generic_v1"
 
 
@@ -79,6 +81,23 @@ def validate_readiness_path(value: object) -> str:
     path = _string(value, "http.readiness_path")
     if not re.fullmatch(r"/[A-Za-z0-9._~/-]*", path) or "//" in path:
         raise ManifestError("http.readiness_path must be an absolute URL path")
+    return path
+
+
+def validate_build_command(value: object) -> str:
+    """Validate the single command a generated native workflow runs to build the binary."""
+    command = _string(value, "github.build_command")
+    if not _BUILD_COMMAND.fullmatch(command):
+        raise ManifestError("github.build_command must be one line of printable characters")
+    return command
+
+
+def validate_binary_path(value: object) -> str:
+    """Validate the repository-relative path the build command writes the binary to."""
+    path = _string(value, "github.binary_path")
+    if (not _BINARY_PATH.fullmatch(path) or path.startswith("/") or path.endswith("/")
+            or any(part in {"", ".", ".."} for part in path.split("/"))):
+        raise ManifestError("github.binary_path must be a relative file path inside the repository")
     return path
 
 
@@ -171,7 +190,7 @@ def validate_manifest(raw: dict) -> dict:
         except StorageError as error:
             raise ManifestError(str(error)) from None
     if "github" in root:
-        github = _table(root["github"], "github", {"repository", "deployment_branch"})
+        github = _table(root["github"], "github", {"repository", "deployment_branch", "build_command", "binary_path"})
         repository = _string(github.get("repository"), "github.repository")
         if not _REPOSITORY.fullmatch(repository) or any(part in {".", ".."} or part.startswith("-") for part in repository.split("/")):
             raise ManifestError("github.repository must be an owner/repository pair")
@@ -179,4 +198,13 @@ def validate_manifest(raw: dict) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or any(x in branch for x in ("..", "//", "@{")) or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") for part in branch.split("/")):
             raise ManifestError("github.deployment_branch must be a valid branch name")
         result["github"] = {"repository": repository, "deployment_branch": branch}
+        # The workflow generator needs both for a native application; they stay optional here so an existing
+        # manifest without them still loads for every other command.
+        if "build_command" in github or "binary_path" in github:
+            if runtime != "native":
+                raise ManifestError("github.build_command and github.binary_path apply only to native applications")
+            if "build_command" in github:
+                result["github"]["build_command"] = validate_build_command(github["build_command"])
+            if "binary_path" in github:
+                result["github"]["binary_path"] = validate_binary_path(github["binary_path"])
     return result

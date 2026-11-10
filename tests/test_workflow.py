@@ -13,12 +13,21 @@ from shiplord.workflow import ACTIONS, WorkflowError, render_workflow
 REF = "ab" * 20
 
 
-def manifest(**changes):
+def manifest(runtime="docker", **changes):
     value = validate_manifest({"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk",
-                               "runtime": "docker", "http": {"api_domain": "orders.example.com", "frontend_origins": [],
+                               "runtime": runtime, "http": {"api_domain": "orders.example.com", "frontend_origins": [],
                                "container_port": 8080, "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
                                "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2},
                                "github": {"repository": "Example/orders", "deployment_branch": "main"}})
+    value.update(changes)
+    return value
+
+
+def native_manifest(**changes):
+    value = manifest("native")
+    value["github"] = {"repository": "Example/orders", "deployment_branch": "main",
+                       "build_command": "go build -trimpath -o dist/orders ./cmd/orders",
+                       "binary_path": "dist/orders"}
     value.update(changes)
     return value
 
@@ -84,9 +93,9 @@ class WorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("actionlint"), "actionlint is required to validate Actions expressions")
     def test_generated_workflows_pass_actionlint(self):
-        for branch in ("main", "release/prod"):
-            with self.subTest(branch=branch):
-                value = manifest(github={"repository": "Example/orders", "deployment_branch": branch})
+        for value in (manifest(), manifest(github={"repository": "Example/orders", "deployment_branch": "release/prod"}),
+                      native_manifest()):
+            with self.subTest(runtime=value["runtime"]):
                 result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"],
                                         input=render_workflow(value, tooling_ref=REF),
                                         capture_output=True, text=True, timeout=30)
@@ -189,8 +198,91 @@ class WorkflowTests(unittest.TestCase):
                        {"tooling_ref": REF, "tooling_repository": "evil repo; rm"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(WorkflowError):
                 render_workflow(manifest(), **kwargs)
-        with self.assertRaisesRegex(WorkflowError, "native"):
+        with self.assertRaisesRegex(WorkflowError, "native application needs"):
             render_workflow(manifest(runtime="native"), tooling_ref=REF)
+
+
+@unittest.skipUnless(shutil.which("ruby"), "ruby is used as an independent YAML parser")
+class NativeWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.text = render_workflow(native_manifest(), tooling_ref=REF)
+        self.data = parse(self.text)
+        self.jobs = self.data["jobs"]
+
+    def named(self, job):
+        return {step.get("name"): step for step in self.jobs[job]["steps"]}
+
+    def test_a_native_workflow_builds_uploads_and_deploys_the_binary(self):
+        self.assertEqual(list(self.jobs), ["build", "deploy"])
+        self.assertEqual(self.jobs["deploy"]["needs"], "build")
+        build = self.named("build")
+        self.assertIn("go build -trimpath -o dist/orders ./cmd/orders", build["Build the binary"]["run"])
+        self.assertEqual(build["Build the binary"]["env"]["BINARY_PATH"], "dist/orders")
+        upload = build["Upload the binary"]
+        self.assertEqual(upload["with"]["path"], "dist/orders")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        deploy = self.named("deploy")
+        download = deploy["Download the binary"]
+        self.assertEqual(download["with"]["name"], upload["with"]["name"])
+        self.assertEqual(download["with"]["path"], "${{ runner.temp }}/shiplord-binary")
+        self.assertEqual(deploy["Deploy"]["env"]["BINARY"], "${{ runner.temp }}/shiplord-binary/orders")
+        for fragment in ('shiplord deploy --binary "$BINARY"', '--commit "$GITHUB_SHA"',
+                         '--request-id "gh-${RUN_ID}-${RUN_ATTEMPT}"', "--require-public", "--json"):
+            self.assertIn(fragment, deploy["Deploy"]["run"])
+
+    def test_a_native_workflow_pins_the_same_actions_as_the_docker_one(self):
+        for reference in re.findall(r"uses: (\S+)", self.text):
+            self.assertRegex(reference, r"^[\w./-]+@[0-9a-f]{40}$", reference)
+        for name in ("checkout", "python", "tailscale", "upload-artifact", "download-artifact"):
+            self.assertIn(ACTIONS[name], self.text)
+        docker = render_workflow(manifest(), tooling_ref=REF)
+        self.assertNotIn("upload-artifact", docker)  # the Docker workflow is unchanged
+        self.assertNotIn("download-artifact", docker)
+
+    def test_a_check_only_dispatch_skips_the_build_and_the_download(self):
+        self.assertEqual(self.jobs["build"]["if"], "${{ !inputs.check_only }}")
+        deploy = self.named("deploy")
+        self.assertEqual(deploy["Download the binary"]["if"], "${{ !inputs.check_only }}")
+        self.assertEqual(deploy["Deploy"]["if"], "${{ !inputs.check_only }}")
+        self.assertEqual(deploy["Check access only"]["if"], "${{ inputs.check_only }}")
+        self.assertIn("needs.build.result == 'success'", self.jobs["deploy"]["if"])
+
+    def test_the_build_runs_on_the_runner_for_the_binary_architecture(self):
+        self.assertEqual(self.jobs["build"]["runs-on"], "ubuntu-24.04")
+        arm = parse(render_workflow(native_manifest(), tooling_ref=REF, platforms="linux/arm64"))
+        self.assertEqual(arm["jobs"]["build"]["runs-on"], "ubuntu-24.04-arm")
+
+    def test_no_secret_variable_or_event_value_is_interpolated_into_a_shell_script(self):
+        for job in self.jobs.values():
+            for step in job.get("steps", []):
+                if "run" in step:
+                    self.assertNotIn("${{", step["run"], step.get("name"))
+        self.assertEqual(self.text.count("secrets.SHIPLORD_SSH_PRIVATE_KEY"), 1)
+
+    def test_the_native_workflow_is_deterministic_and_follows_the_deployment_branch(self):
+        self.assertEqual(self.text, render_workflow(native_manifest(), tooling_ref=REF))
+        other = native_manifest(github={"repository": "Example/orders", "deployment_branch": "release/prod",
+                                        "build_command": "make", "binary_path": "build/orders"})
+        data = parse(render_workflow(other, tooling_ref=REF))
+        self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["release/prod"])
+        self.assertIn("github.ref == 'refs/heads/release/prod'", data["jobs"]["deploy"]["if"])
+        deploy = next(s for s in data["jobs"]["deploy"]["steps"] if s.get("name") == "Deploy")
+        self.assertEqual(deploy["env"]["BINARY"], "${{ runner.temp }}/shiplord-binary/orders")
+
+    def test_missing_or_unsafe_build_settings_are_refused(self):
+        base = {"repository": "Example/orders", "deployment_branch": "main"}
+        for github in (base,
+                       base | {"build_command": "make"},
+                       base | {"binary_path": "dist/orders"},
+                       base | {"build_command": "make\nrm -rf /", "binary_path": "dist/orders"},
+                       base | {"build_command": "make", "binary_path": "/usr/local/bin/orders"},
+                       base | {"build_command": "make", "binary_path": "../orders"},
+                       base | {"build_command": "make", "binary_path": "dist//orders"},
+                       base | {"build_command": "", "binary_path": "dist/orders"}):
+            with self.subTest(github=github), self.assertRaises(WorkflowError):
+                render_workflow(native_manifest(github=github), tooling_ref=REF)
+        with self.assertRaisesRegex(WorkflowError, "one binary"):
+            render_workflow(native_manifest(), tooling_ref=REF, platforms="linux/amd64,linux/arm64")
 
 
 if __name__ == "__main__":

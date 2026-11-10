@@ -1030,6 +1030,10 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
                          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
+                         build_command: Optional[str] = typer.Option(None, "--build-command",
+                                                                     help="Native only: the command CI runs to build the binary."),
+                         binary_path: Optional[str] = typer.Option(None, "--binary-path",
+                                                                   help="Native only: the path that command writes the binary to."),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
                          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
@@ -1039,7 +1043,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
-        github.validate_setup_profile(manifest)
+        github.validate_setup_profile(manifest, build_command=build_command, binary_path=binary_path,
+                                      platforms=platforms)
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
         interactive = sys.stdin.isatty() and not json_output
@@ -1052,6 +1057,7 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
         target = load_server(manifest["server"])
         result = github.github_setup(manifest, repo, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                      admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
+                                     build_command=build_command, binary_path=binary_path,
                                      tailscale=settings, force_workflow=force_workflow)
         result["tailscale"] = origin
         return 0, result

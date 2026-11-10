@@ -99,6 +99,26 @@ class ManifestTests(unittest.TestCase):
             self.load('name = "secretvalue')
         self.assertNotIn("secretvalue", str(caught.exception))
 
+    def test_native_github_build_settings_are_optional_but_validated(self):
+        native = MANIFEST.replace('runtime = "docker"', 'runtime = "native"')
+        self.assertNotIn("build_command", self.load(native)["github"])  # every other command still works
+        settings = 'deployment_branch = "main"\nbuild_command = "go build -o dist/orders ./cmd/orders"\nbinary_path = "dist/orders"'
+        loaded = self.load(native.replace('deployment_branch = "main"', settings))
+        self.assertEqual((loaded["github"]["build_command"], loaded["github"]["binary_path"]),
+                         ("go build -o dist/orders ./cmd/orders", "dist/orders"))
+        with self.assertRaisesRegex(ManifestError, "only to native"):
+            self.load(MANIFEST.replace('deployment_branch = "main"', settings))
+
+    def test_native_build_settings_reject_unsafe_values(self):
+        native = MANIFEST.replace('runtime = "docker"', 'runtime = "native"')
+        for command, path in (("make\nrm -rf /", "build/orders"), ("", "build/orders"), ("make", ""),
+                              ("make", "../orders"), ("make", "/usr/local/bin/orders"), ("make", "build//orders"),
+                              ("make", "build/./orders"), ("make", "build/orders/")):
+            settings = (f'deployment_branch = "main"\nbuild_command = {json.dumps(command)}\n'
+                        f'binary_path = {json.dumps(path)}')
+            with self.subTest(command=command, path=path), self.assertRaises(ManifestError):
+                self.load(native.replace('deployment_branch = "main"', settings))
+
     def test_configuration_reports_unusable_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigurationError, "could not create ship.toml"):

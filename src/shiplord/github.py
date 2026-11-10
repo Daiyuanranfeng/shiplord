@@ -26,9 +26,9 @@ from . import tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
-from .manifest import ManifestError, validate_manifest
+from .manifest import (ManifestError, validate_binary_path, validate_build_command, validate_manifest)
 from .servers import SshOptions, _config_home, ssh_command
-from .workflow import TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError, render_workflow
+from .workflow import (TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError, render_workflow, validate_platforms)
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
@@ -249,11 +249,55 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
-def validate_setup_profile(manifest: dict) -> None:
+def _native_build_settings(manifest: dict, build_command: str | None,
+                           binary_path: str | None) -> tuple[str | None, str | None]:
+    """Resolve how CI builds a native binary, refusing before any account, key, or GitHub change.
+
+    The values live in ``[github]`` so a later run needs no flags. A section that predates this feature has no
+    place to write them without rewriting the user's file, so it is refused with the two lines to add.
+    """
+    if manifest["runtime"] != "native":
+        if build_command is not None or binary_path is not None:
+            raise GitHubError("--build-command and --binary-path apply only to native applications", 2, "configuration")
+        return None, None
+    section = manifest.get("github") or {}
+    if section and not (section.get("build_command") and section.get("binary_path")):
+        raise GitHubError("ship.toml already has a [github] section without github.build_command and "
+                          "github.binary_path; add both to that section", 2, "configuration")
+    resolved: dict[str, str | None] = {}
+    for name, given, existing, validate in (
+        ("build_command", build_command, section.get("build_command"), validate_build_command),
+        ("binary_path", binary_path, section.get("binary_path"), validate_binary_path),
+    ):
+        if given is not None:
+            try:
+                given = validate(given)
+            except ManifestError as error:
+                raise GitHubError(str(error), 2, "configuration") from None
+            if existing is not None and existing != given:
+                raise GitHubError(f"ship.toml already names github.{name}; edit it first to change it", 2,
+                                  "configuration")
+        resolved[name] = given if given is not None else existing
+    if not resolved["build_command"] or not resolved["binary_path"]:
+        raise GitHubError("a native application needs the command that builds its binary and the path it writes: "
+                          "pass --build-command and --binary-path, or add github.build_command and "
+                          "github.binary_path to ship.toml", 2, "configuration")
+    return resolved["build_command"], resolved["binary_path"]
+
+
+def validate_setup_profile(manifest: dict, *, build_command: str | None = None,
+                           binary_path: str | None = None,
+                           platforms: str | None = None) -> tuple[str | None, str | None]:
     """Reject unsupported workflow generation before callers collect settings or credentials."""
     if manifest["template"] == "generic":
         raise GitHubError("github setup generates an ADK workflow; generic Docker applications need a custom "
                           "workflow invoking `shiplord deploy`", 2, "configuration")
+    if platforms is not None:
+        try:
+            validate_platforms(manifest["runtime"], platforms)
+        except WorkflowError as error:
+            raise GitHubError(str(error), 2, "configuration") from None
+    return _native_build_settings(manifest, build_command, binary_path)
 
 
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
@@ -275,10 +319,12 @@ def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
 
 def github_setup(manifest: dict, repository: str, *, project: Path, admin: AdminClient, gh: GitHub, admin_target: str,
                  ci_host: str | None = None, tooling_ref: str | None = None, platforms: str = "linux/amd64",
+                 build_command: str | None = None, binary_path: str | None = None,
                  tailscale: Mapping[str, str] | None = None, force_workflow: bool = False, home: Path | None = None,
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                  resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
-    validate_setup_profile(manifest)
+    command, path = validate_setup_profile(manifest, build_command=build_command, binary_path=binary_path,
+                                           platforms=platforms)
     if not _REPOSITORY.fullmatch(repository):
         raise GitHubError("--repo must be owner/repository", 2)
     if "github" in manifest and manifest["github"]["repository"] != repository:
@@ -338,8 +384,9 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         gh.set_variable(repository, name, value)
     steps["variables"] = ", ".join(sorted(variables))
 
-    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms, force_workflow)
-    _ensure_manifest_github(project, manifest, repository)
+    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms,
+                                        command, path, force_workflow)
+    _ensure_manifest_github(project, manifest, repository, command, path)
     steps["manifest"] = f"ship.toml names {repository}"
     remaining = []
     extra: dict = {}
@@ -371,16 +418,17 @@ def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
 
 
 def _write_workflow(manifest: dict, repository: str, project: Path, state: dict, directory: Path,
-                    tooling_ref: str | None, platforms: str, force: bool) -> str:
-    if manifest["runtime"] != "docker":
-        return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
+                    tooling_ref: str | None, platforms: str, build_command: str | None, binary_path: str | None,
+                    force: bool) -> str:
     ref = tooling_ref or detect_tooling_ref()
     if ref is None:
         raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
                           "pushed to GitHub)", 2, "workflow")
+    github = {"repository": repository, **manifest.get("github", {"deployment_branch": "main"})}
+    if build_command is not None:
+        github.update(build_command=build_command, binary_path=binary_path)
     try:
-        text = render_workflow(dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})}),
-                               tooling_ref=ref, platforms=platforms)
+        text = render_workflow(dict(manifest, github=github), tooling_ref=ref, platforms=platforms)
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
     path = project / WORKFLOW_PATH
@@ -401,7 +449,8 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     return f"written ({WORKFLOW_PATH}, Shiplord pinned at {ref[:12]})"
 
 
-def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:
+def _ensure_manifest_github(project: Path, manifest: dict, repository: str, build_command: str | None = None,
+                            binary_path: str | None = None) -> None:
     """Add the [github] section to ship.toml if the file (not just the loaded dict) lacks it."""
     import tomllib
     path = project / "ship.toml"
@@ -413,8 +462,14 @@ def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> N
     if "github" in existing:
         if existing["github"].get("repository") != repository:
             raise GitHubError(f"ship.toml names {existing['github'].get('repository')}, not {repository}", 2, "manifest")
+        if manifest["runtime"] == "native" and (existing["github"].get("build_command") != build_command
+                                                or existing["github"].get("binary_path") != binary_path):
+            raise GitHubError("ship.toml names different native build settings; edit [github] first", 2, "manifest")
         return
-    text += ("" if text.endswith("\n") else "\n") + f'\n[github]\nrepository = "{repository}"\ndeployment_branch = "main"\n'
+    lines = [f'repository = "{repository}"', 'deployment_branch = "main"']
+    if manifest["runtime"] == "native":
+        lines += [f"build_command = {json.dumps(build_command)}", f"binary_path = {json.dumps(binary_path)}"]
+    text += ("" if text.endswith("\n") else "\n") + "\n[github]\n" + "\n".join(lines) + "\n"
     try:
         validate_manifest(tomllib.loads(text))
     except (ManifestError, ValueError):

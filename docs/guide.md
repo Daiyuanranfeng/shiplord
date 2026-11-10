@@ -84,6 +84,13 @@ x86-64 and arm64 are supported), for example in CI. The binary is uploaded over 
 verified by size, SHA-256 and ELF header on the server, and run as an unprivileged account under a confined
 systemd unit.
 
+`shiplord github setup --repo <owner>/<repository> --build-command '<build command>' --binary-path dist/orders`
+writes a release workflow that runs that command on a hosted runner, uploads the binary as an artifact, and
+deploys it with `shiplord deploy --binary`. The two values are recorded in the manifest's `[github]` section,
+so later runs need no flags. Use `--platforms linux/arm64` to build on an arm64 runner for an arm64 server;
+a native workflow builds one architecture at a time. It has no quality job of its own, so run your tests in
+the build command or in a separate workflow.
+
 ## Existing Docker applications
 
 Use the generic profile to deploy an existing image without Google ADK settings. In a terminal, run
@@ -114,7 +121,8 @@ files belong to the application and can survive a profile change.
 `configure` defaults to `google-adk` for compatibility. `init` still scaffolds only `google-adk`, and native
 binaries still require that profile. `github setup` generates the ADK template's workflow and refuses generic
 applications before creating keys or changing GitHub; use a custom workflow that builds your image, runs
-your application's checks, and invokes `shiplord deploy` by digest.
+your application's checks, and invokes `shiplord deploy` by digest. A native application needs its build
+command and binary path; a `[github]` section that predates them is refused with the two lines to add.
 
 The CLI requires the helper capability `docker_generic_v1` before submitting a generic plan or deploy.
 Upgrade with `shiplord server bootstrap` when it is missing. Do not downgrade to a helper that cannot read

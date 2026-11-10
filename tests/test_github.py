@@ -335,12 +335,78 @@ class SetupTests(GitHubTestCase):
         with patch("shiplord.github.detect_tooling_ref", return_value="ef" * 20):
             self.assertIn("efefefefefef", self.setup_call(tooling_ref=None)["steps"]["workflow"])
 
-    def test_native_applications_get_credentials_but_no_generated_workflow(self):
+    def test_native_applications_get_credentials_and_a_workflow_that_builds_and_deploys(self):
         (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
-        result = self.setup_call(manifest=manifest("native"))
-        self.assertIn("skipped", result["steps"]["workflow"])
-        self.assertFalse((self.project / WORKFLOW_PATH).exists())
+        command, path = "go build -trimpath -o dist/orders ./cmd/orders", "dist/orders"
+        result = self.setup_call(manifest=manifest("native"), build_command=command, binary_path=path)
+        self.assertIn(f"written ({WORKFLOW_PATH}", result["steps"]["workflow"])
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn(command, text)
+        self.assertIn("Upload the binary", text)
+        self.assertIn("actions/upload-artifact@", text)
+        self.assertIn("actions/download-artifact@", text)
+        self.assertIn('shiplord deploy --binary "$BINARY"', text)
+        expected = render_workflow(manifest("native") | {"github": {"repository": "Example/orders",
+                                   "deployment_branch": "main", "build_command": command, "binary_path": path}},
+                                   tooling_ref=REF)
+        self.assertEqual(text, expected)
+        manifest_text = (self.project / "ship.toml").read_text()
+        self.assertIn(f'build_command = "{command}"', manifest_text)
+        self.assertIn(f'binary_path = "{path}"', manifest_text)
         self.assertIn(SECRET_NAME, self.gh_runner.secrets)
+
+    def test_native_setup_reuses_the_build_settings_recorded_in_the_manifest(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        self.setup_call(manifest=manifest("native"), build_command="make", binary_path="build/orders")
+        stored = manifest("native") | {"github": {"repository": "Example/orders", "deployment_branch": "main",
+                                                  "build_command": "make", "binary_path": "build/orders"}}
+        second = self.setup_call(manifest=stored)
+        self.assertIn("unchanged", second["steps"]["workflow"])
+        self.assertIn('build_command = "make"', (self.project / "ship.toml").read_text())
+
+    def test_native_setup_without_build_settings_is_refused_before_any_change(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        before = (self.project / "ship.toml").read_bytes()
+        with patch.object(github, "generate_ci_key", side_effect=AssertionError("must not create a key")):
+            with self.assertRaisesRegex(GitHubError, "--build-command") as caught:
+                self.setup_call(manifest=manifest("native"))
+        self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertFalse((self.project / WORKFLOW_PATH).exists())
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+
+    def test_native_setup_refuses_an_existing_github_section_without_build_settings(self):
+        native = MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"')
+        (self.project / "ship.toml").write_text(native + '\n[github]\nrepository = "Example/orders"\ndeployment_branch = "main"\n')
+        with self.assertRaisesRegex(GitHubError, "add both"):
+            self.setup_call(manifest=manifest("native", with_github=True), build_command="make", binary_path="build/orders")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_native_build_flags_are_refused_for_a_docker_application(self):
+        with self.assertRaisesRegex(GitHubError, "only to native"):
+            self.setup_call(build_command="make")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_a_build_setting_that_differs_from_the_manifest_is_refused(self):
+        stored = manifest("native") | {"github": {"repository": "Example/orders", "deployment_branch": "main",
+                                                  "build_command": "make", "binary_path": "build/orders"}}
+        with self.assertRaisesRegex(GitHubError, "already names github.build_command"):
+            self.setup_call(manifest=stored, build_command="make release")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_unsafe_native_build_settings_are_refused_before_any_change(self):
+        for build_command, binary_path in (("make\nrm -rf /", "build/orders"), ("make", "../orders"),
+                                           ("make", "/usr/local/bin/orders"), ("make", "build//orders")):
+            with self.subTest(build_command=build_command, binary_path=binary_path):
+                with self.assertRaises(GitHubError) as caught:
+                    self.setup_call(manifest=manifest("native"), build_command=build_command, binary_path=binary_path)
+                self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        with self.assertRaisesRegex(GitHubError, "one binary"):
+            self.setup_call(manifest=manifest("native"), build_command="make", binary_path="build/orders",
+                            platforms="linux/amd64,linux/arm64")
+        self.assertEqual(self.gh_runner.calls, [])
 
     def test_tailscale_settings_a_custom_ci_host_and_a_nondefault_port_are_carried_through(self):
         result = self.setup_call(ci_host="tail.example.ts.net", resolve=lambda host: (host, 2222),
@@ -356,7 +422,9 @@ class SetupTests(GitHubTestCase):
         given = " ".join(self.setup_call(tailscale={"SHIPLORD_TS_CLIENT_ID": "id", "SHIPLORD_TS_AUDIENCE": "aud"})["remaining"])
         self.assertNotIn("--tailscale-client-id", given)
         self.assertIn("tag:ci", given)
-        native = " ".join(self.setup_call(manifest=manifest("native"))["remaining"])
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        native = " ".join(self.setup_call(
+            manifest=manifest("native"), build_command="make", binary_path="build/orders")["remaining"])
         self.assertNotIn("registry login", native)
 
     def test_without_tailscale_settings_the_result_carries_the_exact_subject_for_immutable_subjects(self):
