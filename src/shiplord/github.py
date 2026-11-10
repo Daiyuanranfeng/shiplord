@@ -147,13 +147,40 @@ class GitHub:
 
 # --- local state -----------------------------------------------------------------
 
-def ci_directory(application_id: str, home: Path | None = None) -> Path:
+def ci_directory(application_id: str, server: str, home: Path | None = None) -> Path:
+    """The private per-server, per-application directory; state from the earlier layout is moved into it."""
     base = (home / "shiplord") if home else (_config_home() / "shiplord")
-    directory = base / "ci" / application_id
+    root = base / "ci"
+    directory = root / server / application_id
     directory.mkdir(parents=True, exist_ok=True)
-    for path in (base, base / "ci", directory):
+    for path in (base, root, root / server, directory):
         os.chmod(path, 0o700)
+    _migrate_legacy_state(root / application_id, directory)
     return directory
+
+
+def _migrate_legacy_state(legacy: Path, directory: Path) -> None:
+    """Move state written at ``ci/<app>`` into the server-scoped directory; never overwrite newer state.
+
+    A private key retained by an interrupted setup moves with the state, so its recorded path is rewritten.
+    Migration is best effort: an unmovable directory costs at most one extra key, never a failed command.
+    """
+    if legacy == directory or legacy.is_symlink() or not legacy.is_dir() or (directory / "state.json").exists():
+        return
+    try:
+        for entry in sorted(legacy.iterdir()):
+            if entry.is_file() and not entry.is_symlink():
+                os.replace(entry, directory / entry.name)
+        legacy.rmdir()
+        state = _load_state(directory)
+        private = state.get("private_key")
+        if isinstance(private, str) and Path(private).parent == legacy:
+            moved = directory / Path(private).name
+            if moved.is_file():
+                state["private_key"] = str(moved)
+                _save_state(directory, state)
+    except OSError:
+        pass
 
 
 def _load_state(directory: Path) -> dict:
@@ -187,6 +214,17 @@ def generate_ci_key(directory: Path, application_id: str, name: str) -> tuple[Pa
 
 def label_for(fingerprint: str) -> str:
     return "ci-" + re.sub(r"[^a-z0-9]", "", fingerprint.split(":", 1)[1].lower())[:8]
+
+
+def ci_key_labels(listed: list[dict]) -> list[str]:
+    """The labels Shiplord derives from a key's own fingerprint; a key whose label does not match is not ours."""
+    labels = []
+    for item in listed:
+        label, fingerprint = item.get("label"), item.get("fingerprint")
+        if isinstance(label, str) and isinstance(fingerprint, str) and fingerprint.startswith("SHA256:"):
+            if label == label_for(fingerprint):
+                labels.append(label)
+    return sorted(labels)
 
 
 # --- host keys ------------------------------------------------------------------------
@@ -295,7 +333,7 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
     host, port = resolve(admin_target.partition("@")[2])
     server_host = ci_host or host
     keys = (host_keys or (lambda target: fetch_host_keys(target, runner)))(admin_target)
-    directory = ci_directory(app, home)
+    directory = ci_directory(app, manifest["server"], home)
     state = _load_state(directory)
     reuse = bool(state.get("fingerprint")) and state.get("repository") == repository and state.get("secret_set")
     private: Path | None = None
@@ -427,13 +465,21 @@ def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> N
 def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: str, home: Path | None = None,
                runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
-    """Replace the CI key: add, prove, store in GitHub, and only then remove the old key."""
+    """Replace the CI key: add, prove, store in GitHub, and only then remove the old key.
+
+    The key to replace is found in the server's authorized-keys list, so rotation works from a machine that never
+    ran setup. Only labels Shiplord derives from a key's own fingerprint are ever removed.
+    """
     app = manifest["name"]
-    directory = ci_directory(app, home)
+    if "github" not in manifest:
+        raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
+    repository = manifest["github"]["repository"]
+    old_labels = ci_key_labels(admin.call("keys", app, {"operation": "list"})["keys"])
+    if not old_labels:
+        raise GitHubError("no CI key is registered on the server for this application; run "
+                          "`shiplord github setup` first", 2)
+    directory = ci_directory(app, manifest["server"], home)
     state = _load_state(directory)
-    if not state.get("secret_set") or not state.get("label") or "github" not in manifest:
-        raise GitHubError("no completed CI setup was found for this application; run `shiplord github setup` first", 2)
-    repository, old_label = manifest["github"]["repository"], state["label"]
     host, port = resolve(admin_target.partition("@")[2])
     keys = (host_keys or (lambda target: fetch_host_keys(target, runner)))(admin_target)
     private, public = generate_ci_key(directory, app, f"rotate-{os.getpid()}")
@@ -456,16 +502,34 @@ def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: 
     finally:
         for leftover in (private, Path(str(private) + ".pub")):
             leftover.unlink(missing_ok=True)
-    state.update(label=new_label, fingerprint=fingerprint)
-    _save_state(directory, state)
-    try:
-        admin.call("keys", app, {"operation": "remove", "label": old_label})
-    except ClientError as error:
-        raise GitHubError(f"the new key is live, but the old key {old_label} could not be removed: {error}", error.code,
-                          "revoke") from None
-    return {"ok": True, "repository": repository, "old_label": old_label, "key_label": new_label, "key_fingerprint": fingerprint,
+    state.update(repository=repository, label=new_label, fingerprint=fingerprint, secret_set=True)
+    try:  # a failed cache write must not stop the revocation that keeps one CI key registered
+        _save_state(directory, state)
+    except OSError:
+        pass
+    _revoke_keys(admin, app, old_labels)
+    return {"ok": True, "repository": repository, "old_label": old_labels[0] if len(old_labels) == 1 else None,
+            "old_labels": old_labels, "key_label": new_label, "key_fingerprint": fingerprint,
             "steps": {"register": new_label, "ssh_check": "the new key authenticated", "secret": f"{SECRET_NAME} updated",
-                      "revoke": f"{old_label} removed"}}
+                      "revoke": f"{', '.join(old_labels)} removed"}}
+
+
+def _revoke_keys(admin: AdminClient, application_id: str, labels: list[str]) -> None:
+    """Remove every stale CI key; a failure is reported with the new key already live and stored."""
+    failures: list[tuple[str, ClientError]] = []
+    for label in labels:
+        try:
+            admin.call("keys", application_id, {"operation": "remove", "label": label})
+        except ClientError as error:
+            failures.append((label, error))
+    if not failures:
+        return
+    if len(failures) == 1:
+        label, error = failures[0]
+        raise GitHubError(f"the new key is live, but the old key {label} could not be removed: {error}", error.code,
+                          "revoke") from None
+    raise GitHubError(f"the new key is live, but these old keys could not be removed: "
+                      f"{', '.join(label for label, _ in failures)}", failures[0][1].code, "revoke") from None
 
 
 def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClient | None = None,
@@ -473,7 +537,7 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
     if "github" not in manifest:
         raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
     app, repository = manifest["name"], manifest["github"]["repository"]
-    state = _load_state(ci_directory(app, home))
+    state = _load_state(ci_directory(app, manifest["server"], home))
     checks: dict[str, dict] = {}
     permission = gh.permission(repository)
     checks["access"] = {"ok": permission in WRITE_PERMISSIONS, "account": gh.account(), "permission": permission}

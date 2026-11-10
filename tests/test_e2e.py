@@ -360,8 +360,10 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.assertEqual((variables / "SHIPLORD_TS_CLIENT_ID").read_text(), "client123")
         workflow = (self.project / ".github" / "workflows" / "shiplord-release.yml").read_text()
         self.assertIn("ab" * 20, workflow)
-        self.assertEqual(oct((self.config / "shiplord" / "ci" / self.app).stat().st_mode & 0o777), "0o700")
-        self.assertEqual([p.name for p in (self.config / "shiplord" / "ci" / self.app).iterdir()], ["state.json"])
+        ci = self.config / "shiplord" / "ci" / "production" / self.app  # scoped by server as well as application
+        self.assertEqual(oct(ci.stat().st_mode & 0o777), "0o700")
+        self.assertEqual([p.name for p in ci.iterdir()], ["state.json"])
+        self.assertFalse((self.config / "shiplord" / "ci" / self.app).exists())  # nothing is written at the old path
         type(self).first_label = result["key_label"]
         type(self).first_secret = (secrets / "SHIPLORD_SSH_PRIVATE_KEY").read_bytes()
 
