@@ -113,19 +113,23 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "backup", "restore", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
         bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}) if False else ("logs", {"tail": 0}),
                ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}), ("deploy", {}),
                ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}), ("rollback", {"x": 1}),
-               ("recover", {"x": 1})]
+               ("recover", {"x": 1}), ("backup", {"x": 1}), ("restore", {}),
+               ("restore", {"archive": "../escape.tar.gz"}), ("restore", {"archive": "a.tar.gz", "latest": True}),
+               ("restore", {"latest": "yes"})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
         with self.assertRaises(ProtocolError):
             self.call("rollback", commit="a" * 40)
+        with self.assertRaises(ProtocolError):
+            self.call("backup", commit="a" * 40)
         with self.assertRaises(ProtocolError):
             self.call("deploy", commit="a" * 40, sequence=1, artifact={}, configuration={}, allow_older="yes")
         self.assertEqual(self.factory_calls, 0)
@@ -250,6 +254,25 @@ class DeployJobTests(HelperTestCase):
             response, code = self.call(action, f"{action}-1")
             self.assertEqual((code, response["job"]["action"]), (0, action))
         self.assertEqual([r for _, r in self.launcher.launched], ["rollback-1", "recover-1"])
+
+    def test_backup_and_restore_become_jobs_and_run_through_the_worker(self):
+        data = self.layout.data / "orders"
+        data.mkdir(parents=True)
+        (data / "state.db").write_bytes(b"sqlite")
+        self.runtime.data_root_path = data
+        response, code = self.call("backup", "backup-1")
+        self.assertEqual((code, response["job"]["action"]), (0, "backup"))
+        self.assertEqual(run_job(self.services, "orders", "backup-1"), 0)
+        backup = self.call("status", job_id="backup-1")[0]["result"]["job"]
+        self.assertEqual((backup["outcome"]["status"], backup["outcome"]["detail"]["verified"]), ("succeeded", True))
+        name = backup["outcome"]["detail"]["archive"]
+        (data / "state.db").write_bytes(b"changed")
+        response, code = self.call("restore", "restore-1", archive=name)
+        self.assertEqual((code, response["job"]["action"]), (0, "restore"))
+        self.assertEqual(run_job(self.services, "orders", "restore-1"), 0)
+        restored = self.call("status", job_id="restore-1")[0]["result"]["job"]
+        self.assertEqual(restored["outcome"]["status"], "succeeded")
+        self.assertEqual((data / "state.db").read_bytes(), b"sqlite")
 
 
 class WorkerTests(HelperTestCase):

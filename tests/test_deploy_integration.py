@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import FakeCaddy  # noqa: E402
 from shiplord import registry, release_state  # noqa: E402
+from shiplord.backup import BackupManager, read_manifest  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import Probes  # noqa: E402
@@ -555,6 +556,59 @@ class RealDockerDeployTests(unittest.TestCase):
     def runtime_rollback(self, request_id):
         with self.lock.acquire():
             return self.deployer.rollback(request_id)
+
+    def manager(self):
+        return BackupManager(registration=self.registration, state=self.state, runtime=self.runtime,
+                             layout=self.layout)
+
+    def wipe_data(self):
+        """Delete the volume's contents as a lost disk would; the container keeps running with nothing to read."""
+        data_root = self.runtime.data_root(self.registration)
+        for entry in data_root.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        self.assertEqual(list(data_root.iterdir()), [])
+
+    def test_zzz_backup_wipe_and_restore_round_trip(self):
+        """Back up, destroy the data, restore it, and refuse a corrupt archive without touching live data."""
+        self.assertOutcome(self.deploy("req-b1", "v1", 9000), "succeeded")
+        before_rows = json.loads(self.get("/sqlite"))
+        before_counter = int(self.get("/counter"))
+        with self.lock.acquire():
+            backed_up = self.manager().backup()
+        self.assertOutcome(backed_up, "succeeded")
+        self.assertTrue(backed_up.detail["verified"])
+        name = backed_up.detail["archive"]
+        archive = self.layout.backups / self.app / name
+        self.assertEqual(oct(archive.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(read_manifest(archive.with_name(name + ".json")).archive, name)
+
+        self.wipe_data()
+        with self.lock.acquire():
+            restored = self.manager().restore({"archive": name})
+        self.assertOutcome(restored, "succeeded")
+        self.assertTrue(restored.detail["verified"])
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertEqual(json.loads(self.get("/sqlite")), before_rows + ["v1"])
+        self.assertEqual(int(self.get("/counter")), before_counter + 1)
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
+        with self.lock.acquire():
+            second = self.manager().backup()
+        self.assertOutcome(second, "succeeded")
+        corrupt = self.layout.backups / self.app / second.detail["archive"]
+        with corrupt.open("r+b") as file:
+            file.seek(20)
+            file.write(b"\x00")
+        live_counter = int(self.get("/counter"))
+        with self.lock.acquire():
+            refused = self.manager().restore({"archive": second.detail["archive"]})
+        self.assertOutcome(refused, "failed")
+        self.assertEqual(refused.detail["error"], "checksum_mismatch")
+        self.assertEqual(int(self.get("/counter")), live_counter + 1)  # the live data was never replaced
+        self.assertEqual(self.get("/version"), "v1")
 
 
 if __name__ == "__main__":

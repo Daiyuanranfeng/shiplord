@@ -1,4 +1,4 @@
-"""Runs one queued job (deploy, rollback, or recover) as root, outside any SSH session.
+"""Runs one queued job (deploy, rollback, recover, backup, or restore) as root, outside any SSH session.
 
 Started by the privileged helper as a transient service. It pulls the image the job needs before it takes the host
 lock, runs the transaction under the lock, and records the outcome in the job file so a client can read it later.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
+from .backup import BackupManager
 from .deploy import Deployer
 from .jobs import JobError
 from .manifest import ManifestError, validate_app_name
@@ -39,6 +40,12 @@ def run_job(services: HostServices, application_id: str, request_id: str) -> int
                     result = deployer.deploy({**record["request"], "request_id": request_id})
                 elif record["action"] == "rollback":
                     result = deployer.rollback(request_id)
+                elif record["action"] in ("backup", "restore"):
+                    manager = BackupManager(
+                        registration=session.registration, state=session.state, runtime=deployer.runtime,
+                        layout=session.services.layout,
+                        progress=lambda phase: session.jobs.set_phase(request_id, phase))
+                    result = manager.backup() if record["action"] == "backup" else manager.restore(record["request"])
                 else:
                     result = deployer.recover()
                 outcome = _outcome(result.status, result.exit_code, result.detail)

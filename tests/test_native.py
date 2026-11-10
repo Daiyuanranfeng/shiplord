@@ -391,5 +391,26 @@ class DiscardTests(RuntimeTestCase):
         self.assertTrue((elsewhere / "precious").exists())
 
 
+class DataRootTests(RuntimeTestCase):
+    def test_the_data_directory_is_returned_when_it_exists(self):
+        data = self.layout.data / "orders"
+        data.mkdir(parents=True)
+        self.assertEqual(self.runtime.data_root(REGISTRATION), data)
+
+    def test_a_missing_data_directory_is_refused_as_no_data(self):
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.data_root(REGISTRATION)
+        self.assertEqual((caught.exception.phase, caught.exception.kind), ("storage", "no_data"))
+
+    def test_a_symlinked_data_directory_is_refused(self):
+        elsewhere = Path(self.temp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (self.layout.data).mkdir(parents=True)
+        (self.layout.data / "orders").symlink_to(elsewhere)
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.data_root(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "no_data")
+
+
 if __name__ == "__main__":
     unittest.main()

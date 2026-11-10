@@ -29,7 +29,7 @@ MAX_PENDING_JOBS = 4  # unfinished jobs per application; further submissions are
 INTERRUPTED_SECONDS = MAX_RUNTIME_SECONDS + 300
 _UNIT_ID_LENGTH = 24  # a request ID that fits stays readable in the unit name; a longer one is hashed whole
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
-ACTIONS = ("deploy", "rollback", "recover")
+ACTIONS = ("deploy", "rollback", "recover", "backup", "restore")
 TERMINAL = ("finished",)
 
 

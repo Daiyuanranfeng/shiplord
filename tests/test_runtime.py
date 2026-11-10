@@ -599,5 +599,55 @@ class StorageMountTests(RuntimeTestCase):
         self.assertEqual(self.docker.sub("volume rm"), [])
 
 
+class VolumeDocker(FakeDocker):
+    """A daemon whose first volume inspect describes the volume and whose second reports its mountpoint."""
+
+    def __init__(self, mountpoint: str, *, exists: bool = True):
+        super().__init__()
+        self.mountpoint, self.exists, self.volume_calls = mountpoint, exists, 0
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        if argv[1:3] == ["volume", "inspect"]:
+            self.calls.append(argv)
+            self.volume_calls += 1
+            if not self.exists:
+                return CommandResult(1, "Error: No such volume: shiplord-orders-artifacts")
+            return LABELLED_VOLUME if self.volume_calls == 1 else CommandResult(0, self.mountpoint + "\n")
+        return super().run(argv, input=input, timeout=timeout, max_output=max_output)
+
+
+class DataRootTests(RuntimeTestCase):
+    def runtime_for(self, mountpoint: str, *, exists: bool = True) -> DockerRuntime:
+        return DockerRuntime(VolumeDocker(mountpoint, exists=exists), self.layout, platform_name="linux/amd64")
+
+    def test_the_volume_mountpoint_is_returned_when_it_is_a_directory(self):
+        data = Path(self.temp.name) / "volume" / "_data"
+        data.mkdir(parents=True)
+        self.assertEqual(self.runtime_for(str(data)).data_root(REGISTRATION), data)
+
+    def test_a_missing_volume_is_refused_as_no_data(self):
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime_for("/var/lib/docker/volumes/x/_data", exists=False).data_root(REGISTRATION)
+        self.assertEqual((caught.exception.phase, caught.exception.kind), ("storage", "no_data"))
+
+    def test_an_unusable_mountpoint_is_refused(self):
+        file_path = Path(self.temp.name) / "not-a-directory"
+        file_path.write_text("x")
+        link = Path(self.temp.name) / "link"
+        link.symlink_to(file_path.parent)
+        for mountpoint in ("relative/path", "/", str(file_path), str(link)):
+            with self.subTest(mountpoint=mountpoint), self.assertRaises(RuntimeFailure) as caught:
+                self.runtime_for(mountpoint).data_root(REGISTRATION)
+            self.assertEqual(caught.exception.kind, "no_data")
+
+    def test_a_daemon_error_other_than_absence_is_not_reported_as_no_data(self):
+        docker = VolumeDocker("/var/lib/docker/volumes/x/_data")
+        docker.run = lambda argv, **options: CommandResult(1, "Cannot connect to the Docker daemon")
+        with self.assertRaises(RuntimeFailure) as caught:
+            DockerRuntime(docker, self.layout, platform_name="linux/amd64").data_root(REGISTRATION)
+        self.assertEqual((caught.exception.phase, caught.exception.kind), ("storage", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

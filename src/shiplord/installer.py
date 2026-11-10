@@ -424,7 +424,8 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
     for directory, mode in ((layout.path("/etc/shiplord"), 0o755), (layout.registrations, 0o700),
                             (layout.environments, 0o700), (layout.authorized_keys, 0o755),
                             (layout.var, 0o755), (layout.app_state, 0o700), (layout.jobs, 0o700),
-                            (layout.data, 0o755), (layout.releases, 0o755), (layout.lib, 0o755)):
+                            (layout.backups, 0o700), (layout.data, 0o755), (layout.releases, 0o755),
+                            (layout.lib, 0o755)):
         _ensure_dir(directory, mode)
     name, files = _build_payload(source)
     changed["code"] = _install_version(layout, name, files)

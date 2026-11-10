@@ -646,6 +646,15 @@ def _render_operation(code: int, result: dict, target: str, operation: str) -> N
             continue
         if result.get(name) is not None:
             typer.echo(f"{name.replace('_', ' ').capitalize()}: {result[name]}")
+    if operation in ("backup", "restore"):
+        for name in ("archive", "sha256", "size", "entries", "bytes"):
+            if result.get(name) is not None:
+                typer.echo(f"{name.capitalize()}: {result[name]}")
+        if result.get("verified") is True:
+            typer.echo("Verified: yes")
+        application = result.get("application")
+        if isinstance(application, dict) and application.get("restarted"):
+            typer.echo(f"Application: {'running' if application.get('running') else 'did not start again'}")
     if operation == "plan":
         _render_plan_details(result)
     elif operation == "deployment":
@@ -961,6 +970,34 @@ def recover(json_output: bool = typer.Option(False, "--json")) -> None:
     manifest = _manifest(json_output)
     _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover",
                                               on_progress=_progress(json_output)), json_output)
+
+
+@app.command(rich_help_panel="Administration")
+def backup(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Archive this application's persistent data on the server and verify the archive."""
+    manifest = _manifest(json_output)
+    _execute(lambda: commands.backup_application(manifest, _helper(manifest), on_progress=_progress(json_output)),
+             json_output, lambda code, result: _render_operation(
+                 code, result, f"{manifest['name']} on {manifest['server']}", "backup"))
+
+
+@app.command(rich_help_panel="Administration")
+def restore(archive: Optional[str] = typer.Option(None, "--archive", help="An archive name reported by `shiplord backup`."),
+            latest: bool = typer.Option(False, "--latest", help="Use the most recent backup."),
+            yes: bool = typer.Option(False, "--yes", help="Confirm that this application's live data is replaced."),
+            json_output: bool = typer.Option(False, "--json")) -> None:
+    """Replace this application's persistent data with a verified backup."""
+    manifest = _manifest(json_output)
+    if not yes:
+        _fail(f"a restore replaces {manifest['name']}'s live data on the server; rerun with --yes to confirm", 2,
+              json_output)
+
+    def action() -> tuple[int, dict]:
+        arguments = commands.restore_arguments(archive, latest)  # validated before any connection is made
+        return commands.restore_application(manifest, _helper(manifest), arguments,
+                                            on_progress=_progress(json_output))
+    _execute(action, json_output, lambda code, result: _render_operation(
+        code, result, f"{manifest['name']} on {manifest['server']}", "restore"))
 
 
 @env_app.command("set")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from shiplord.probes import ProbeFailure
 from shiplord.registry import validate_registration
 from shiplord.routing import RoutingError
@@ -41,6 +43,7 @@ class FakeRuntime:
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
         self.discarded: list[str] = []
+        self.data_root_path: Path | None = None
 
     def pull(self, registration, release):
         self.calls.append(("pull", release_id(release)))
@@ -77,6 +80,13 @@ class FakeRuntime:
     def discard(self, registration, release):
         self.discarded.append(release["artifact"]["image"])
         return []
+
+    def data_root(self, registration):
+        self.calls.append(("data_root",))
+        if self.data_root_path is None:
+            raise RuntimeFailure("this application has no data volume to back up; nothing was changed", "storage",
+                                 kind="no_data")
+        return self.data_root_path
 
     def names(self):
         return [c[0] for c in self.calls]
