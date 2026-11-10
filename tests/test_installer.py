@@ -9,23 +9,48 @@ import unittest
 from pathlib import Path
 
 import shiplord
-from shiplord.installer import CLIENT_MODULES, BootstrapError, bootstrap, helper_modules
+from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, SSHD_DROPIN, BootstrapError, bootstrap,
+                                helper_modules)
 from shiplord.layout import Layout, deployment_user
 from shiplord.routing import RoutingError
-from shiplord.system import CommandResult
+from shiplord.system import TRUNCATION_MARKER, CommandResult
 
 SOURCE = Path(shiplord.__file__).parent
+EXPECTED_DROPIN = """\
+# Managed by Shiplord. Confines deployment accounts to the forced-command dispatcher.
+Match Group shiplord-deploy
+    AuthorizedKeysFile /etc/shiplord/authorized_keys/%u
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PermitTTY no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    GatewayPorts no
+"""
 
 
 class FakeSystem:
+    """Records commands and models the account database that group membership needs."""
+
     def __init__(self):
         self.calls = []
         self.results = {}
         self.units = {"ssh.service"}
         self.active = set()
+        self.accounts = {}  # name -> passwd comment
+        self.groups = {}  # name -> members
+        self.truncate_passwd = False
 
-    def run(self, argv, *, input=None, timeout=60):
-        self.calls.append(list(argv))
+    def run(self, argv, *, input=None, timeout=60, max_output=None):
+        argv = list(argv)
+        self.calls.append(argv)
+        tool = argv[0].rsplit("/", 1)[-1]
         if argv[0].endswith("systemctl"):
             command = argv[1]
             if command == "list-unit-files":
@@ -34,7 +59,25 @@ class FakeSystem:
             if command == "is-active":
                 return CommandResult(0 if argv[-1] in self.active else 3, "")
             return self.results.get(argv[-1], CommandResult(0, ""))
-        return self.results.get(argv[0].rsplit("/", 1)[-1], CommandResult(0, ""))
+        if tool == "getent" and argv[1] == "group":
+            members = self.groups.get(argv[2])
+            return CommandResult(2, "") if members is None else CommandResult(
+                0, f"{argv[2]}:x:990:{','.join(sorted(members))}\n")
+        if tool == "getent" and argv[1] == "passwd":
+            listing = "".join(f"{name}:x:1000:1000:{comment}:/:/bin/sh\n"
+                              for name, comment in sorted(self.accounts.items()))
+            return CommandResult(0, TRUNCATION_MARKER + listing if self.truncate_passwd else listing)
+        if tool == "groupadd":
+            if tool in self.results:
+                return self.results[tool]
+            self.groups.setdefault(argv[-1], set())
+            return CommandResult(0, "")
+        if tool == "usermod":
+            if tool in self.results:
+                return self.results[tool]
+            self.groups.setdefault(argv[argv.index("--groups") + 1], set()).add(argv[-1])
+            return CommandResult(0, "")
+        return self.results.get(tool, CommandResult(0, ""))
 
 
 class FakeCaddy:
@@ -124,6 +167,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertEqual(self.system.calls[0][:2], ["/usr/bin/systemctl", "list-unit-files"])
         self.assertIn(["/usr/sbin/sshd", "-t"], self.system.calls)
         self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
+        self.assertEqual(self.system.calls[-2:], [["/usr/sbin/sshd", "-t"],
+                                                  ["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"]])
 
     def test_second_run_changes_nothing(self):
         first = self.run_bootstrap()
@@ -133,7 +178,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertEqual(second["version"], first["version"])
         self.assertFalse(any(second["changed"].values()), second)
         self.assertEqual({str(p): p.read_bytes() for p in self.prefix.rglob("*") if p.is_file()}, before)
-        self.assertEqual([call[:2] for call in self.system.calls[calls:]], [["/usr/bin/systemctl", "list-unit-files"]])
+        self.assertEqual([[call[0].rsplit("/", 1)[-1], *call[1:2]] for call in self.system.calls[calls:]],
+                         [["systemctl", "list-unit-files"], ["getent", "group"], ["getent", "passwd"]])
         self.assertEqual(self.caddy.reloaded, 1)
 
     def test_changed_code_installs_a_new_version_and_keeps_the_old_one(self):
@@ -288,6 +334,71 @@ class SshdTests(InstallerTestCase):
     def test_failed_reload_restores_and_reports(self):
         self.system.results["ssh.service"] = CommandResult(1, "failed")
         with self.assertRaisesRegex(BootstrapError, "reload"):
+            self.run_bootstrap()
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+
+class SshdPolicyTests(unittest.TestCase):
+    def test_the_rendered_dropin_matches_the_deployment_group_and_disables_ca_authentication(self):
+        rendered = SSHD_DROPIN.format(keys="/etc/shiplord/authorized_keys", group=DEPLOY_GROUP)
+        self.assertEqual(rendered, EXPECTED_DROPIN)
+        self.assertIn("Match Group shiplord-deploy\n", rendered)
+        self.assertNotIn("Match User", rendered)
+        self.assertNotIn("ship-*", rendered)  # a human account with the prefix keeps the host's default policy
+        self.assertIn("AuthorizedKeysCommand none\n", rendered)
+        self.assertIn("TrustedUserCAKeys none\n", rendered)
+
+    def test_the_existing_confinement_is_still_rendered(self):
+        rendered = SSHD_DROPIN.format(keys="/etc/shiplord/authorized_keys", group=DEPLOY_GROUP)
+        for line in ("AuthorizedKeysFile /etc/shiplord/authorized_keys/%u", "AuthenticationMethods publickey",
+                     "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitTTY no",
+                     "AllowTcpForwarding no", "AllowStreamLocalForwarding no", "AllowAgentForwarding no",
+                     "X11Forwarding no", "PermitTunnel no", "GatewayPorts no"):
+            with self.subTest(line=line):
+                self.assertIn(f"{line}\n", rendered)
+
+
+class DeploymentGroupTests(InstallerTestCase):
+    def test_bootstrap_creates_the_group_the_policy_matches(self):
+        self.assertNotIn(DEPLOY_GROUP, self.system.groups)
+        result = self.run_bootstrap()
+        self.assertTrue(result["changed"]["sshd_group"])
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], set())
+        self.assertIn(["/usr/sbin/groupadd", "--system", DEPLOY_GROUP], self.system.calls)
+
+    def test_bootstrap_confines_deployment_accounts_that_already_exist(self):
+        self.system.accounts = {"ship-orders": "shiplord-deploy-orders", "ship-human": "a human account",
+                                "app-orders": "shiplord-runtime-orders"}
+        self.run_bootstrap()
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
+        self.assertIn(["/usr/sbin/usermod", "--append", "--groups", DEPLOY_GROUP, "ship-orders"], self.system.calls)
+
+    def test_membership_is_granted_once(self):
+        self.system.accounts = {"ship-orders": "shiplord-deploy-orders"}
+        self.run_bootstrap()
+        calls = len(self.system.calls)
+        second = self.run_bootstrap()
+        self.assertFalse(second["changed"]["sshd_group"])
+        self.assertEqual([call[0].rsplit("/", 1)[-1] for call in self.system.calls[calls:]],
+                         ["systemctl", "getent", "getent"])
+
+    def test_a_group_that_cannot_be_created_stops_before_the_dropin(self):
+        self.system.results["groupadd"] = CommandResult(1, "failed")
+        with self.assertRaisesRegex(BootstrapError, "deployment group"):
+            self.run_bootstrap()
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_membership_that_cannot_be_granted_stops_before_the_dropin(self):
+        self.system.accounts = {"ship-orders": "shiplord-deploy-orders"}
+        self.system.results["usermod"] = CommandResult(1, "failed")
+        with self.assertRaisesRegex(BootstrapError, "deployment group"):
+            self.run_bootstrap()
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_cut_short_account_listing_is_refused_rather_than_guessed(self):
+        self.system.accounts = {"ship-orders": "shiplord-deploy-orders"}
+        self.system.truncate_passwd = True
+        with self.assertRaisesRegex(BootstrapError, "too large"):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
 

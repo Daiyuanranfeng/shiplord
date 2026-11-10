@@ -24,7 +24,7 @@ from . import __version__
 from .layout import Layout
 from .release_state import HostLock
 from .routing import CaddyCommands, RouteManager, RoutingError
-from .system import CommandError, System
+from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
 CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
                             "tailscale.py", "template.py", "transport.py", "workflow.py"})
@@ -40,10 +40,14 @@ LAUNCHER_TEMPLATE = (
     "from {module} import main\n\nmain()\n"
 )
 PLACEHOLDER = b"# Managed by Shiplord. Generated route files live in this directory.\n"
+DEPLOY_GROUP = "shiplord-deploy"  # the only accounts the sshd drop-in matches; provisioning adds each new one
+DEPLOY_MARKER = "shiplord-deploy"  # prefix of the passwd comment that marks an account as a deployment account
 SSHD_DROPIN = """\
 # Managed by Shiplord. Confines deployment accounts to the forced-command dispatcher.
-Match User ship-*
+Match Group {group}
     AuthorizedKeysFile {keys}/%u
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
     AuthenticationMethods publickey
     PasswordAuthentication no
     KbdInteractiveAuthentication no
@@ -61,6 +65,8 @@ SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
 SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
 SSHD_INCLUDE_DEPTH = 8
 SSHD_CONFIG = "sshd_config"
+GROUPADD, GETENT, USERMOD = "/usr/sbin/groupadd", "/usr/bin/getent", "/usr/sbin/usermod"
+ACCOUNT_DATABASE_BYTES = 1 << 20  # room for a whole passwd or group dump; a cut-short one is refused, not guessed
 
 
 class BootstrapError(Exception):
@@ -293,9 +299,78 @@ def _sshd_preflight(layout: Layout, system: System) -> tuple[str, str | None]:
     return unit, socket
 
 
+def _account_database(system: System, *arguments: str) -> CommandResult:
+    """A ``getent`` answer, read with room for a whole listing rather than the default short window."""
+    try:
+        return system.run([GETENT, *arguments], max_output=ACCOUNT_DATABASE_BYTES)
+    except CommandError:
+        raise BootstrapError("could not read the account database") from None
+
+
+def _untruncated(result: CommandResult) -> str:
+    """The output of a listing, refusing one that was cut short: a missed account would stay unconfined."""
+    if result.output.startswith(TRUNCATION_MARKER):
+        raise BootstrapError("the account database is too large to inspect")
+    return result.output
+
+
+def _group_members(system: System, group: str) -> set[str] | None:
+    """The members of ``group``, or None when the group does not exist."""
+    result = _account_database(system, "group", group)
+    if result.code != 0:
+        return None
+    fields = _untruncated(result).strip().split(":")
+    if len(fields) < 4 or fields[0] != group:
+        raise BootstrapError("could not read the account database")
+    return {name for name in fields[3].split(",") if name}
+
+
+def _deployment_accounts(system: System) -> list[str]:
+    """Every account this host marks as a Shiplord deployment account, by its passwd comment."""
+    result = _account_database(system, "passwd")
+    if result.code != 0:
+        raise BootstrapError("could not read the account database")
+    accounts = []
+    for line in _untruncated(result).splitlines():
+        fields = line.split(":")
+        if len(fields) == 7 and fields[4].startswith(DEPLOY_MARKER + "-"):
+            accounts.append(fields[0])
+    return accounts
+
+
+def _ensure_deployment_group(system: System) -> bool:
+    """Create the group the sshd policy matches on and put every existing deployment account in it.
+
+    The policy is replaced as a whole, so an account created under an earlier policy would otherwise fall back to
+    the host's default sshd policy. This runs before the drop-in is written and reloaded.
+    """
+    created = False
+    members = _group_members(system, DEPLOY_GROUP)
+    if members is None:
+        try:
+            result = system.run([GROUPADD, "--system", DEPLOY_GROUP])
+        except CommandError:
+            raise BootstrapError("could not create the deployment group") from None
+        if result.code != 0:
+            raise BootstrapError("could not create the deployment group")
+        created, members = True, set()
+    changed = False
+    for account in _deployment_accounts(system):
+        if account in members:
+            continue
+        try:
+            result = system.run([USERMOD, "--append", "--groups", DEPLOY_GROUP, account])
+        except CommandError:
+            raise BootstrapError("could not add a deployment account to the deployment group") from None
+        if result.code != 0:
+            raise BootstrapError("could not add a deployment account to the deployment group")
+        changed = True
+    return created or changed
+
+
 def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None) -> bool:
     path = layout.sshd_dropin
-    desired = SSHD_DROPIN.format(keys=layout.authorized_keys).encode()
+    desired = SSHD_DROPIN.format(keys=layout.authorized_keys, group=DEPLOY_GROUP).encode()
     _ensure_dir(path.parent, 0o755)
     previous = path.read_bytes() if path.exists() else None
     if previous == desired:
@@ -352,6 +427,7 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                 changed["caddy_import"] = RouteManager(layout.caddy_root, lock, caddy).ensure_import().changed
             except RoutingError as error:
                 raise BootstrapError(f"Caddy integration failed ({error.kind}): {error}") from None
+            changed["sshd_group"] = _ensure_deployment_group(system)
             changed["sshd"] = _install_sshd(layout, system, unit, socket)
     finally:
         os.close(descriptor)
