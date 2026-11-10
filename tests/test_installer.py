@@ -3,14 +3,15 @@ from __future__ import annotations
 import ast
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import shiplord
-from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, SSHD_DROPIN, BootstrapError, bootstrap,
-                                helper_modules)
+from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
+                                SSHD_DROPIN, BootstrapError, bootstrap, helper_modules, python_supported)
 from shiplord.layout import Layout, deployment_user
 from shiplord.routing import RoutingError
 from shiplord.system import TRUNCATION_MARKER, CommandResult
@@ -169,6 +170,11 @@ class BootstrapTests(InstallerTestCase):
         self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
         self.assertEqual(self.system.calls[-2:], [["/usr/sbin/sshd", "-t"],
                                                   ["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"]])
+
+    def test_the_installed_wrappers_run_the_interpreter_the_probe_checks(self):
+        self.run_bootstrap()
+        for wrapper in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.dispatch):
+            self.assertIn(f"exec {SERVER_PYTHON} -I -S -B ", wrapper.read_text())
 
     def test_second_run_changes_nothing(self):
         first = self.run_bootstrap()
@@ -401,6 +407,27 @@ class DeploymentGroupTests(InstallerTestCase):
         with self.assertRaisesRegex(BootstrapError, "too large"):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
+
+
+class ServerPythonTests(unittest.TestCase):
+    """The helper imports tomllib, so the interpreter the wrappers run must be 3.11 or later."""
+
+    def test_only_python_311_or_later_is_supported(self):
+        for answer in ("3 11", "3 12", "4 0", "3 11\n"):
+            with self.subTest(answer=answer):
+                self.assertTrue(python_supported(answer))
+        for answer in ("3 10", "2 7", "", "3", "3.10.12", "Python 3.12.3", "three twelve", "3 x"):
+            with self.subTest(answer=answer):
+                self.assertFalse(python_supported(answer))
+
+    def test_the_probe_prints_the_major_and_minor_version_on_this_interpreter(self):
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", PYTHON_PROBE], capture_output=True,
+                                check=True)
+        self.assertTrue(python_supported(result.stdout.decode("utf-8", "replace")))
+
+    def test_the_requirement_and_the_interpreter_path_are_one_definition(self):
+        self.assertEqual(SERVER_PYTHON, "/usr/bin/python3")
+        self.assertEqual(REQUIRED_PYTHON, (3, 11))
 
 
 class DeploymentUserTests(unittest.TestCase):

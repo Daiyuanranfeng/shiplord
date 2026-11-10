@@ -21,9 +21,18 @@ Also run on a real Hetzner server (Ubuntu, x86-64, behind Cloudflare): native de
 restored automatically, Let's Encrypt HTTPS, and a release deployed by GitHub Actions through Tailscale OIDC. Not
 verified: the plan's controlled install on *your* production server (§12E). See [evidence.md](evidence.md).
 
+## Requirements
+
+- **The server:** a Linux host with systemd, OpenSSH, and Caddy, and **Python 3.11 or later at
+  `/usr/bin/python3`**. The helper reads TOML with `tomllib`, which only exists from Python 3.11, so Ubuntu
+  22.04 (Python 3.10) and Debian 11 (Python 3.9) are too old. `shiplord server bootstrap` checks that
+  interpreter over SSH before it builds or uploads anything, and refuses the server with a message naming the
+  path and the version instead of failing later with an unreadable response.
+- **Your machine:** Python 3.11 or later, Git, and OpenSSH.
+
 ## Install the CLI
 
-Python 3.11 or later and OpenSSH are required on the machine you work from.
+Install the CLI on the machine you work from:
 
 ```sh
 python -m pip install .
