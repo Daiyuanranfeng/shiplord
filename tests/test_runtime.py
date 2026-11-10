@@ -36,12 +36,14 @@ REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "o
 class FakeDocker:
     def __init__(self):
         self.calls: list[list[str]] = []
+        self.max_outputs: list[int] = []
         self.results: dict[str, CommandResult] = {}
         self.raise_for: dict[str, CommandError] = {}
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         argv = list(argv)
         self.calls.append(argv)
+        self.max_outputs.append(max_output)
         assert argv[0] == "/usr/bin/docker"
         key = " ".join(argv[1:3]) if argv[1] in ("image", "volume") else argv[1]
         if key in self.raise_for:
@@ -524,6 +526,22 @@ class InspectTests(RuntimeTestCase):
         self.runtime.logs(REGISTRATION, -5)
         self.assertEqual(self.docker.sub("logs")[1][2:4], ["--tail", "1"])
 
+    def test_release_logs_read_that_release_own_container_by_name(self):
+        self.docker.results["logs"] = CommandResult(0, "boom\n")
+        self.assertEqual(self.runtime.release_logs(REGISTRATION, release(), 10**9), "boom\n")
+        (call,) = self.docker.sub("logs")
+        self.assertEqual(call[1:], ["logs", "--tail", "1000", self.runtime.container_name(REGISTRATION, release())])
+        self.assertEqual(self.docker.max_outputs, [MAX_LOG_BYTES])
+        self.runtime.release_logs(REGISTRATION, release(), -5)
+        self.assertEqual(self.docker.sub("logs")[1][2:4], ["--tail", "1"])
+
+    def test_release_logs_are_none_only_when_the_container_is_gone(self):
+        self.docker.results["logs"] = CommandResult(1, "Error: No such container: shiplord-orders-missing\n")
+        self.assertIsNone(self.runtime.release_logs(REGISTRATION, release(), 50))
+        self.docker.results["logs"] = CommandResult(1, "permission denied while reading logs\n")
+        with self.assertRaises(RuntimeFailure):
+            self.runtime.release_logs(REGISTRATION, release(), 50)
+
     def test_discard_reports_but_does_not_raise_when_the_image_is_in_use(self):
         self.assertEqual(self.runtime.discard(REGISTRATION, release()), [])
         self.docker.results["image rm"] = CommandResult(1, "conflict: image is being used")
@@ -556,6 +574,12 @@ class LogTruncationTests(unittest.TestCase):
     def test_the_newest_log_lines_survive_the_log_cap(self):
         logs = self.runtime.logs(REGISTRATION, 50)
         self.assertLessEqual(len(logs), MAX_LOG_BYTES)
+        self.assertTrue(logs.endswith("the failure\n"))
+
+    def test_a_release_log_capture_keeps_the_newest_bytes_within_its_own_bound(self):
+        logs = self.runtime.release_logs(REGISTRATION, release(), 50, max_bytes=4096)
+        self.assertLessEqual(len(logs), 4096)
+        self.assertTrue(logs.startswith("[shiplord: earlier output truncated]"))
         self.assertTrue(logs.endswith("the failure\n"))
 
 

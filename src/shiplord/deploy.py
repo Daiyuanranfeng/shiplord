@@ -22,6 +22,8 @@ from .shutdown import ShutdownError, check_budget, check_recovery_budget, policy
 from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
+CANDIDATE_LOG_LINES = 100  # the tail a failed candidate's crash output needs
+CANDIDATE_LOG_BYTES = 16384  # the outcome is stored in a job record bounded by MAX_RECORD_BYTES (64 KiB)
 SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover"}
 
 
@@ -413,6 +415,24 @@ class Deployer:
         except RuntimeFailure as failure:
             return [str(failure)]
 
+    def _capture_candidate_logs(self, candidate: dict) -> dict:
+        """The failed candidate's last log lines, read before the restore removes its container.
+
+        A candidate with no container reports nothing. A capture that fails is a note in the detail, never a restore
+        failure: a rollback that restored service must still report that result.
+        """
+        read = getattr(self.runtime, "release_logs", None)
+        if read is None or candidate["artifact"]["kind"] != "docker":
+            return {}
+        captured = {"tail": CANDIDATE_LOG_LINES, "max_bytes": CANDIDATE_LOG_BYTES}
+        try:
+            output = read(self.registration, candidate, CANDIDATE_LOG_LINES, max_bytes=CANDIDATE_LOG_BYTES)
+        except RuntimeFailure as failure:
+            return {"candidate_logs": {**captured, "error": str(failure)}}
+        if output is None:
+            return {}
+        return {"candidate_logs": {**captured, "output": output}}
+
     @staticmethod
     def _shared_resource(release: dict, retained: list[dict | None]) -> bool:
         """Whether discarding ``release`` would remove a resource one of the retained releases still uses."""
@@ -432,6 +452,8 @@ class Deployer:
     def _restore(self, failure: Exception, probes: dict, candidate: dict, before: dict) -> Outcome:
         """Return to the last committed release; clear the journal only after verifying that."""
         failed = {"error": "deployment_failed", **self._describe(failure), "probes": probes}
+        # The restore stops and removes the candidate's container, so its crash output must be read before that.
+        failed.update(self._capture_candidate_logs(candidate))
         try:
             journal = self.state.read_journal()
             target = self.state.reconciliation_target()

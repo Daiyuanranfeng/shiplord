@@ -42,6 +42,9 @@ class FakeRuntime:
         self.start_errors: dict[str, Exception] = {}
         self.force_stop_error = None
         self.discarded: list[str] = []
+        self.candidate_logs: dict[str, str] = {}  # container output per release, as `docker logs` would return it
+        self.log_errors: dict[str, Exception] = {}
+        self.release_log_calls: list[tuple] = []
 
     def pull(self, registration, release):
         self.calls.append(("pull", release_id(release)))
@@ -83,6 +86,16 @@ class FakeRuntime:
 
     def logs(self, registration, tail):
         return ""
+
+    def release_logs(self, registration, release, tail, *, max_bytes=None):
+        rid = release_id(release)
+        self.calls.append(("release_logs", rid))
+        self.release_log_calls.append((rid, tail, max_bytes))
+        if rid not in self.running:  # a candidate that never produced a container has nothing to read
+            return None
+        if rid in self.log_errors:
+            raise self.log_errors[rid]
+        return self.candidate_logs.get(rid, "")
 
     def discard(self, registration, release):
         self.discarded.append(release["artifact"]["image"])
