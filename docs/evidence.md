@@ -42,7 +42,7 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | No personal private key is uploaded; host trust is pinned | Verified | `test_github` (the secret is the dedicated key; no key material in results, state, or arguments); CI mode ignores `~/.ssh/config` (found and fixed by e2e 19); host keys come over the trusted connection. |
 | Deployment privileges scoped to the registered application and helper | Verified | Real sudo/sshd: `test_host_integration` (account cannot write its own access, cannot use admin), e2e 15 and 24 (each login refused for the other application). |
 | Secret values absent from repository files, normal output, artifacts | Verified for the paths tested | Env, registry token, CI key, sudo password: never in argv, results, state, or errors (`test_provision`, `test_commands`, `test_github`, `test_client`). The generated workflow passes secrets only through `env:`. |
-| Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
+| Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; `--cpus`/`--init` and configurable readiness status/interval covered by unit tests (not real Docker); readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
 | Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | All but the live workflow, as above. |
 | README and AGENTS.md let a fresh agent release and interpret failures | Written, not field-tested | `README.md`, `AGENTS.md`, the generated `SHIPLORD.md`; no fresh agent was run against them. |
 | No additional continuously running deployment service | Verified by construction | Only jobs run, as transient units that exit; there is no daemon. |
@@ -140,14 +140,15 @@ What it found:
   candidate that asked for another path, and returns to the legacy path; one volume throughout.
 - Real Docker: `test_z_image_declared_volume_does_not_break_readiness_or_release_identity` deploys an image declaring
   `VOLUME /scratch`; readiness and release identity still pass with Docker's additional anonymous mount.
-- Not done: ownership initialization (`owner_uid`/`owner_gid` are rejected by the helper), the non-root UID 10001
-  fixture, interruption tests around volume creation, and proof that the path-only restoration regression fails on the
-  baseline in real Docker (the unit test shows it at the `is_running` boundary). A legacy unlabelled volume is accepted
-  only when a retained Shiplord container proves the exact volume; that proof is tied to the inspected volume identity
-  in the transaction journal.
+- Not done: ownership initialization (`owner_uid`/`owner_gid` are refused at manifest validation, so a request that
+  smuggles them is refused before a plan or job), the non-root UID 10001 fixture, interruption tests around volume
+  creation, and proof that the path-only restoration regression fails on the baseline in real Docker (the unit test
+  shows it at the `is_running` boundary). A legacy unlabelled volume is accepted only when a retained Shiplord
+  container proves the exact volume; that proof is tied to the inspected volume identity in the transaction journal.
 - **Explicit ownership initialization remains blocked** until a pinned initializer image is reviewed and a fresh
-  volume is proven writable by UID 10001 in the real-Docker suite. The helper continues to reject
-  `owner_uid`/`owner_gid` until both prerequisites pass. An image that establishes the directory's ownership during
+  volume is proven writable by UID 10001 in the real-Docker suite. `validate_storage` refuses
+  `owner_uid`/`owner_gid` while loading `ship.toml` (`tests/test_runtime_knobs.py`, `tests/test_storage.py`), so the
+  setting cannot be accepted and then refused at deploy. An image that establishes the directory's ownership during
   its build can instead use path-only storage, after an application-specific fresh-volume check.
 - Separate local application evidence (2026-10-30): Handwriting Studio commit
   `9502a77beb81dc1182ac14ba4a0543d2a28496cd`, Linux amd64 image
@@ -155,6 +156,16 @@ What it found:
   `10001:10001` on a fresh `/data` volume through the Docker runtime adapter. This proof is outside the repository's
   CI suite; it does not establish permissions on an existing volume, general initialization support, remote helper
   recovery, or a production deployment.
+
+## Runtime knobs
+
+- Unit: `tests/test_runtime_knobs.py` checks manifest validation (bounds, native refusal, unknown keys), that
+  `resources.cpu_limit` and `deploy.init` reach the `docker run` command line, that a configured readiness status and
+  interval drive `probes` for stored releases, that storage ownership is refused while the manifest loads, and the
+  `runtime_knobs_v1` negotiation. `tests/test_storage.py` and `tests/test_probes.py` cover the moved refusal and the
+  unchanged defaults.
+- Not done: real Docker execution of `--cpus` and `--init`, and a readiness poll against a live container. The
+  command line and the polling loop are covered by unit tests only; `tests/linux/run.sh docker` was not run here.
 
 ## Generic Docker profile
 

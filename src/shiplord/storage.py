@@ -10,7 +10,6 @@ import re
 
 DEFAULT_CONTAINER_PATH = "/app/src/.adk"
 MAX_PATH_BYTES = 4096
-MAX_ID = 2147483647
 FEATURE = "docker_storage_v1"  # capability a helper advertises when it can honour [storage]
 
 _COMPONENT = re.compile(r"[A-Za-z0-9._-]+\Z")
@@ -39,25 +38,23 @@ def validate_container_path(value: object) -> str:
     return value
 
 
-def _identifier(value: object, name: str) -> int:
-    if type(value) is not int or not 1 <= value <= MAX_ID:
-        raise StorageError(f"storage.{name} must be an integer between 1 and {MAX_ID}")
-    return value
-
-
 def validate_storage(raw: object) -> dict:
-    """Validate the ``[storage]`` table and return only the fields that were given."""
-    if not isinstance(raw, dict) or set(raw) - {"container_path", "owner_uid", "owner_gid"}:
-        raise StorageError("storage must be a table with only container_path, owner_uid and owner_gid")
+    """Validate the ``[storage]`` table and return only the fields that were given.
+
+    Ownership is refused here, at manifest validation, rather than at deploy: establishing it safely needs a
+    pinned initializer image, so accepting the setting would only move the refusal to the worst possible place.
+    An image that establishes the mount directory's ownership during its build needs no setting.
+    """
+    if not isinstance(raw, dict):
+        raise StorageError("storage must be a table with only container_path")
+    if "owner_uid" in raw or "owner_gid" in raw:
+        raise StorageError("storage.owner_uid and storage.owner_gid are not supported: "
+                           "the image must establish the mount directory's ownership")
+    if set(raw) - {"container_path"}:
+        raise StorageError("storage must be a table with only container_path")
     if "container_path" not in raw:
         raise StorageError("storage.container_path is required")
-    result = {"container_path": validate_container_path(raw["container_path"])}
-    if ("owner_uid" in raw) != ("owner_gid" in raw):
-        raise StorageError("storage.owner_uid and storage.owner_gid must be given together")
-    if "owner_uid" in raw:
-        result["owner_uid"] = _identifier(raw["owner_uid"], "owner_uid")
-        result["owner_gid"] = _identifier(raw["owner_gid"], "owner_gid")
-    return result
+    return {"container_path": validate_container_path(raw["container_path"])}
 
 
 def container_path(configuration: dict) -> str:

@@ -13,7 +13,8 @@ from shiplord.system import CommandError, CommandResult, run_command
 ID_A, ID_B = "a" * 64, "b" * 64
 
 
-def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None, template="google-adk"):
+def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None, template="google-adk",
+            cpu=None, init=False):
     value = {"commit": commit * 40, "sequence": sequence,
             "artifact": {"kind": "docker", "image": "ghcr.io/example/orders@sha256:" + image * 64},
             "configuration": {"schema_version": 1, "name": "orders", "server": "production", "template": template,
@@ -23,6 +24,10 @@ def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=
                               "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}}
     if storage is not None:
         value["configuration"]["storage"] = storage
+    if cpu is not None:
+        value["configuration"]["resources"]["cpu_limit"] = cpu
+    if init:
+        value["configuration"]["deploy"]["init"] = True
     return value
 
 
