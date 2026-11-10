@@ -73,6 +73,8 @@ Excluded:
 - Automatic public DNS changes in version one. The CLI checks DNS and explains
   the required record; the user creates it at their DNS provider.
 - Automatic database provisioning, destructive migrations, or database rollback.
+  Section 16 records the decision: one SQLite database on the application's volume or
+  data directory is the supported data path, and a database server is not.
 
 ## 4. User-facing command contract
 
@@ -515,6 +517,9 @@ The first version is done only when all of these are true:
 - [ ] A new ADK application can be generated from the pinned user template.
 - [ ] Provisioning sets up a unique local port, route, runtime, persistent data,
       deployment account, and public-key access.
+- [ ] Application data has one documented location per application, survives every
+      release, rollback and removal, and a copy can be taken and restored with a
+      verified result (section 16).
 - [ ] Frontend origins reach the existing ALLOW_ORIGINS configuration correctly.
 - [ ] Docker deployment uses a tested immutable image built outside the VM.
 - [ ] Native Linux binary deployment works through the same user-facing lifecycle.
@@ -576,3 +581,129 @@ rented disposable VM is a prerequisite.
 - GitHub-hosted VMs: https://docs.github.com/en/actions/how-tos/manage-runners/github-hosted-runners/use-github-hosted-runners
 - Runner administrative access: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 - Ubuntu 24.04 runner image: https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+
+## 16. Decision: application data is SQLite on the volume (2026-11-11)
+
+Records the decision for [#61](https://github.com/QueryPlanner/shiplord/issues/61). This is the product
+decision the issue left open; it defines what "ship any app" means for data in 1.0. The user-facing version
+is in [docs/guide.md](docs/guide.md) under *Application data*.
+
+### The decision
+
+Each application has exactly one persistent location, and Shiplord already owns it:
+
+- **Docker:** the named volume `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` or at
+  `[storage].container_path`.
+- **Native:** `/var/lib/shiplord/data/<application>`, the service's working directory and only writable path.
+
+The supported database inside that location is SQLite: one file (plus its WAL and shared-memory files)
+opened by the application's single process. Shiplord guarantees the location survives a deploy, a failed
+candidate, a rollback, `deprovision --retire`, and helper upgrades, and that it is never deleted.
+
+Backup and restore are part of this path, not an optional extra. `shiplord backup` and `shiplord restore`
+(#62) copy that one location, and the copy is **cold**: the application is stopped first. Until #62 ships
+there is no supported backup command, and the guide says so.
+
+### Why this is the 1.0 answer
+
+**What 1.0 promises.** One application is one container or one binary on one host, with verified
+readiness, a reversible artifact, data that is never silently destroyed, and no daemon. SQLite fits that
+model exactly: the database is a file in the storage location Shiplord already creates, mounts, documents,
+and preserves. Nothing new is supervised, and rollback stays a claim about the artifact only, which the
+documentation already states.
+
+**Operational cost.** SQLite needs no service, port, account, tuning, or version upgrade. Its real costs
+are two, and both are documented: one writer, and a backup that needs a stop. A database container is a
+second supervised process per application; the honest list is in the next section.
+
+**Failure modes.** With SQLite, a failure is a locked or damaged file in one application's volume. It is
+local, visible in the application's logs, and recoverable from a copy; a crash mid-write is handled by
+SQLite's own journal and WAL recovery. With a database container the failure surface multiplies: the app
+up while the database is down, two disks to fill, a major-version upgrade that needs a dump and restore, a
+lost or rotated credential, a second port and its conflicts, an OOM of the database that takes the app
+down, and a schema the rolled-back image can no longer read. The last one is decisive. Shiplord's central
+promise is "restore the previous release and verify it"; with a schema the previous image cannot read, that
+promise becomes false, or true-looking. A data path that breaks the rollback promise is not a 1.0 feature.
+
+**Backup and restore.** One location is copied as one unit and verified by checksum; a restore is "stop,
+replace, start, verify readiness", the same shape as a release restore. A database server needs a logical
+dump plus roles, ownership, and a version-matched restore. That is a different feature, and it would not
+reuse #62's copy-and-verify shape.
+
+**Who operates it.** The audience is one operator on a 4 GB VM. SQLite makes them an application author.
+A database container makes them a DBA (upgrades, connections, vacuuming, tuning, backups) on a host
+Shiplord deliberately keeps small. Shiplord cannot do that well enough to call the result "managed", and
+1.0 should not charge for it.
+
+### The rejected alternative, and what it would really cost
+
+A "managed database container" — Shiplord creates and supervises Postgres or MySQL per application — is
+rejected for 1.0. It is not one more container; it is a second resource lifecycle:
+
+- **Manifest and registration:** a database section (engine, version, database name, credential source),
+  validated and carried in every release record.
+- **Provision:** a second volume, a generated password, a second container, an unpublished port, and its
+  own health check.
+- **Deploy:** start and verify the database before the application, journal two runtimes, and define what
+  a failed candidate does to a database that already started.
+- **Rollback:** restore the image but not the schema, which is the case above and needs a policy Shiplord
+  does not have.
+- **Retention and removal:** never prune the database while still pruning images; `retire` and
+  `deprovision` must keep it while deleting everything else, and say so.
+- **Backup:** a logical dump, not a volume copy, with engine-version awareness.
+- **Secrets:** another generated secret class, stored root-only and never printed.
+- **Tests and docs:** real Postgres in the Docker suite, upgrade and restore scenarios, the interaction
+  with the two-release window, and a major-version upgrade path that artifact rollback cannot undo.
+
+That is the L in #61, and it is understated: the work is the second lifecycle plus a version-upgrade story
+the release model cannot express. It also does not replace #62; it makes #62 engine-specific.
+
+And it still would not be managed: no point-in-time recovery, replicas, failover, automated minor
+upgrades, monitoring, or off-host durability. It would be a self-hosted database with a Shiplord wrapper —
+more surface than SQLite, fewer guarantees than a real managed service.
+
+### The escape hatch that already exists
+
+An application that needs Postgres, concurrent writers, or a database it does not own can point at one
+outside the server: a managed service (RDS, Cloud SQL, Neon, Supabase) or a database the operator runs
+themselves. The connection string is a runtime environment value set with `shiplord env set`, which
+Shiplord passes to the container or unit without printing it. Shiplord's job ends at the environment
+variable; the database's availability, backups, and upgrades belong to the provider or the operator. That
+keeps the blast radius off the 4 GB host and needs no new feature.
+
+### What this does not cover
+
+Also stated in the guide:
+
+- Concurrent writers, a second process, or more than one instance of the application. One container or
+  one service per application is enforced; two writers would corrupt the file.
+- Multi-instance or horizontally scaled applications, and data shared between applications.
+- Schema and data migrations. The application runs them (at startup, or through #96 when it lands);
+  Shiplord never does, and never rolls them back.
+- Hot or online backups. The supported copy is taken with the application stopped (#62); copying a live
+  SQLite file is not safe.
+- Encryption at rest, replication, high availability, and point-in-time recovery.
+- Moving data when `[storage].container_path` changes: the same volume is mounted at the new path.
+- Volume ownership initialization (`owner_uid`/`owner_gid` are still refused; #64).
+
+### Consequences and follow-ups
+
+- [#62](https://github.com/QueryPlanner/shiplord/issues/62) — `shiplord backup` and `shiplord restore`.
+  Required by this decision: the archive is taken with the application stopped, carries a checksum, and a
+  restore is verified before it reports success. A copy left on the same host protects against mistakes,
+  not disk or host loss; copying it off the host is the operator's job.
+- [#138](https://github.com/QueryPlanner/shiplord/issues/138) — prove the contract in the Docker suite: a
+  real SQLite application keeps its rows across a deploy and a rollback, survives a `SIGKILL` mid-write,
+  and reopens with `PRAGMA integrity_check` clean in WAL mode.
+- [#64](https://github.com/QueryPlanner/shiplord/issues/64) — storage ownership for images that do not own
+  the mount at build time.
+- [#96](https://github.com/QueryPlanner/shiplord/issues/96) — `shiplord exec`, the answer for a one-off
+  migration or console; not required for the data path itself.
+
+Revisit this decision only if a real user needs concurrent writers and cannot use an external database.
+The answer then is a separate design with its own decision record and its own backup story — a companion
+container, not a bolt-on to this one.
+
+Note: #61 cites `docs/storage-and-shutdown-plan.md`. No such file exists at `67fd881` or on `main`; the
+storage and shutdown behavior it refers to is documented in [docs/guide.md](docs/guide.md) and
+[docs/evidence.md](docs/evidence.md).

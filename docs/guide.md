@@ -163,6 +163,69 @@ slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`,
   by the image's application user with real Docker before deployment. Shiplord does not repair existing
   volume permissions, and changing the mount path does not migrate data from another application.
 
+## Application data
+
+Each application gets exactly one persistent location, and Shiplord leaves it alone. This is the supported
+data story for 1.0; [section 16 of the plan](../ship-cli-plan.md) records the decision and why a database
+container is not part of it.
+
+- **Docker:** the named volume `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` by default or at
+  `[storage].container_path`.
+- **Native:** `/var/lib/shiplord/data/<application>`, which is the service's working directory and its only
+  writable path.
+
+A SQLite database and any files the app writes belong there. Shiplord creates the location (the volume at the
+first deploy, the directory at provision), mounts it at the same path on every release, and never deletes it:
+not on a failed candidate, a rollback, `deprovision --retire`, or a helper upgrade. `shiplord deprovision`
+reports the data it kept.
+
+The application is responsible for:
+
+- Keeping the database and its files under the mount. Anything written elsewhere in a container is lost when
+  the container is replaced.
+- Opening SQLite in WAL mode with a busy timeout. There is one writer, and WAL keeps a reader from blocking it.
+- Owning the mount, or creating its files as the user the image runs as. Shiplord does not initialise
+  ownership: `[storage] owner_uid` / `owner_gid` are validated and then refused (#64). An image that runs as
+  non-root should create the directory with the right owner in its build.
+- Running its own migrations at startup or in a build step. Shiplord never runs a migration and never rolls one
+  back. A rollback restores the previous image, which must still be able to read the current schema, so keep
+  migrations backward compatible for at least the two releases Shiplord keeps.
+
+What this does **not** cover:
+
+- Concurrent writers, a second process, or more than one instance of the app. Shiplord runs one container or
+  one service per application and refuses a second live container; two writers would corrupt the file.
+- Postgres, MySQL, or any database server. Point the app at a database outside the server (a managed service,
+  or one you run yourself) and set its connection string with `shiplord env set`. Shiplord passes the value
+  and does not manage the database.
+- Sharing data between applications. There is one location per application and no shared volume.
+- Encryption at rest, replication, high availability, or point-in-time recovery.
+- Moving data when `[storage].container_path` changes. The same volume is mounted at the new path; nothing is
+  copied.
+
+### Backup and restore
+
+There is **no supported backup command yet**. #62 adds `shiplord backup` and `shiplord restore`; this section
+will be updated when it ships. Do not work around it by copying a live SQLite file with `tar`, `cp`, or a
+volume plugin while the app is writing: the copy can capture a torn write and will not restore cleanly.
+`shiplord rollback` does not undo data, so take a copy before a release that changes the schema.
+
+The contract those commands will implement is a **cold copy**, because that is the only safe way to copy a
+SQLite database without a database-aware snapshot:
+
+1. Stop the application, with the same journaled stop a deploy uses.
+2. Copy the volume or data directory into a timestamped archive with a checksum.
+3. Start the application again and verify readiness.
+
+A backup is therefore a short outage, and the archive lands on the server. A copy on the same host protects
+against an application or operator mistake, not against losing the disk or the server; copy the archive
+somewhere else yourself.
+
+On a default Docker install the volume's files are under
+`/var/lib/docker/volumes/shiplord-<application>-artifacts/_data`, and a native app's files are under
+`/var/lib/shiplord/data/<application>`. Both are owned by the user the application runs as, not by your login, so inspect them
+with the privileges you already use for that host.
+
 ## Graceful replacement (Docker)
 
 Replacing a Docker release now signals the old container, waits, and only then removes it and starts the new one:
