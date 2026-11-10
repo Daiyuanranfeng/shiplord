@@ -82,6 +82,7 @@ shiplord recover
 ```
 
 Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
+Run `shiplord restart` to apply the current environment to the running release without a new commit.
 
 ## Learn more
 

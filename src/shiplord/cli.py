@@ -955,6 +955,14 @@ def rollback(json_output: bool = typer.Option(False, "--json")) -> None:
                                               on_progress=_progress(json_output)), json_output)
 
 
+@app.command(rich_help_panel="Administration")
+def restart(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Restart the deployed release so it reads the current environment."""
+    manifest = _manifest(json_output)
+    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "restart",
+                                              on_progress=_progress(json_output)), json_output)
+
+
 @app.command(rich_help_panel="Troubleshooting")
 def recover(force_stop: bool = typer.Option(
                 False, "--force-stop",
