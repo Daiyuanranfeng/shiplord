@@ -342,7 +342,8 @@ def application_doctor(manifest: dict, client: HelperClient, *, which=None, reso
 
 
 def server_doctor(admin: AdminClient) -> tuple[int, dict]:
-    """Deep server health: helper, Caddy wiring, sshd confinement, Docker, disk, and each application's state."""
+    """Deep server health: helper, Caddy wiring, sshd confinement, ports, Docker, disk, and each application's
+    state and consistency."""
     result = admin.call("doctor", None, {})
     return (0 if result["ok"] else 3), {"ok": result["ok"], "scope": "server health (read-only)", "checks": result["checks"]}
 

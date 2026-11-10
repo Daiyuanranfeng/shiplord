@@ -257,7 +257,7 @@ def plan(image: Optional[str] = typer.Option(None, "--image", help="Ask the serv
 @app.command(rich_help_panel="Troubleshooting")
 def doctor(local: bool = typer.Option(False, "--local", help="Check local prerequisites."),
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
-           deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, Docker, disk, and applications (sudo)."),
+           deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, ports, Docker, disk, and applications (sudo)."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
     """Check local prerequisites or a server's protocol capabilities; without a manifest, check local only."""
     if local and server:
@@ -670,7 +670,8 @@ def _doctor_value(value: object) -> str:
         if "ok" in value:
             state = "passed" if value["ok"] else "failed"
             details = []
-            for key in ("helper_version", "version", "protocol", "current", "running", "unfinished_transaction", "hint"):
+            for key in ("helper_version", "version", "protocol", "current", "running", "unfinished_transaction",
+                        "error", "hint"):
                 if value.get(key) is not None:
                     details.append(f"{key.replace('_', ' ')}: {value[key]}")
             return state + (" (" + "; ".join(details) + ")" if details else "")
@@ -690,8 +691,8 @@ def _render_doctor(result: dict, target: str) -> None:
     groups = (
         ("Local tools", ("ssh", "git", "gh")),
         ("Server access", ("server_access", "helper_actions", "helper")),
-        ("Application", ("application", "applications")),
-        ("Network", ("dns",)),
+        ("Application", ("application", "applications", "consistency")),
+        ("Network", ("dns", "ports")),
         ("Server services", ("caddy", "sshd", "docker")),
         ("Storage", ("disk",)),
     )
@@ -704,6 +705,8 @@ def _render_doctor(result: dict, target: str) -> None:
         for name, value in present:
             shown.add(name)
             typer.echo(f"  {name.replace('_', ' ')}: {_doctor_value(value)}")
+            if isinstance(value, dict) and value.get("ok") is False and value.get("next_step"):
+                typer.echo(f"    next: {value['next_step']}")
             if name == "applications" and isinstance(value, dict):
                 for application in value.get("applications", []):
                     label = application.get("application", "application")
@@ -711,6 +714,21 @@ def _render_doctor(result: dict, target: str) -> None:
                     state = application.get("unfinished_transaction") or "none"
                     typer.echo(f"    {label}: release {release}; unfinished transaction {state}")
                 _render_ignored_files(value.get("ignored_files", []))
+            if name == "ports" and isinstance(value, dict):
+                for port in value.get("ports", []):
+                    state = "listening" if port["listening"] else "not listening"
+                    scope = ("reachable from outside" if port["external"]
+                             else "loopback only" if port["listening"] else "nothing bound")
+                    typer.echo(f"    port {port['port']}: {state}; {scope}")
+            if name == "consistency" and isinstance(value, dict):
+                for application in value.get("applications", []):
+                    label = application.get("application", "application")
+                    if application.get("ok"):
+                        typer.echo(f"    {label}: consistent")
+                        continue
+                    typer.echo(f"    {label}: {', '.join(application.get('mismatches', []))}")
+                    if application.get("next_step"):
+                        typer.echo(f"      next: {application['next_step']}")
     for name, value in checks.items():
         if name not in shown:
             typer.echo(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
