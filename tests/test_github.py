@@ -23,10 +23,11 @@ from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_c
                              resolve_ssh_host, rotate_key)
 from shiplord.keys import parse_public_key  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
-from shiplord.workflow import WORKFLOW_PATH, render_workflow  # noqa: E402
+from shiplord.workflow import DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH, render_deploy_workflow, render_workflow  # noqa: E402
 
 REF = "cd" * 20
 HOST = "server.example.com"
+QUALITY_WORKFLOW = ".github/workflows/code-quality.yml"
 
 
 def host_key(seed=1, key_type="ssh-ed25519"):
@@ -35,8 +36,8 @@ def host_key(seed=1, key_type="ssh-ed25519"):
     return key_type, base64.b64encode(field(key_type.encode()) + field(bytes([seed]) * 32)).decode()
 
 
-def manifest(runtime="docker", with_github=False, server="production"):
-    value = {"schema_version": 1, "name": "orders", "server": server, "template": "google-adk", "runtime": runtime,
+def manifest(runtime="docker", with_github=False, server="production", template="google-adk"):
+    value = {"schema_version": 1, "name": "orders", "server": server, "template": template, "runtime": runtime,
              "http": {"api_domain": "orders.example.com", "frontend_origins": [], "container_port": 8080,
                       "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
              "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
@@ -190,18 +191,31 @@ class GitHubTestCase(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
 class SetupTests(GitHubTestCase):
-    def test_generic_setup_is_refused_before_keys_secrets_or_files_are_changed(self):
-        config = manifest() | {"template": "generic"}
-        before = (self.project / "ship.toml").read_bytes()
-        with patch.object(github, "generate_ci_key", side_effect=AssertionError("must not create a key")):
-            with self.assertRaisesRegex(GitHubError, "generic Docker applications need a custom workflow") as caught:
-                self.setup_call(manifest=config)
-        self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
-        self.assertEqual(self.gh_runner.calls, [])
-        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
-        self.assertFalse(self.home.exists())
-        self.assertEqual(list(self.project.iterdir()), [self.project / "ship.toml"])
-        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+    def test_generic_setup_reaches_the_key_secret_variables_and_workflow_steps(self):
+        result = self.setup_call(manifest=manifest(template="generic"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.server.keys), 1)  # the CI key reached the server
+        self.assertIn(SECRET_NAME, self.gh_runner.secrets)
+        for name in ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS"):
+            self.assertIn(name, self.gh_runner.variables_)
+        for path in (WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH):
+            self.assertTrue((self.project / path).is_file(), path)
+        self.assertIn('[github]\nrepository = "Example/orders"', (self.project / "ship.toml").read_text())
+        self.assertEqual(set(self.state()["workflows"]), {WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH})
+
+    def test_an_unsupported_request_is_refused_before_any_change_for_every_template(self):
+        for template in ("google-adk", "generic"):
+            with self.subTest(template=template):
+                before = (self.project / "ship.toml").read_bytes()
+                with patch.object(github, "generate_ci_key", side_effect=AssertionError("must not create a key")):
+                    with self.assertRaises(GitHubError) as caught:
+                        self.setup_call(manifest=manifest(template=template), repository="not a repo")
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(self.gh_runner.calls, [])
+                self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+                self.assertFalse(self.home.exists())
+                self.assertEqual(list(self.project.iterdir()), [self.project / "ship.toml"])
+                self.assertEqual((self.project / "ship.toml").read_bytes(), before)
 
     def test_setup_registers_proves_then_stores_the_key_sets_variables_and_writes_the_workflow(self):
         result = self.setup_call()
@@ -217,9 +231,10 @@ class SetupTests(GitHubTestCase):
                          known_hosts_lines(HOST, 22, [host_key(1), host_key(2, "ecdsa-sha2-nistp256")]))
         self.assertNotIn("SHIPLORD_SSH_PORT", self.gh_runner.variables_)
         workflow = (self.project / WORKFLOW_PATH).read_text()
-        expected = render_workflow(manifest(with_github=True) | {"github": {"repository": "Example/orders",
-                                   "deployment_branch": "main"}}, tooling_ref=REF)
-        self.assertEqual(workflow, expected)
+        merged = manifest(with_github=True) | {"github": {"repository": "Example/orders", "deployment_branch": "main"}}
+        self.assertEqual(workflow, render_workflow(merged, tooling_ref=REF))
+        self.assertEqual((self.project / DEPLOY_WORKFLOW_PATH).read_text(),
+                         render_deploy_workflow(merged, tooling_ref=REF))
         self.assertIn('[github]\nrepository = "Example/orders"', (self.project / "ship.toml").read_text())
         self.assertTrue(result["ok"] and result["github_account"] == "octocat")
         self.assertEqual(self.server.keys, {result["key_label"]: result["key_fingerprint"]})
@@ -259,7 +274,7 @@ class SetupTests(GitHubTestCase):
         self.assertEqual(self.server.keys, before)
         self.assertEqual(len([c for c in self.server.admin_calls if c[1]["operation"] == "add"]), 1)
         self.assertEqual(len([a for a, _ in self.gh_runner.calls if a[:2] == ["secret", "set"]]), 1)
-        self.assertEqual(second["steps"]["workflow"], f"unchanged ({WORKFLOW_PATH})")
+        self.assertEqual(second["steps"]["workflow"], f"unchanged ({DEPLOY_WORKFLOW_PATH}, {WORKFLOW_PATH})")
 
     def test_the_same_application_name_on_two_servers_keeps_separate_state(self):
         staging = FakeServer()
@@ -369,13 +384,50 @@ class SetupTests(GitHubTestCase):
 
     def test_an_edited_workflow_is_not_overwritten_without_force(self):
         self.setup_call()
-        path = self.project / WORKFLOW_PATH
-        path.write_text(path.read_text() + "# my change\n")
-        with self.assertRaisesRegex(GitHubError, "was edited"):
-            self.setup_call(manifest=manifest(with_github=True))
-        self.assertIn("# my change", path.read_text())
-        self.setup_call(manifest=manifest(with_github=True), force_workflow=True)
-        self.assertNotIn("# my change", path.read_text())
+        for path in (WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH):
+            with self.subTest(path=path):
+                target = self.project / path
+                original = target.read_text()
+                target.write_text(original + "# my change\n")
+                with self.assertRaisesRegex(GitHubError, "was edited") as caught:
+                    self.setup_call(manifest=manifest(with_github=True))
+                self.assertIn(path, str(caught.exception))
+                self.assertIn("# my change", target.read_text())
+                self.setup_call(manifest=manifest(with_github=True), force_workflow=True)
+                self.assertEqual(target.read_text(), original)
+
+    def test_no_quality_job_is_generated_when_the_project_has_no_quality_workflow(self):
+        self.setup_call()
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertNotIn("quality", text)
+        self.assertNotIn("code-quality", text)
+
+    def test_the_quality_job_uses_the_projects_reusable_workflow_when_it_exists(self):
+        path = self.project / QUALITY_WORKFLOW
+        path.parent.mkdir(parents=True)
+        path.write_text("on: workflow_call\njobs: {}\n")
+        self.setup_call()
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn(f"uses: ./{QUALITY_WORKFLOW}", text)
+        merged = manifest(with_github=True) | {"github": {"repository": "Example/orders", "deployment_branch": "main"}}
+        self.assertEqual(text, render_workflow(merged, tooling_ref=REF, quality_workflow=QUALITY_WORKFLOW))
+
+    def test_the_quality_job_can_be_left_out_of_a_project_that_has_one(self):
+        path = self.project / QUALITY_WORKFLOW
+        path.parent.mkdir(parents=True)
+        path.write_text("on: workflow_call\njobs: {}\n")
+        self.setup_call(include_quality=False)
+        self.assertNotIn("quality", (self.project / WORKFLOW_PATH).read_text())
+
+    def test_an_explicit_quality_workflow_is_used_and_an_unusable_one_changes_nothing(self):
+        self.setup_call(quality_workflow=".github/workflows/checks.yml")
+        self.assertIn("uses: ./.github/workflows/checks.yml", (self.project / WORKFLOW_PATH).read_text())
+        before = (self.project / WORKFLOW_PATH).read_text()
+        for bad in ("code-quality.yml", WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH):
+            with self.subTest(bad=bad), self.assertRaises(GitHubError) as caught:
+                self.setup_call(quality_workflow=bad, force_workflow=True)
+            self.assertEqual((caught.exception.code, caught.exception.step), (2, "workflow"))
+            self.assertEqual((self.project / WORKFLOW_PATH).read_text(), before)
 
     def test_the_tooling_version_must_be_pinned_explicitly_when_it_cannot_be_detected(self):
         with patch("shiplord.github.detect_tooling_ref", return_value=None), self.assertRaisesRegex(GitHubError, "--tooling-ref"):
@@ -565,6 +617,14 @@ class StatusTests(GitHubTestCase):
             self.assertFalse(checks[name]["ok"], name)
         self.assertEqual(checks["variables"]["missing"], ["SHIPLORD_DEPLOY_USER"])
 
+    def test_a_missing_deploy_workflow_is_reported(self):
+        self.setup_call()
+        (self.project / DEPLOY_WORKFLOW_PATH).unlink()
+        code, result = self.status()
+        self.assertEqual(code, 3)
+        self.assertFalse(result["checks"]["workflow"]["ok"])
+        self.assertEqual(result["checks"]["workflow"]["missing"], [DEPLOY_WORKFLOW_PATH])
+
     def test_a_manifest_without_github_is_a_usage_error(self):
         with self.assertRaises(GitHubError) as caught:
             github_status(manifest(), project=self.project, gh=self.gh, home=self.home)
@@ -701,6 +761,15 @@ class CheckCiTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("github status --check-server", result["hint"])
         self.assertNotIn("subject_expected", result)
+
+    def test_the_deploy_job_is_found_inside_the_called_workflow(self):
+        view = check_view()
+        for job in view["jobs"]:
+            if job["name"] == "deploy":
+                job["name"] = "deploy / deploy"  # a reusable workflow reports `caller / called`
+        self.gh_runner.views = [view]
+        code, result = self.check()
+        self.assertEqual((code, result["steps"]["Check access only"]), (0, "success"))
 
     def test_a_workflow_without_the_check_mode_asks_for_regeneration(self):
         self.gh_runner.dispatch_error = "could not create workflow dispatch event: HTTP 422: Unexpected inputs provided"

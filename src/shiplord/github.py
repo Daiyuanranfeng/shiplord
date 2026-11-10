@@ -28,7 +28,8 @@ from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
 from .manifest import ManifestError, validate_manifest
 from .servers import SshOptions, _config_home, ssh_command
-from .workflow import TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError, render_workflow
+from .workflow import (DEFAULT_QUALITY_WORKFLOW, DEPLOY_WORKFLOW_PATH, TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError,
+                       render_deploy_workflow, render_workflow, validate_quality_workflow)
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
@@ -287,11 +288,16 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
-def validate_setup_profile(manifest: dict) -> None:
-    """Reject unsupported workflow generation before callers collect settings or credentials."""
-    if manifest["template"] == "generic":
-        raise GitHubError("github setup generates an ADK workflow; generic Docker applications need a custom "
-                          "workflow invoking `shiplord deploy`", 2, "configuration")
+def validate_setup_request(manifest: dict, repository: str) -> None:
+    """Reject an unusable setup request before callers collect settings, credentials, or change anything.
+
+    Nothing here is template-specific: every supported template gets the same CI key, secret, variables and
+    generated pipeline. Only the runtime decides whether a workflow is generated.
+    """
+    if not _REPOSITORY.fullmatch(repository):
+        raise GitHubError("--repo must be owner/repository", 2)
+    if "github" in manifest and manifest["github"]["repository"] != repository:
+        raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
 
 
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
@@ -315,12 +321,9 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
                  ci_host: str | None = None, tooling_ref: str | None = None, platforms: str = "linux/amd64",
                  tailscale: Mapping[str, str] | None = None, force_workflow: bool = False, home: Path | None = None,
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
-                 resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
-    validate_setup_profile(manifest)
-    if not _REPOSITORY.fullmatch(repository):
-        raise GitHubError("--repo must be owner/repository", 2)
-    if "github" in manifest and manifest["github"]["repository"] != repository:
-        raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
+                 resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host, quality_workflow: str | None = None,
+                 include_quality: bool = True) -> dict:
+    validate_setup_request(manifest, repository)
     app = manifest["name"]
     steps: dict[str, str] = {}
     account = gh.account()
@@ -376,7 +379,8 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         gh.set_variable(repository, name, value)
     steps["variables"] = ", ".join(sorted(variables))
 
-    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms, force_workflow)
+    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms,
+                                        force_workflow, quality_workflow, include_quality)
     _ensure_manifest_github(project, manifest, repository)
     steps["manifest"] = f"ship.toml names {repository}"
     remaining = []
@@ -408,35 +412,65 @@ def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
         raise GitHubError(str(error), 3, "tailscale") from None
 
 
+def _resolve_quality_workflow(project: Path, requested: str | None, include: bool) -> str | None:
+    """The reusable quality workflow to run before deploy, or ``None``.
+
+    Never guessed by the renderer: an explicit request wins, otherwise the conventional file is used only
+    when the project really contains it, so a generated workflow never references a file the user lacks.
+    """
+    if not include:
+        return None
+    if requested is not None:
+        try:
+            return validate_quality_workflow(requested)
+        except WorkflowError as error:
+            raise GitHubError(str(error), 2, "workflow") from None
+    return DEFAULT_QUALITY_WORKFLOW if (project / DEFAULT_QUALITY_WORKFLOW).is_file() else None
+
+
 def _write_workflow(manifest: dict, repository: str, project: Path, state: dict, directory: Path,
-                    tooling_ref: str | None, platforms: str, force: bool) -> str:
+                    tooling_ref: str | None, platforms: str, force: bool, quality_workflow: str | None = None,
+                    include_quality: bool = True) -> str:
     if manifest["runtime"] != "docker":
         return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
     ref = tooling_ref or detect_tooling_ref()
     if ref is None:
         raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
                           "pushed to GitHub)", 2, "workflow")
+    quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
+    merged = dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})})
     try:
-        text = render_workflow(dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})}),
-                               tooling_ref=ref, platforms=platforms)
+        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, platforms=platforms),
+                 WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, platforms=platforms, quality_workflow=quality)}
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
-    path = project / WORKFLOW_PATH
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    if path.exists():
-        existing = hashlib.sha256(path.read_bytes()).hexdigest()
-        if existing == digest:
-            return f"unchanged ({WORKFLOW_PATH})"
-        if existing != state.get("workflow_sha256") and not force:
-            raise GitHubError(f"{WORKFLOW_PATH} was edited since Shiplord generated it; review it, or pass "
-                              "--force-workflow to replace it", 2, "workflow")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(text)
-    os.replace(temporary, path)
-    state["workflow_sha256"] = digest
+    digests = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()}
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    # Check every file before writing any, so a refusal never leaves half a pipeline behind.
+    changed = []
+    for path in texts:
+        target = project / path
+        if target.exists():
+            existing = hashlib.sha256(target.read_bytes()).hexdigest()
+            if existing == digests[path]:
+                continue
+            previous = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+            if existing != previous and not force:
+                raise GitHubError(f"{path} was edited since Shiplord generated it; review it, or pass "
+                                  "--force-workflow to replace it", 2, "workflow")
+        changed.append(path)
+    for path in changed:
+        target = project / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        temporary.write_text(texts[path])
+        os.replace(temporary, target)
+    state["workflows"] = {**recorded, **digests}
+    state["workflow_sha256"] = digests[WORKFLOW_PATH]  # kept so an older installation's record still matches
     _save_state(directory, state)
-    return f"written ({WORKFLOW_PATH}, Shiplord pinned at {ref[:12]})"
+    if not changed:
+        return f"unchanged ({', '.join(texts)})"
+    return f"written ({', '.join(changed)}, Shiplord pinned at {ref[:12]})"
 
 
 def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:
@@ -550,9 +584,17 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
     checks["tailscale"] = {"ok": all(variables.get(name) for name in TAILSCALE_VARIABLES[:2]),
                            "hint": "rerun `shiplord github setup` for step-by-step Tailscale instructions with this "
                                    "repository's exact OIDC subject"}
-    workflow = project / WORKFLOW_PATH
-    unmodified = workflow.exists() and hashlib.sha256(workflow.read_bytes()).hexdigest() == state.get("workflow_sha256")
-    checks["workflow"] = {"ok": workflow.exists(), "unmodified_since_generation": unmodified}
+    workflow_paths = (WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH)
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    present = [path for path in workflow_paths if (project / path).is_file()]
+    missing = [path for path in workflow_paths if path not in present]
+
+    def unmodified(path: str) -> bool:
+        previous = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+        return bool(previous) and hashlib.sha256((project / path).read_bytes()).hexdigest() == previous
+
+    checks["workflow"] = {"ok": not missing, "missing": missing,
+                          "unmodified_since_generation": bool(present) and all(unmodified(path) for path in present)}
     checks["ci_key"] = {"ok": bool(state.get("secret_set")), "label": state.get("label"), "fingerprint": state.get("fingerprint")}
     if admin is not None:
         listed = {item["label"]: item["fingerprint"] for item in admin.call("keys", app, {"operation": "list"})["keys"]}
@@ -571,6 +613,11 @@ CHECK_HINTS = {
     "Prepare the SSH identity and pinned host keys": "the CI secret or variables are missing; run `shiplord github setup`",
     "Check access only": "the CI key, host keys or helper were refused; run `shiplord github status --check-server`",
 }
+
+
+def _job(jobs: list[dict], name: str) -> dict:
+    """A job by name. A reusable workflow reports its jobs as ``caller / called``."""
+    return next((job for job in jobs if str(job.get("name", "")).split(" / ")[-1] == name), {})
 
 
 def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callable[[], float] = time.monotonic,
@@ -599,7 +646,7 @@ def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callab
             return 1, {"ok": False, "run": run.get("url"), "status": run.get("status"),
                        "error": "the check run did not finish in time; it is still running on GitHub"}
         sleep(10)
-    deploy = next((job for job in run.get("jobs") or [] if job.get("name") == "deploy"), {})
+    deploy = _job(run.get("jobs") or [], "deploy")
     steps = {step["name"]: step.get("conclusion") for step in deploy.get("steps") or []}
     failed = next((name for name, conclusion in steps.items() if conclusion == "failure"), None)
     ok = run.get("conclusion") == "success" and steps.get("Check access only") == "success"
