@@ -606,7 +606,18 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
         phase = transaction.get("phase", "unknown")
         typer.echo(f"Unfinished transaction: {phase} ({transaction.get('request_id', 'request ID unavailable')})")
         typer.echo("Why: the server has an unfinished deployment transaction that must be reconciled before another deploy.")
-        typer.echo("Next: run `shiplord recover` from this application's repository.")
+        if server:
+            typer.echo(f"Next: run `shiplord recover {application} --server {server}` to reconcile it.")
+        else:
+            typer.echo("Next: run `shiplord recover` from this application's repository.")
+
+
+def _render_recovery(application: str, server: str | None, result: dict) -> None:
+    """Name the explicit target on stderr; the result body stays the same as manifest mode."""
+    target = f"{application} on {server}" if server else application
+    typer.echo(f"Target: {target}", err=True)
+    typer.echo(f"Outcome: {str(result.get('status') or 'unknown').replace('_', ' ')}", err=True)
+    _emit(result, False)
 
 
 def _render_operation(code: int, result: dict, target: str, operation: str) -> None:
@@ -916,11 +927,26 @@ def rollback(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command(rich_help_panel="Troubleshooting")
-def recover(json_output: bool = typer.Option(False, "--json")) -> None:
+def recover(application: Optional[str] = typer.Argument(None, metavar="APP"),
+            server: Optional[str] = typer.Option(None, "--server", help="Registered server alias; required with APP."),
+            json_output: bool = typer.Option(False, "--json")) -> None:
     """Reconcile an interrupted deployment to the last committed release."""
-    manifest = _manifest(json_output)
-    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover",
-                                              on_progress=_progress(json_output)), json_output)
+    if application is None and server is None:
+        manifest = _manifest(json_output)
+        _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover",
+                                                  on_progress=_progress(json_output)), json_output)
+        return
+    if application is None or server is None:
+        _fail("recovery needs both an application and a server alias: run "
+              "`shiplord recover <app> --server <alias>` from anywhere, or `shiplord recover` in the application's "
+              "directory", 2, json_output)
+    try:
+        app_name, server_alias, client = _app_context(application, server, json_output, "recover")
+    except (CommandError, ClientError, ManifestError, ServerError) as error:
+        _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
+              **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
+    _execute(lambda: commands.run_job_command(None, client, "recover", on_progress=_progress(json_output)), json_output,
+             lambda _code, result: _render_recovery(app_name, server_alias, result))
 
 
 @env_app.command("set")

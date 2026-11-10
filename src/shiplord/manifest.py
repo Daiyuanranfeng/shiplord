@@ -20,6 +20,7 @@ _NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 GENERIC_DOCKER_FEATURE = "docker_generic_v1"
+MAX_READINESS_SECONDS = 900  # the ceiling for deploy.readiness_timeout_seconds
 
 
 def _table(value: object, name: str, allowed: set[str]) -> dict:
@@ -149,7 +150,8 @@ def validate_manifest(raw: dict) -> dict:
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases",
                                                    "shutdown_timeout_seconds", "shutdown_timeout_action"})
-    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 900)
+    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1,
+                     MAX_READINESS_SECONDS)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,

@@ -16,7 +16,7 @@ from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
-from .manifest import GENERIC_DOCKER_FEATURE
+from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS
 from .runtime import RuntimeFailure
 from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
@@ -254,6 +254,13 @@ def job_timeout(manifest: dict) -> float:
     return manifest["deploy"]["readiness_timeout_seconds"] + 900
 
 
+def explicit_job_timeout() -> float:
+    """Wait bound for a named target with no local manifest: cover the larger of both supported runtimes."""
+    docker = job_timeout({"runtime": "docker"})
+    native = job_timeout({"runtime": "native", "deploy": {"readiness_timeout_seconds": MAX_READINESS_SECONDS}})
+    return max(docker, native)
+
+
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
                        commit: str, sequence: int, request_id: str | None = None, timeout: float | None = None, allow_older: bool = False,
                        on_progress: Callable[[str], None] = lambda phase: None, verify_public: bool = True,
@@ -302,11 +309,16 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
     return 0, {"ok": True, "logs": client.call("logs", arguments={"tail": tail})["result"]["logs"]}
 
 
-def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+def run_job_command(manifest: dict | None, client: HelperClient, action: str, *, request_id: str | None = None,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Submit one job and wait for it.
+
+    ``manifest`` is None for a named target resolved without a local manifest; the wait bound then has to cover
+    every runtime the server may report for that application.
+    """
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress)
+    timeout = explicit_job_timeout() if manifest is None else job_timeout(manifest)
+    outcome = submit_and_wait(client, action, request_id=request_id, timeout=timeout, on_progress=on_progress)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 

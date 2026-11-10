@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `shiplord recover <app> --server <alias>`, so an interrupted deployment can be
+  reconciled from any directory without a checkout, and print that target-specific
+  command in human-readable `status` output.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

@@ -219,7 +219,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
-| `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
+| `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| (in an app directory)` | Prerequisites; helper probe (`--deep`: Caddy, sshd, Docker, disk, each application); access, helper, DNS. |
@@ -259,7 +259,9 @@ back deliberately. Database and persistent data are never
 rolled back.
 
 If a worker is killed mid-deployment the journal remains, further deployments are refused with
-`recovery_required`, and `shiplord recover` restores the last committed release.
+`recovery_required`, and `shiplord recover` restores the last committed release. `shiplord status` prints the
+named form of that command, so recovery works from any directory without a checkout:
+`shiplord recover <app> --server <alias>`.
 
 ## Security model
 

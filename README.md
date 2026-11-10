@@ -72,6 +72,9 @@ shiplord rollback
 shiplord recover
 ```
 
+From any directory, `shiplord recover <app> --server <alias>` reconciles a named application without a checkout;
+`shiplord status` prints that exact command when it finds unfinished work.
+
 Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
 
 ## Learn more
