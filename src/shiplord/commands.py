@@ -18,13 +18,21 @@ from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
+from .servers import ServerError
 from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
-from .protocol import PROTOCOL_VERSION
+from .protocol import IncompatibleProtocol, PROTOCOL_VERSION
+from .transport import TransportError, probe_capabilities
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z")
 DEFAULT_KEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
+MINIMUM_INVENTORY_HELPER_VERSION = "0.2.0"
+FLEET_PROBE_TIMEOUT_SECONDS = 5.0
+# Only stable SemVer releases have an unambiguous compatibility ordering.
+_STABLE_RELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                             r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+_MINIMUM_INVENTORY = tuple(int(part) for part in MINIMUM_INVENTORY_HELPER_VERSION.split("."))
 
 
 class CommandError(Exception):
@@ -351,3 +359,63 @@ def server_applications(admin: AdminClient) -> tuple[int, dict]:
     """Read the registered applications from the server's root-only inventory."""
     result = admin.call("apps", None, {})
     return (0 if result["ok"] else 3), result
+
+
+def inventory_support(version: object) -> str:
+    """Classify a helper version against the app-inventory minimum.
+
+    A version without an unambiguous ordering (a pre-release, or anything that is not stable
+    SemVer) is ``unknown``: it is never reported as a confirmed lack of inventory support.
+    """
+    match = _STABLE_RELEASE.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        return "unknown"
+    return "supported" if tuple(map(int, match.groups())) >= _MINIMUM_INVENTORY else "unsupported"
+
+
+def inventory_upgrade(alias: str, version: object) -> dict | None:
+    """Upgrade guidance only when a stable helper release is confirmed too old for app inventory."""
+    if inventory_support(version) != "unsupported":
+        return None
+    return {"error": f"App inventory requires helper {MINIMUM_INVENTORY_HELPER_VERSION} or later.",
+            "error_code": "helper_upgrade_required", "helper_version": version,
+            "minimum_helper_version": MINIMUM_INVENTORY_HELPER_VERSION,
+            "upgrade_command": f"shiplord server bootstrap {alias}"}
+
+
+def doctor_all_servers(servers: list[dict[str, str]], probe: Callable[..., dict] | None = None,
+                       timeout: float = FLEET_PROBE_TIMEOUT_SECONDS) -> tuple[int, dict]:
+    """Probe every registered server read-only; one failed probe never stops the sweep.
+
+    Reachability and inventory support are reported separately, so an unreachable server is
+    never mistaken for a confirmed old helper. Nothing here asks for sudo or runs bootstrap.
+    """
+    probe = probe or probe_capabilities
+    results = []
+    for entry in servers:
+        alias = entry["alias"]
+        try:
+            response = probe(entry["ssh"], timeout=timeout)
+        except IncompatibleProtocol:
+            results.append({"server": alias, "ok": False, "reachable": True, "helper_version": None,
+                            "inventory_support": "unknown", "error": "incompatible helper protocol version",
+                            "error_code": "incompatible_protocol"})
+            continue
+        except (TransportError, ServerError):
+            results.append({"server": alias, "ok": False, "reachable": False, "helper_version": None,
+                            "inventory_support": "unknown",
+                            "error": "server capabilities check failed; verify the alias, SSH trust, login, and dispatcher"})
+            continue
+        version = response.get("helper_version")
+        upgrade = inventory_upgrade(alias, version)
+        item = {"server": alias, "ok": upgrade is None, "reachable": True,
+                "helper_version": version if isinstance(version, str) else None,
+                "inventory_support": inventory_support(version)}
+        if upgrade is not None:
+            item.update(upgrade)
+        results.append(item)
+    partial = any(not item["ok"] for item in results)
+    return (3 if partial else 0), {
+        "ok": not partial, "partial": partial,
+        "scope": "protocol capabilities only; server readiness and deployment access were not checked",
+        "servers": results}

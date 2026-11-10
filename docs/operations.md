@@ -37,6 +37,13 @@ installation, whether Caddy imports the managed routes and is running, whether t
 accepts its configuration, whether Docker answers, free disk on the Shiplord paths and Docker's, and each
 application's state including any unfinished transaction.
 
+`shiplord doctor --all-servers` probes every registered alias with the same read-only capabilities exchange, five
+seconds per server, and keeps going when one is unreachable. It reports each alias's reachability, helper version,
+and inventory support separately: only a stable helper older than 0.2.0 is a confirmed lack of inventory support and
+gets the `shiplord server bootstrap <alias>` hint. The aggregate exits 0 only when every registered server answered
+with a compatible helper; anything unreachable, incompatible, or unreadable exits 3. It never asks for sudo and never
+runs bootstrap. It rejects `--server`, `--local`, and `--deep` before contacting anything.
+
 ## Failure and recovery
 
 | Situation | What happens | What you do |

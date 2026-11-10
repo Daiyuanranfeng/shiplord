@@ -162,13 +162,9 @@ def _server_inventory(server: dict, json_output: bool) -> tuple[int, dict]:
         version = response.get("helper_version")
     except (TransportError, IncompatibleProtocol, ServerError):
         version = None
-    # Only stable SemVer releases have an unambiguous compatibility ordering.
-    stable_version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-    match = re.fullmatch(stable_version, version) if isinstance(version, str) else None
-    if match and tuple(map(int, match.groups())) < (0, 2, 0):
-        return 4, {"ok": False, "error": "App inventory requires helper 0.2.0 or later.",
-                   "error_code": "helper_upgrade_required", "helper_version": version,
-                   "minimum_helper_version": "0.2.0", "upgrade_command": f"shiplord server bootstrap {server['alias']}"}
+    upgrade = commands.inventory_upgrade(server["alias"], version)
+    if upgrade is not None:
+        return 4, {"ok": False, **upgrade}
     prompt = None if json_output else _interactive_admin_prompt(False)
     return commands.server_applications(AdminClient(server["ssh"], prompt=prompt))
 
@@ -253,9 +249,18 @@ def plan(image: Optional[str] = typer.Option(None, "--image", help="Ask the serv
 @app.command(rich_help_panel="Troubleshooting")
 def doctor(local: bool = typer.Option(False, "--local", help="Check local prerequisites."),
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
+           all_servers: bool = typer.Option(False, "--all-servers",
+                                            help="Probe every registered server (read-only, no sudo)."),
            deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, Docker, disk, and applications (sudo)."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
     """Check local prerequisites or a server's protocol capabilities."""
+    if all_servers:
+        for name, chosen in (("--local", local), ("--server", server is not None), ("--deep", deep)):
+            if chosen:
+                _emit({"ok": False, "error": f"--all-servers cannot be combined with {name}"}, json_output)
+                raise typer.Exit(2)
+        _doctor_all_servers(json_output)
+        return
     if local and server:
         _emit({"ok": False, "error": "choose either --local or --server"}, json_output)
         raise typer.Exit(2)
@@ -310,6 +315,28 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
         _render_doctor(result, "local machine")
     if not ok:
         raise typer.Exit(3)
+
+
+def _doctor_all_servers(json_output: bool) -> None:
+    """Probe every registered server once, continuing past a failure; sudo and bootstrap are never involved."""
+    try:
+        servers, invalid = list_servers()
+    except ServerError as error:
+        _fail(str(error), 3, json_output)
+    if not servers:
+        _fail("No servers are registered. Run `shiplord server add`, then `shiplord doctor --all-servers`.",
+              3, json_output)
+    code, result = commands.doctor_all_servers(servers)
+    if invalid:
+        result.update(ok=False, partial=True, invalid_entries=invalid)
+        code = 3
+    result["client"] = _client_details()
+    if json_output:
+        _emit(result, True)
+    else:
+        _render_fleet_doctor(result)
+    if code:
+        raise typer.Exit(code)
 
 
 @server_app.command("add", rich_help_panel="Setup")
@@ -696,6 +723,29 @@ def _render_doctor(result: dict, target: str) -> None:
     for name, value in checks.items():
         if name not in shown:
             typer.echo(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
+
+
+def _render_fleet_doctor(result: dict) -> None:
+    typer.echo("Target: all registered servers")
+    typer.echo(f"Outcome: {'compatible' if result.get('ok') else 'attention required'}")
+    client = result.get("client")
+    if client:
+        typer.echo("Client:")
+        typer.echo(f"  shiplord {client['version']}")
+        typer.echo(f"  executable: {client['executable']}")
+    for item in result.get("servers", []):
+        if item.get("reachable"):
+            version = item.get("helper_version") or "unknown"
+            typer.echo(f"{item['server']}: reachable, helper {version}, inventory {item['inventory_support']}")
+        else:
+            typer.echo(f"{item['server']}: unreachable, inventory unknown")
+        if item.get("error_code") == "helper_upgrade_required":
+            typer.echo("  " + _upgrade_message(item))
+        elif item.get("error"):
+            typer.echo(f"  Error: {item['error']}")
+    if result.get("invalid_entries"):
+        count = result["invalid_entries"]
+        typer.echo(f"Ignored {count} invalid server {'entry' if count == 1 else 'entries'}.")
 
 
 @server_app.command("bootstrap", rich_help_panel="Setup")
