@@ -48,3 +48,17 @@ list each discarded release only when the discard returned no warnings.
 #### Scenario: A discard that produced a warning is reported as kept
 - **WHEN** a release's discard returns a warning
 - **THEN** the report lists that warning under `retained` and does not claim that release's artifacts were removed
+
+### Requirement: The command that retires an application returns the retirement report
+`deprovision --retire` MUST include the retirement report in its own result, under `retired`, and MUST merge the
+retirement's retained entries into its `retained` list. A report computed and then discarded does not satisfy the
+requirement that the operator is told what was removed and what was kept.
+
+#### Scenario: The operator sees what retirement removed
+- **WHEN** a deployed application is deprovisioned with a retirement callback that reports its work
+- **THEN** the `deprovision` result contains `retired` with that report
+- **AND** its `retained` list includes the retirement's retained entries
+
+#### Scenario: A callback that reports nothing changes nothing
+- **WHEN** the retirement callback returns no report
+- **THEN** the `deprovision` result has no `retired` key and its `retained` list is unchanged

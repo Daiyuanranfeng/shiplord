@@ -509,6 +509,29 @@ class DeprovisionTests(ProvisionTestCase):
         self.assertTrue(result["removed"]["account"])
         self.assertFalse((self.layout.registrations / "orders.json").exists())
 
+    def test_the_retirement_report_reaches_the_result_the_caller_sees(self):
+        self.provision()
+        store = self.open_store()
+        report = {"removed": ["public route", "running release"],
+                  "retained": ["application data (the data directory and its volume)"]}
+        with self.lock.acquire():
+            self.deploy_one(store)
+            result = deprovision(self.layout, self.system, self.lock, "orders",
+                                 retire=lambda registration, state: report)
+        self.assertEqual(result["retired"], report)
+        self.assertIn("application data (the data directory and its volume)", result["retained"])
+        self.assertTrue(result["removed"]["registration"])
+
+    def test_a_retirement_callback_that_reports_nothing_adds_nothing(self):
+        self.provision()
+        store = self.open_store()
+        with self.lock.acquire():
+            self.deploy_one(store)
+            result = deprovision(self.layout, self.system, self.lock, "orders",
+                                 retire=lambda registration, state: None)
+        self.assertNotIn("retired", result)
+        self.assertEqual(result["retained"], [])
+
     def test_a_failed_retirement_leaves_the_application_registered_and_reachable(self):
         self.provision()
         store = self.open_store()

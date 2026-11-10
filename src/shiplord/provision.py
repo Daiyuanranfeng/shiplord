@@ -354,12 +354,13 @@ def _remove_account(system: System, name: str, sleep: Callable[[float], None]) -
 
 
 def deprovision(layout: Layout, system: System, lock: HostLock, application_id: str, *,
-                retire: Callable[[dict, dict], None] | None = None,
+                retire: Callable[[dict, dict], dict | None] | None = None,
                 sleep: Callable[[float], None] = time.sleep) -> dict:
     """Remove an application's access and host resources.
 
     While a release is deployed this refuses, unless ``retire(registration, state)`` is given: it stops the runtime,
     removes the route and discards the releases first, and any failure of it leaves the application registered.
+    A report from it is returned under ``retired`` and its retained entries join the result's ``retained`` list.
     """
     if not lock.held:
         raise ProvisionError("host lock is required")
@@ -369,6 +370,7 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
     if (state_path / "journal.json").exists():
         raise ProvisionError("an unfinished transaction exists; recover it before removing the application")
     state_file = state_path / "state.json"
+    retired = None
     if state_file.exists():
         state_fd = _open_directory(state_path)
         try:
@@ -383,7 +385,7 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
                     os.close(registry_fd)
                 if registration is None:
                     raise ProvisionError("the application is not registered")
-                retire(registration, state)
+                retired = retire(registration, state)
         except StateError as error:
             raise ProvisionError(f"release state is not usable: {error}") from None
         finally:
@@ -418,6 +420,8 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
         elif key != "registry_login":  # an optional item is reported only when it existed
             removed[key] = False
     retained = []
+    if isinstance(retired, dict):  # what retirement kept is part of what this command kept
+        retained.extend(retired.get("retained", []))
     if (layout.data / app).exists():
         retained.append("data directory and runtime account (they hold application data)")
     if (layout.releases / app).is_symlink():
@@ -431,4 +435,5 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
         unit.unlink(missing_ok=True)
         _run(system, ["/usr/bin/systemctl", "daemon-reload"], "systemctl")
         removed["service_unit"] = True
-    return {"application_id": app, "removed": removed, "retained": retained}
+    return {"application_id": app, "removed": removed, "retained": retained,
+            **({"retired": retired} if isinstance(retired, dict) else {})}

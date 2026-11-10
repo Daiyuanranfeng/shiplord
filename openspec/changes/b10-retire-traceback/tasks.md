@@ -11,6 +11,9 @@
 - [x] 2.1 Return `{"removed": [...], "retained": [...]}` from the retirement callback, and verify the tests assert the route and running release are under `removed` and application data is under `retained`
 - [x] 2.2 List a discarded release only when `runtime.discard` returned no warnings, and verify the warning test asserts the release is kept and its warning is reported
 - [x] 2.3 Update the callback docstring and verify the full unit suite still passes
+- [x] 2.4 Carry the report into the `deprovision` result under `retired`, and merge its retained entries into the
+      result's `retained`, so the caller sees what retirement did; verify a test drives `deprovision(..., retire=...)`
+      and asserts the report is in the returned dict (it fails with `KeyError: 'retired'` before the change)
 
 ## 3. Verification
 
