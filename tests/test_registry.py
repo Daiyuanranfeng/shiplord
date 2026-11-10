@@ -65,6 +65,15 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(RegistryError):
             validate_registration(record(), "billing")
 
+    def test_additional_hostnames_round_trip_and_are_validated(self):
+        aliases = record(hostnames=["legacy.example.com", "www.orders.example.com"])
+        self.assertEqual(validate_registration(aliases), aliases)
+        self.assertNotIn("hostnames", validate_registration(record()))  # a record without aliases is unchanged
+        for bad in (["orders.example.com"], ["www.other.example.com"], ["legacy.example.com"] * 2,
+                    ["Legacy.example.com"], ["127.0.0.1"], "legacy.example.com"):
+            with self.subTest(hostnames=bad), self.assertRaises(RegistryError):
+                validate_registration(record(hostnames=bad))
+
 
 class RegistryTests(unittest.TestCase):
     def setUp(self):
@@ -135,6 +144,45 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(RegistryError, "account"):
                 self.register("billing", deployment_uid=1002)
         self.assertEqual(os.listdir(self.directory), ["orders.json"])
+
+    def test_an_alias_conflicts_with_another_applications_canonical_hostname(self):
+        with self.lock.acquire():
+            self.register("orders")
+            for alias in (["orders.example.com"], ["legacy.example.com", "orders.example.com"]):
+                with self.subTest(alias=alias), self.assertRaisesRegex(RegistryError, "hostname"):
+                    self.register("billing", hostnames=alias, deployment_uid=1002,
+                                  deployment_user="ship-billing")
+                with self.subTest(alias=alias, check=True), self.assertRaisesRegex(RegistryError, "hostname"):
+                    self.registry.check("billing", **request("billing", hostnames=alias, deployment_uid=1002,
+                                                             deployment_user="ship-billing"))
+        self.assertEqual(os.listdir(self.directory), ["orders.json"])
+
+    def test_a_canonical_hostname_conflicts_with_another_applications_alias(self):
+        with self.lock.acquire():
+            self.register("orders", hostnames=["legacy.example.com", "www.orders.example.com"])
+            for change in ({"api_domain": "legacy.example.com"}, {"api_domain": "www.orders.example.com"}):
+                with self.subTest(change=change), self.assertRaisesRegex(RegistryError, "hostname"):
+                    self.register("billing", deployment_uid=1002, deployment_user="ship-billing", **change)
+        self.assertEqual(sorted(os.listdir(self.directory)), ["orders.json"])
+
+    def test_aliases_are_stored_and_an_identical_registration_is_returned(self):
+        with self.lock.acquire():
+            created = self.register(hostnames=["legacy.example.com", "www.orders.example.com"])
+            self.assertEqual(created["hostnames"], ["legacy.example.com", "www.orders.example.com"])
+            self.assertEqual(json.loads((self.directory / "orders.json").read_text()), created)
+            self.assertEqual(self.registry.check("orders", **request(
+                hostnames=["legacy.example.com", "www.orders.example.com"])), created)
+            self.assertEqual(self.register(hostnames=["legacy.example.com", "www.orders.example.com"]), created)
+
+    def test_changing_the_aliases_of_a_registered_application_is_refused(self):
+        with self.lock.acquire():
+            first = self.register(hostnames=["legacy.example.com"])
+            for hostnames in ([], ["other.example.com"], ["legacy.example.com", "www.orders.example.com"]):
+                with self.subTest(hostnames=hostnames), self.assertRaisesRegex(RegistryError, "differs"):
+                    self.register(hostnames=hostnames)
+                with self.subTest(hostnames=hostnames, check=True), self.assertRaisesRegex(RegistryError, "differs"):
+                    self.registry.check("orders", **request(hostnames=hostnames))
+            self.assertEqual(self.registry.read("orders"), first)
 
     def test_invalid_input_is_rejected_before_any_write(self):
         with self.lock.acquire():

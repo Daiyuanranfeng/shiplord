@@ -94,6 +94,21 @@ def _routes_for_host(node: object, domain: str, found: list[dict]) -> None:
             _routes_for_host(item, domain, found)
 
 
+def _static_responses(node: object, found: list[dict]) -> None:
+    if isinstance(node, dict):
+        if node.get("handler") == "static_response":
+            found.append(node)
+        for value in node.values():
+            _static_responses(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _static_responses(item, found)
+
+
+REDIRECT_STATUS = 308
+URI_PLACEHOLDER = "{http.request.uri}"  # Caddy's {uri}: the path and query string of the request
+
+
 def config_routes_to(config: object, domain: str, upstream: str) -> bool:
     """True if some route matching ``domain`` in a Caddy JSON config proxies to ``upstream``."""
     routes: list[dict] = []
@@ -103,6 +118,25 @@ def config_routes_to(config: object, domain: str, upstream: str) -> bool:
         _dials(route, dials)
         if upstream in dials:
             return True
+    return False
+
+
+def config_redirects_to(config: object, host: str, canonical: str) -> bool:
+    """True if some route matching ``host`` permanently redirects every path and query to ``canonical``.
+
+    Caddy renders ``redir https://<host>{uri} 308`` as a ``static_response`` whose ``Location`` keeps the
+    request URI, so a redirect that would drop the path, the query, or the scheme is not this redirect.
+    """
+    expected = f"https://{canonical}{URI_PLACEHOLDER}"
+    routes: list[dict] = []
+    _routes_for_host(config, host, routes)
+    for route in routes:
+        responses: list[dict] = []
+        _static_responses(route, responses)
+        for response in responses:
+            locations = (response.get("headers") or {}).get("Location") or []
+            if response.get("status_code") == REDIRECT_STATUS and expected in locations:
+                return True
     return False
 
 
@@ -144,7 +178,11 @@ class Probes:
             config = json.loads(body.decode("utf-8"))
         except (OSError, http.client.HTTPException, ValueError):
             return None
-        return config_routes_to(config, registration["api_domain"], f"127.0.0.1:{registration['host_port']}")
+        canonical = registration["api_domain"]
+        if not config_routes_to(config, canonical, f"127.0.0.1:{registration['host_port']}"):
+            return False
+        # An alias that is not served as a permanent redirect to the canonical hostname is not what was rendered.
+        return all(config_redirects_to(config, host, canonical) for host in registration.get("hostnames") or ())
 
     def https(self, registration: dict, release: dict) -> dict:
         """Informational: does the public name serve over verified TLS (needs DNS and a certificate)?"""

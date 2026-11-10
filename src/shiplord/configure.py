@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from . import detect
@@ -95,13 +95,14 @@ def repository_from_git_remote(root: Path) -> str | None:
 
 def create_manifest(directory: Path, name: str, server: str, api_domain: str,
                     origins: list[str], runtime: str = "docker", template: str = "google-adk", *,
+                    hostnames: Sequence[str] | None = None, www_redirect: bool = False,
                     container_port: int = DEFAULT_CONTAINER_PORT, readiness_path: str = DEFAULT_READINESS_PATH,
                     memory_mb: int = DEFAULT_MEMORY_MB, image_repository: str | None = None) -> Path:
     raw = {
         "schema_version": 1, "name": name, "server": server,
         "template": template, "runtime": runtime,
-        "http": {"api_domain": api_domain, "frontend_origins": origins,
-                 "container_port": container_port, "readiness_path": readiness_path},
+        "http": {"api_domain": api_domain, "hostnames": list(hostnames or []), "www_redirect": www_redirect,
+                 "frontend_origins": origins, "container_port": container_port, "readiness_path": readiness_path},
         "resources": {"memory_mb": memory_mb},
         "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2},
     }
@@ -110,11 +111,14 @@ def create_manifest(directory: Path, name: str, server: str, api_domain: str,
     config = validate_manifest(raw)
     quote = json.dumps
     origin_list = ", ".join(quote(origin) for origin in config["http"]["frontend_origins"])
+    # `www_redirect` is expanded by validation, so the file records the aliases it produces and no second rule.
+    hostname_list = ", ".join(quote(host) for host in config["http"].get("hostnames") or [])
     content = (
         f'schema_version = 1\nname = {quote(config["name"])}\n'
         f'server = {quote(config["server"])}\ntemplate = {quote(config["template"])}\n'
         f'runtime = {quote(config["runtime"])}\n\n'
         f'[http]\napi_domain = {quote(config["http"]["api_domain"])}\n'
+        + (f'hostnames = [{hostname_list}]\n' if hostname_list else "") +
         f'frontend_origins = [{origin_list}]\ncontainer_port = {config["http"]["container_port"]}\n'
         f'readiness_path = {quote(config["http"]["readiness_path"])}\n\n'
         f'[resources]\nmemory_mb = {config["resources"]["memory_mb"]}\n\n'

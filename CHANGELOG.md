@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Serve additional hostnames per application: `http.hostnames` (or
+  `--hostname`, repeatable) and `http.www_redirect` (`--www`) redirect
+  permanently to the canonical `http.api_domain`, keeping the path and query
+  string. The extra hostnames are part of the registration, so a deployment
+  cannot add or drop them.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

@@ -10,9 +10,9 @@ from __future__ import annotations
 import os
 import re
 import socket
-from typing import Callable
+from typing import Callable, Sequence
 
-from .manifest import ManifestError, validate_app_name, validate_hostname
+from .manifest import ManifestError, validate_app_name, validate_hostname, validate_hostnames
 from .release_state import HostLock, StateError, _directory, _read, _write
 
 PORT_RANGE = range(20000, 30000)
@@ -21,7 +21,9 @@ MAX_REGISTRATION_BYTES = 4096
 _USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}\Z")
 _REPOSITORY = re.compile(r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+\Z")
 _FIELDS = {"schema_version", "application_id", "deployment_uid", "deployment_user", "runtime",
-           "api_domain", "host_port", "image_repository", "max_memory_mb"}
+           "api_domain", "hostnames", "host_port", "image_repository", "max_memory_mb"}
+# Registrations written before an application could answer on more than one hostname have no "hostnames".
+_OPTIONAL_FIELDS = {"hostnames"}
 _IDENTITY_FIELDS = _FIELDS - {"host_port"}
 
 
@@ -31,13 +33,14 @@ class RegistryError(StateError):
 
 def validate_registration(value: object, application_id: str | None = None) -> dict:
     """Validate a parsed registration; optionally require a specific application."""
-    if not isinstance(value, dict) or set(value) != _FIELDS:
+    if not isinstance(value, dict) or not _FIELDS - _OPTIONAL_FIELDS <= set(value) <= _FIELDS:
         raise RegistryError("invalid registration fields")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise RegistryError("incompatible registration version")
     try:
         app = validate_app_name(value["application_id"])
         domain = validate_hostname(value["api_domain"], "api_domain")
+        hostnames = validate_hostnames(domain, value.get("hostnames", []), "hostnames")
     except ManifestError:
         raise RegistryError("invalid registration identity") from None
     if application_id is not None and app != application_id:
@@ -64,9 +67,17 @@ def validate_registration(value: object, application_id: str | None = None) -> d
     memory = value["max_memory_mb"]
     if type(memory) is not int or not 16 <= memory <= 1048576:
         raise RegistryError("the memory ceiling must be between 16 and 1048576 MiB")
-    return {"schema_version": 1, "application_id": app, "deployment_uid": uid, "deployment_user": user,
-            "runtime": runtime, "api_domain": domain, "host_port": port, "image_repository": repository,
-            "max_memory_mb": memory}
+    result = {"schema_version": 1, "application_id": app, "deployment_uid": uid, "deployment_user": user,
+              "runtime": runtime, "api_domain": domain, "host_port": port, "image_repository": repository,
+              "max_memory_mb": memory}
+    if hostnames:  # absent means none, so a registration written before aliases existed reads back unchanged
+        result["hostnames"] = hostnames
+    return result
+
+
+def _hostnames(record: dict) -> list[str]:
+    """Every hostname a registration claims: the canonical one and the aliases that redirect to it."""
+    return [record["api_domain"], *record.get("hostnames", [])]
 
 
 def port_is_free(port: int) -> bool:
@@ -118,14 +129,15 @@ class Registry:
         return records
 
     def register(self, application_id: str, *, deployment_uid: int, deployment_user: str, runtime: str,
-                 api_domain: str, image_repository: str | None, max_memory_mb: int = DEFAULT_MAX_MEMORY_MB,
+                 api_domain: str, hostnames: Sequence[str] = (), image_repository: str | None,
+                 max_memory_mb: int = DEFAULT_MAX_MEMORY_MB,
                  probe: Callable[[int], bool] = port_is_free) -> dict:
         """Create a registration, or return the identical existing one."""
         if not self.lock.held:
             raise RegistryError("host lock is required")
         requested = self._requested(application_id, deployment_uid=deployment_uid, deployment_user=deployment_user,
-                                    runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                    max_memory_mb=max_memory_mb)
+                                    runtime=runtime, api_domain=api_domain, hostnames=hostnames,
+                                    image_repository=image_repository, max_memory_mb=max_memory_mb)
         existing, others = self._compared(requested)
         if existing is not None:
             return existing
@@ -138,7 +150,7 @@ class Registry:
         raise RegistryError("no loopback port is available")
 
     def check(self, application_id: str, *, deployment_uid: int | None, deployment_user: str, runtime: str,
-              api_domain: str, image_repository: str | None,
+              api_domain: str, hostnames: Sequence[str] = (), image_repository: str | None,
               max_memory_mb: int = DEFAULT_MAX_MEMORY_MB) -> dict | None:
         """Validate a prospective registration without writing; return the identical existing one, if any.
 
@@ -149,18 +161,21 @@ class Registry:
         if not self.lock.held:
             raise RegistryError("host lock is required")
         requested = self._requested(application_id, deployment_uid=deployment_uid, deployment_user=deployment_user,
-                                    runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                    max_memory_mb=max_memory_mb)
+                                    runtime=runtime, api_domain=api_domain, hostnames=hostnames,
+                                    image_repository=image_repository, max_memory_mb=max_memory_mb)
         return self._compared(requested)[0]
 
     def _requested(self, application_id: str, *, deployment_uid: int | None, deployment_user: str, runtime: str,
-                   api_domain: str, image_repository: str | None, max_memory_mb: int) -> dict:
+                   api_domain: str, hostnames: Sequence[str], image_repository: str | None,
+                   max_memory_mb: int) -> dict:
         """The prospective record, validated; an unknown UID is validated as a placeholder and then cleared."""
         app = validate_app_name(application_id)
         requested = {"schema_version": 1, "application_id": app, "deployment_uid": deployment_uid,
                      "deployment_user": deployment_user, "runtime": runtime, "api_domain": api_domain,
                      "host_port": PORT_RANGE.start, "image_repository": image_repository,
                      "max_memory_mb": max_memory_mb}
+        if hostnames:
+            requested["hostnames"] = list(hostnames)
         validate_registration(dict(requested, deployment_uid=1 if deployment_uid is None else deployment_uid))
         requested["deployment_uid"] = deployment_uid
         return requested
@@ -171,11 +186,12 @@ class Registry:
         others = [record for record in self.list() if record["application_id"] != app]
         existing = self.read(app)
         if existing is not None:
-            if any(existing[field] != requested[field] for field in _IDENTITY_FIELDS):
+            if any(existing.get(field) != requested.get(field) for field in _IDENTITY_FIELDS):
                 raise RegistryError("registration differs; changing it needs an explicit update")
         else:
+            claimed = set(_hostnames(requested))
             for record in others:
-                if record["api_domain"] == requested["api_domain"]:
+                if claimed & set(_hostnames(record)):
                     raise RegistryError("hostname is already registered to another application")
                 if (record["deployment_uid"] == requested["deployment_uid"]
                         or record["deployment_user"] == requested["deployment_user"]):

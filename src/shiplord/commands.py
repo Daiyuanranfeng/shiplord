@@ -85,6 +85,8 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
     arguments = {"runtime": manifest["runtime"], "api_domain": manifest["http"]["api_domain"],
                  "image_repository": image_repository_for(manifest, image_repository), "public_key": text,
                  "key_label": label}
+    if manifest["http"].get("hostnames"):  # a helper older than additional hostnames refuses an unknown argument
+        arguments["hostnames"] = list(manifest["http"]["hostnames"])
     if max_memory_mb is not None:
         arguments["max_memory_mb"] = max_memory_mb  # the ceiling a deploy request may ask for (default 4096)
     result = admin.call("provision", manifest["name"], arguments)

@@ -15,7 +15,7 @@ import secrets
 import shutil
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .environment import EnvironmentError_, load_environment_file, parse_environment
 from .installer import DEPLOY_GROUP, DEPLOY_MARKER
@@ -195,7 +195,7 @@ def _open_directory(path: Path) -> int:
 
 def provision(layout: Layout, system: System, lock: HostLock, *, application_id: str, runtime: str, api_domain: str,
               image_repository: str | None, public_key: str, key_label: str,
-              max_memory_mb: int = DEFAULT_MAX_MEMORY_MB) -> dict:
+              hostnames: Sequence[str] = (), max_memory_mb: int = DEFAULT_MAX_MEMORY_MB) -> dict:
     """Create or complete an application's host resources. The caller holds the host lock."""
     if not lock.held:
         raise ProvisionError("host lock is required")
@@ -208,7 +208,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     try:  # reject bad input before the first side effect; uid and port are placeholders here
         validate_registration({"schema_version": 1, "application_id": app, "deployment_uid": 1,
                                "deployment_user": deployment_user(app), "runtime": runtime,
-                               "api_domain": api_domain, "host_port": PORT_RANGE.start,
+                               "api_domain": api_domain, "hostnames": list(hostnames), "host_port": PORT_RANGE.start,
                                "image_repository": image_repository, "max_memory_mb": max_memory_mb})
     except StateError as error:
         raise ProvisionError(f"invalid application settings: {error}") from None
@@ -221,7 +221,8 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     try:
         existing = Registry(registry_fd, lock).check(
             app, deployment_uid=None if account is None else account["uid"], deployment_user=deployment_user(app),
-            runtime=runtime, api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+            runtime=runtime, api_domain=api_domain, hostnames=hostnames, image_repository=image_repository,
+            max_memory_mb=max_memory_mb)
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
@@ -255,15 +256,16 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     try:
         record = Registry(registry_fd, lock).register(
             app, deployment_uid=account["uid"], deployment_user=account["name"], runtime=runtime,
-            api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+            api_domain=api_domain, hostnames=hostnames, image_repository=image_repository,
+            max_memory_mb=max_memory_mb)
         created["registration"] = existing is None
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
         os.close(registry_fd)
     return {"application_id": app, "deployment_user": account["name"], "host_port": record["host_port"],
-            "api_domain": record["api_domain"], "runtime": record["runtime"], "max_memory_mb": record["max_memory_mb"],
-            "key_fingerprint": key.fingerprint,
+            "api_domain": record["api_domain"], "hostnames": record.get("hostnames") or [], "runtime": record["runtime"],
+            "max_memory_mb": record["max_memory_mb"], "key_fingerprint": key.fingerprint,
             "created": created}
 
 

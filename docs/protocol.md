@@ -102,7 +102,7 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 | Action | `arguments` |
 | --- | --- |
-| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label` |
+| `provision` | `runtime`, `api_domain`, optional `hostnames` (additional hostnames that redirect to it), `image_repository` (null for native), `public_key`, `key_label` |
 | `keys` | `operation` (`add`, `remove`, `list`), `label`, `public_key` |
 | `environment` | `operation` (`set`, `clear`, `keys`), `text` |
 | `registry` | `operation` (`login`, `logout`, `list`), `registry` (`ghcr.io`), `username`, `token` |

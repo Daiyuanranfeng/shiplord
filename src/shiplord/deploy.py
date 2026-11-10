@@ -78,6 +78,10 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
+        if sorted(candidate["configuration"]["http"].get("hostnames") or []) != sorted(
+                registration.get("hostnames") or []):
+            raise StateError("the additional hostnames differ from the registration; changing them needs an "
+                             "administrator")
         if "owner_uid" in candidate["configuration"].get("storage", {}):
             # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
             raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
@@ -154,7 +158,9 @@ class Deployer:
         current = self.state.read_state()["current"]
         route = self.routes.inspect_route(self.registration)
         base = {"candidate": identity(candidate), "current": identity(current), "route": route,
-                "domain": self.registration["api_domain"], "host_port": self.registration["host_port"]}
+                "domain": self.registration["api_domain"],
+                "hostnames": list(self.registration.get("hostnames") or []),
+                "host_port": self.registration["host_port"]}
         if current is not None and not request.get("allow_older") and candidate["sequence"] < current["sequence"]:
             return {"action": "none", "reason": "stale_release", **base}
         if current == candidate and self.runtime.is_running(self.registration, current) \
@@ -255,7 +261,8 @@ class Deployer:
                 "unfinished_transaction": None if journal is None else {"request_id": journal["request_id"],
                                                                          "phase": journal["phase"]},
                 "running": None if current is None else self.runtime.is_running(self.registration, current),
-                "domain": self.registration["api_domain"]}
+                "domain": self.registration["api_domain"],
+                "hostnames": list(self.registration.get("hostnames") or [])}
 
     # the transaction ---------------------------------------------------------
     def _transition(self, request_id: str, candidate: dict, before: dict) -> Outcome:
@@ -291,8 +298,8 @@ class Deployer:
                 probes["warning"] = ("Caddy's admin API could not be read, so the active routing was not verified; "
                                      "run `shiplord doctor --server <alias> --deep`")
             if probes["proxy_routing"] is False:
-                raise _StepFailure("the active Caddy configuration does not route this hostname to the application",
-                                   "routing")
+                raise _StepFailure("the active Caddy configuration does not route the application's hostnames as "
+                                   "rendered", "routing")
             self._advance("routing-ready")
         except (RuntimeFailure, ProbeFailure, RoutingError, _StepFailure, StateError) as failure:
             if isinstance(failure, RuntimeFailure) and failure.intervention_required:

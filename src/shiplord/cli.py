@@ -564,6 +564,8 @@ def _render_plan_details(result: dict) -> None:
         typer.echo(f"Route change: {result['route_change']}")
     if result.get("domain") is not None:
         typer.echo(f"Domain: {result['domain']}")
+    if result.get("hostnames"):
+        typer.echo(f"Additional hostnames: {', '.join(result['hostnames'])}")
 
     storage = result.get("storage")
     if isinstance(storage, dict):
@@ -753,6 +755,10 @@ def _ask(prompt: str, default: str | None) -> str:
 @app.command(rich_help_panel="Setup")
 def configure(server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
               api_domain: Optional[str] = typer.Option(None, "--api-domain", help="Public hostname of the application."),
+              hostname: Optional[list[str]] = typer.Option(
+                  None, "--hostname", help="Additional hostname that redirects to --api-domain (repeatable)."),
+              www: bool = typer.Option(False, "--www",
+                                       help="Also redirect www.<api-domain> to the canonical hostname."),
               frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
               no_frontend: bool = typer.Option(False, "--no-frontend"),
               name: Optional[str] = typer.Option(None, "--name"),
@@ -801,6 +807,10 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
             for label, key in summary:
                 value = answers[key]
                 typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
+            if hostname:
+                typer.echo(f"  additional hostnames: {', '.join(hostname)}")
+            if www:
+                typer.echo(f"  www redirect: www.{answers['api_domain']}")
             if not typer.confirm("Write ship.toml?", default=True):
                 raise typer.Abort()
         except typer.Abort:
@@ -829,7 +839,7 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
                        "--image-repository. Pass --image-repository owner/repository to record it now.", err=True)
     try:
         create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
-                        answers["runtime"], answers["template"],
+                        answers["runtime"], answers["template"], hostnames=hostname, www_redirect=www,
                         **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
                            if answers[key] is not None},
                         image_repository=answers["image_repository"])

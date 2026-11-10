@@ -66,18 +66,20 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         if args:
             raise ProtocolError("unknown arguments")
         return application_inventory(layout, lock)
-    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb"},
+    allowed = {"provision": {"runtime", "api_domain", "hostnames", "image_repository", "public_key", "key_label",
+                             "max_memory_mb"},
                "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text"}, "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]
     if set(args) - allowed:
         raise ProtocolError("unknown arguments")
     if action == "provision":
-        if set(args) - {"max_memory_mb"} != allowed - {"max_memory_mb"}:
+        optional = {"hostnames", "max_memory_mb"}
+        if allowed - optional - set(args):
             raise ProtocolError("missing arguments")
-        extra = {"max_memory_mb": args["max_memory_mb"]} if "max_memory_mb" in args else {}
-        return provision(layout, system, lock, application_id=app, runtime=args["runtime"], **extra,
+        extra = {name: args[name] for name in optional if name in args}
+        return provision(layout, system, lock, application_id=app, runtime=args["runtime"],
                          api_domain=args["api_domain"], image_repository=args["image_repository"],
-                         public_key=args["public_key"], key_label=args["key_label"])
+                         public_key=args["public_key"], key_label=args["key_label"], **extra)
     if action == "keys":
         return manage_key(layout, app, args.get("operation"), label=args.get("label"),
                           public_key=args.get("public_key"))
