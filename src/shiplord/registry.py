@@ -12,6 +12,7 @@ import re
 import socket
 from typing import Callable
 
+from . import registries
 from .manifest import ManifestError, validate_app_name, validate_hostname
 from .release_state import HostLock, StateError, _directory, _read, _write
 
@@ -19,7 +20,6 @@ PORT_RANGE = range(20000, 30000)
 DEFAULT_MAX_MEMORY_MB = 4096  # the ceiling a deploy request may ask for; the administrator sets it at provisioning
 MAX_REGISTRATION_BYTES = 4096
 _USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}\Z")
-_REPOSITORY = re.compile(r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+\Z")
 _FIELDS = {"schema_version", "application_id", "deployment_uid", "deployment_user", "runtime",
            "api_domain", "host_port", "image_repository", "max_memory_mb"}
 _IDENTITY_FIELDS = _FIELDS - {"host_port"}
@@ -51,8 +51,10 @@ def validate_registration(value: object, application_id: str | None = None) -> d
     runtime = value["runtime"]
     repository = value["image_repository"]
     if runtime == "docker":
-        if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository):
-            raise RegistryError("a Docker application needs an allowed image repository")
+        try:
+            repository = registries.validate_repository(repository)
+        except registries.RegistryPolicyError:
+            raise RegistryError("a Docker application needs an allowed image repository") from None
     elif runtime == "native":
         if repository is not None:
             raise RegistryError("a native application has no image repository")
@@ -161,7 +163,9 @@ class Registry:
                      "deployment_user": deployment_user, "runtime": runtime, "api_domain": api_domain,
                      "host_port": PORT_RANGE.start, "image_repository": image_repository,
                      "max_memory_mb": max_memory_mb}
-        validate_registration(dict(requested, deployment_uid=1 if deployment_uid is None else deployment_uid))
+        # Keep the validated record: it holds the registry policy's stored spelling, so a comparison with an
+        # existing registration cannot fail merely because the same image was typed in another accepted form.
+        requested = validate_registration(dict(requested, deployment_uid=1 if deployment_uid is None else deployment_uid))
         requested["deployment_uid"] = deployment_uid
         return requested
 

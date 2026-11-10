@@ -32,6 +32,13 @@ class ValidationTests(unittest.TestCase):
         native = record(runtime="native", image_repository=None)
         self.assertEqual(validate_registration(native, "orders"), native)
 
+    def test_docker_hub_repositories_are_stored_in_their_one_spelling(self):
+        for given, stored in (("docker.io/example/orders", "docker.io/example/orders"),
+                              ("docker.io/library/nginx", "docker.io/library/nginx"),
+                              ("nginx", "docker.io/library/nginx")):
+            with self.subTest(given=given):
+                self.assertEqual(validate_registration(record(image_repository=given))["image_repository"], stored)
+
     def test_invalid_records_are_rejected(self):
         cases = {
             "extra field": record(extra=1),
@@ -48,7 +55,9 @@ class ValidationTests(unittest.TestCase):
             "bad runtime": record(runtime="vm"),
             "docker without repository": record(image_repository=None),
             "docker with tag": record(image_repository="ghcr.io/example/orders:latest"),
-            "docker other registry": record(image_repository="docker.io/example/orders"),
+            "docker other registry": record(image_repository="quay.io/example/orders"),
+            "docker ambiguous pair": record(image_repository="example/orders"),
+            "docker hub without a namespace": record(image_repository="docker.io/nginx"),
             "native with repository": record(runtime="native"),
             "port below range": record(host_port=PORT_RANGE.start - 1),
             "port above range": record(host_port=PORT_RANGE.stop),
@@ -145,6 +154,13 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.register("../escape")
         self.assertEqual(os.listdir(self.directory), [])
+
+    def test_a_bare_docker_hub_name_matches_the_stored_registration(self):
+        """The policy's stored spelling is what a comparison uses, so a re-provision is not a conflict."""
+        with self.lock.acquire():
+            created = self.register(image_repository="docker.io/library/nginx")
+            self.assertEqual(self.registry.check("orders", **request(image_repository="nginx")), created)
+            self.assertEqual(self.register(image_repository="nginx"), created)
 
     def test_check_reports_the_identical_registration_and_writes_nothing(self):
         with self.lock.acquire():

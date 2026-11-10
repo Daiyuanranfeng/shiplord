@@ -68,6 +68,18 @@ class InputTests(unittest.TestCase):
             commands.image_repository_for(manifest(), None)
         self.assertIsNone(commands.image_repository_for(manifest(runtime="native"), None))
 
+    def test_a_manifest_image_table_names_another_registry(self):
+        hub = validate_manifest(dict(configuration(), image={"repository": "docker.io/example/orders"}))
+        self.assertEqual(commands.image_repository_for(hub, None), "docker.io/example/orders")
+        bare = validate_manifest(dict(configuration(), image={"repository": "nginx"}))
+        self.assertEqual(commands.image_repository_for(bare, None), "docker.io/library/nginx")
+        # The override is normalised by the same policy, before any server is contacted.
+        self.assertEqual(commands.image_repository_for(manifest(), "nginx"), "docker.io/library/nginx")
+        with self.assertRaisesRegex(CommandError, "ambiguous"):
+            commands.image_repository_for(manifest(), "example/orders")
+        with self.assertRaisesRegex(CommandError, "ghcr.io/owner/name"):
+            commands.image_repository_for(manifest(), "quay.io/example/orders")
+
     def test_the_release_sequence_is_the_commit_time_so_ci_and_local_agree(self):
         repo = self.home / "repo"
         repo.mkdir()
@@ -93,11 +105,26 @@ class InputTests(unittest.TestCase):
     def test_deploy_inputs_are_validated_without_any_connection(self):
         commands.validate_deploy_inputs(manifest(), IMAGE, COMMIT)
         for image, commit in (("ghcr.io/example/orders:latest", COMMIT), (IMAGE, "HEAD"), (IMAGE, COMMIT[:39]),
-                              ("ghcr.io/example/orders@sha256:abc", COMMIT), ("x; rm -rf /@sha256:" + "a" * 64, COMMIT)):
+                              ("ghcr.io/example/orders@sha256:abc", COMMIT), ("x; rm -rf /@sha256:" + "a" * 64, COMMIT),
+                              ("quay.io/example/orders@sha256:" + "a" * 64, COMMIT),
+                              ("example/orders@sha256:" + "a" * 64, COMMIT),
+                              ("ghcr.io/example/orders@sha512:" + "a" * 128, COMMIT),
+                              (IMAGE.upper(), COMMIT)):
             with self.subTest(image=image, commit=commit), self.assertRaises(CommandError):
                 commands.validate_deploy_inputs(manifest(), image, commit)
         with self.assertRaisesRegex(CommandError, "native"):
             commands.validate_deploy_inputs(manifest(runtime="native"), IMAGE, COMMIT)
+
+    def test_docker_hub_images_are_pinned_and_stored_in_their_one_spelling(self):
+        digest = "sha256:"
+        for given, stored in (("docker.io/example/orders@" + digest + "a" * 64,
+                               "docker.io/example/orders@" + digest + "a" * 64),
+                              ("docker.io/library/nginx@" + digest + "b" * 64,
+                               "docker.io/library/nginx@" + digest + "b" * 64),
+                              ("nginx@" + digest + "c" * 64, "docker.io/library/nginx@" + digest + "c" * 64)):
+            with self.subTest(image=given):
+                arguments = commands._deploy_arguments(manifest(), given, 1000, False)
+                self.assertEqual(arguments["artifact"], {"kind": "docker", "image": stored})
 
 
 class AdminCommandTests(unittest.TestCase):
@@ -156,16 +183,29 @@ class RegistryCommandTests(unittest.TestCase):
         self.assertEqual((code, result["registries"]), (0, [{"registry": "ghcr.io", "username": "bot"}]))
         self.assertIn("read-only", result["note"])
 
+    def test_docker_hub_credentials_are_accepted_like_ghcr(self):
+        ssh = FakeSsh((ok({"registries": [{"registry": "docker.io", "username": "bot"}]}), b"", 0))
+        code, result = commands.registry_login(manifest(), AdminClient("a@h", runner=ssh), registry="docker.io",
+                                               username="bot", token=self.TOKEN)
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["arguments"]["registry"], "docker.io")
+        self.assertIn(self.TOKEN.encode(), ssh.calls[0][1])
+        self.assertNotIn(self.TOKEN, str(result))
+        self.assertEqual((code, result["registries"]), (0, [{"registry": "docker.io", "username": "bot"}]))
+
     def test_invalid_input_is_refused_before_any_connection(self):
         ssh = FakeSsh()
         client = AdminClient("a@h", runner=ssh)
-        for kwargs in ({"registry": "docker.io"}, {"username": "a b"}, {"token": "has space"}, {"token": ""},
-                       {"token": "x" * 513}, {"token": "a\nb"}):
+        for kwargs in ({"registry": "quay.io"}, {"registry": "docker.io/evil"}, {"registry": "index.docker.io"},
+                       {"registry": "https://index.docker.io/v1/"}, {"username": "a b"}, {"token": "has space"},
+                       {"token": ""}, {"token": "x" * 513}, {"token": "a\nb"}):
             options = dict(registry="ghcr.io", username="bot", token=self.TOKEN)
             options.update(kwargs)
             with self.subTest(kwargs=str(kwargs)[:30]), self.assertRaises(CommandError) as caught:
                 commands.registry_login(manifest(), client, **options)
             self.assertNotIn(self.TOKEN, str(caught.exception))
+        with self.assertRaises(CommandError):
+            commands.registry_other(manifest(), client, "logout", "quay.io")
         self.assertEqual(ssh.calls, [])
 
     def test_logout_and_status_send_no_secret_material(self):

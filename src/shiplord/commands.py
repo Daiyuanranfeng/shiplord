@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import registries
 from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .keys import KeyError_, parse_public_key
@@ -23,7 +24,6 @@ from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-_IMAGE = re.compile(r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z")
 DEFAULT_KEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
 
 
@@ -51,14 +51,20 @@ def read_public_key(path: Path | None, home: Path | None = None) -> tuple[str, s
 
 
 def image_repository_for(manifest: dict, override: str | None) -> str | None:
-    """The one image repository the server will accept, ``ghcr.io/<owner>/<repository>`` in lower case."""
+    """The one image repository the server will accept, in the registry policy's stored spelling."""
     if manifest["runtime"] != "docker":
         return None
     if override:
-        return override
+        try:
+            return registries.validate_repository(override)
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
+    if "image" in manifest:
+        return manifest["image"]["repository"]
     if "github" not in manifest:
-        raise CommandError("the image repository is unknown: add a [github] section to ship.toml or pass --image-repository")
-    return "ghcr.io/" + manifest["github"]["repository"].lower()
+        raise CommandError("the image repository is unknown: add [image] repository or a [github] section to "
+                           "ship.toml, or pass --image-repository")
+    return registries.github_repository(manifest["github"]["repository"])
 
 
 def commit_sequence(commit: str, override: int | None, directory: Path | None = None) -> int:
@@ -134,18 +140,12 @@ def native_artifact(binary: Path) -> dict:
     return {"kind": "native", "sha256": digest.hexdigest(), "size": size, "architecture": architecture}
 
 
-_LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
-_LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
-
-
 def validate_registry_login(registry: str, username: str, token: str) -> None:
     """Reject bad input before any server alias is read or any connection is made."""
-    if registry != "ghcr.io":
-        raise CommandError("registry logins are supported for ghcr.io")
-    if not _LOGIN_USER.fullmatch(username):
-        raise CommandError("the username may contain letters, digits, dots, dashes, and underscores")
-    if not _LOGIN_TOKEN.fullmatch(token):
-        raise CommandError("the token must be 1-512 printable characters without spaces or line breaks")
+    try:
+        registries.validate_login(registry, username, token)
+    except registries.RegistryPolicyError as error:
+        raise CommandError(str(error)) from None
 
 
 def registry_login(manifest: dict, admin: AdminClient, *, registry: str, username: str, token: str) -> tuple[int, dict]:
@@ -159,7 +159,10 @@ def registry_login(manifest: dict, admin: AdminClient, *, registry: str, usernam
 def registry_other(manifest: dict, admin: AdminClient, operation: str, registry: str = "ghcr.io") -> tuple[int, dict]:
     arguments = {"operation": operation}
     if operation == "logout":
-        arguments["registry"] = registry
+        try:
+            arguments["registry"] = registries.validate_host(registry)
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
     return 0, {"ok": True, **admin.call("registry", manifest["name"], arguments)}
 
 
@@ -167,9 +170,10 @@ def _deploy_arguments(manifest: dict, artifact: str | dict, sequence: int, allow
     if isinstance(artifact, str):
         if manifest["runtime"] != "docker":
             raise CommandError("this manifest is for a native binary; use --binary", 2)
-        if not _IMAGE.fullmatch(artifact):
-            raise CommandError("--image must be an immutable reference: registry/name@sha256:<digest>")
-        artifact = {"kind": "docker", "image": artifact}
+        try:
+            artifact = {"kind": "docker", "image": registries.validate_pinned(artifact)}
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
     elif manifest["runtime"] != "native":
         raise CommandError("this manifest is for a Docker image; use --image", 2)
     arguments = {"sequence": sequence, "artifact": artifact, "configuration": manifest}

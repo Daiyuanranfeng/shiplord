@@ -64,7 +64,7 @@ shiplord configure --server production --api-domain orders-api.example.com \
   --frontend https://orders.example.com           # or --no-frontend
 shiplord provision                                   # registers your SSH key for this application
 shiplord env set --from-file .env.production         # runtime secrets; values are never printed
-shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
+shiplord registry login --username bot --token-file t   # only for a private image; add --registry docker.io
 
 # every release
 shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only
@@ -121,6 +121,51 @@ Upgrade with `shiplord server bootstrap` when it is missing. Do not downgrade to
 generic release records. Changing the profile replaces the container even with the same image, commit,
 and sequence; rollback and journal recovery restore the recorded profile. Containers without a profile
 label are interpreted as legacy `google-adk` containers.
+
+## Image registries
+
+Shiplord pulls images from GitHub Container Registry (`ghcr.io`) and Docker Hub (`docker.io`). A
+`[github]` table means GHCR: `repository = "owner/name"` allows `ghcr.io/owner/name`. To deploy an image
+that lives on Docker Hub, name it in its own table:
+
+```toml
+[image]
+repository = "docker.io/example/orders"
+```
+
+Exactly these repository forms are accepted, and each is stored in one spelling:
+
+| Written | Stored |
+| --- | --- |
+| `ghcr.io/owner/name` | `ghcr.io/owner/name` |
+| `docker.io/namespace/name` | `docker.io/namespace/name` |
+| `docker.io/library/name` | `docker.io/library/name` |
+| `name` (a Docker Hub official image) | `docker.io/library/name` |
+
+A bare `owner/name` without a host is refused: it could be a GitHub owner/repository or a Docker Hub
+namespace, and guessing would allowlist an image you did not name. `docker.io/name` is refused for the
+same reason: write `docker.io/library/name` or just `name`. No other registry is supported yet, and a
+repository never carries a tag, a port, a scheme, or credentials. `[image]` and `[github]` may both be
+present only when they name the same GHCR repository.
+
+Every deploy is pinned by digest, for either registry:
+
+```sh
+shiplord deploy --image docker.io/example/orders@sha256:<digest> --commit <sha>
+```
+
+For a private image, store a read-only pull login for the registry that serves it. The token comes from a
+file or stdin, never from the command line, and is never printed:
+
+```sh
+shiplord registry login --username <account> --token-file token.txt --registry docker.io
+```
+
+Docker Hub credentials are written under the key Docker looks up (`https://index.docker.io/v1/`), so they
+are found when the image is pulled. `shiplord registry status` lists registry hosts and usernames only.
+
+`github setup` still generates a workflow that publishes to GHCR, because a Docker Hub push needs
+credentials Shiplord does not manage; for a Docker Hub image, use your own workflow and `shiplord deploy`.
 
 ## Persistent storage (Docker)
 
@@ -221,7 +266,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
-| `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
+| `registry login --username U --token-file F \| --token-stdin [--registry ghcr.io\|docker.io]` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| (in an app directory)` | Prerequisites; helper probe (`--deep`: Caddy, sshd, Docker, disk, each application); access, helper, DNS. |
 

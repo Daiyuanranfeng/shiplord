@@ -66,6 +66,27 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "generic template requires the docker runtime"):
             self.load(contents.replace('runtime = "docker"', 'runtime = "native"'))
 
+    def test_an_image_table_names_a_supported_registry(self):
+        without_github = MANIFEST.split("[github]")[0]
+        hub = self.load(without_github + '[image]\nrepository = "docker.io/example/orders"\n')
+        self.assertEqual(hub["image"], {"repository": "docker.io/example/orders"})
+        self.assertEqual(image_repository_for(hub, None), "docker.io/example/orders")
+        bare = self.load(without_github + '[image]\nrepository = "nginx"\n')
+        self.assertEqual(bare["image"], {"repository": "docker.io/library/nginx"})
+        self.assertEqual(image_repository_for(bare, None), "docker.io/library/nginx")
+        # A [github] table and an [image] table may agree, but never disagree.
+        agreeing = self.load(MANIFEST + '[image]\nrepository = "ghcr.io/queryplanner/orders"\n')
+        self.assertEqual(agreeing["image"]["repository"], "ghcr.io/queryplanner/orders")
+        with self.assertRaisesRegex(ManifestError, "two image repositories"):
+            self.load(MANIFEST + '[image]\nrepository = "docker.io/example/orders"\n')
+        for repository in ("docker.io/nginx", "example/orders", "quay.io/example/orders",
+                           "docker.io/example/orders:latest", "docker.io/Example/orders", ""):
+            with self.subTest(repository=repository), self.assertRaises(ManifestError):
+                self.load(without_github + f'[image]\nrepository = "{repository}"\n')
+        native = without_github.replace('runtime = "docker"', 'runtime = "native"')
+        with self.assertRaisesRegex(ManifestError, "Docker applications"):
+            self.load(native + '[image]\nrepository = "docker.io/example/orders"\n')
+
     def test_invalid_fields_are_rejected_without_echoing_values(self):
         replacements = [
             ("schema_version = 1", "schema_version = 2"),
@@ -227,6 +248,13 @@ class CLITests(unittest.TestCase):
             self.assertNotIn("ghp_example", result.stdout + result.stderr)
             result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key), "--json", env=env)
             self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "docker.io", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # Docker Hub is accepted like GHCR
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "quay.io", "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ghcr.io and docker.io", json.loads(result.stdout)["error"])
 
     def test_github_commands_need_a_manifest_and_a_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
