@@ -649,6 +649,33 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertOutcome(self.runtime_rollback("req-profile5"), "succeeded")
         self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
 
+    def test_zzz_failed_routing_restores_the_previous_configuration(self):
+        """A same-release redeploy that changes configuration must restart the old one, not adopt the candidate."""
+        self.fresh_container_slate()
+        self.set_data_dir("/app/src/.adk")
+        original = self.configuration()
+        original["http"].update(container_port=8080, frontend_origins=["https://a.example.test"])
+        original["resources"] = {"memory_mb": 512}
+        self.assertOutcome(self.deploy("req-c1", "v1", 9000, configuration=original), "succeeded")
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertEqual(json.loads(self.get("/env"))["ALLOW_ORIGINS"], '["https://a.example.test"]')
+
+        # Same image, commit, sequence, and therefore the same container: only the configuration differs.
+        changed = self.configuration()
+        changed["http"].update(container_port=8081, frontend_origins=["https://b.example.test"])
+        changed["resources"] = {"memory_mb": 768}
+        with patch.object(self.deployer.routes, "apply", side_effect=RoutingError("fixture routing failure", "reload")):
+            failed = self.deploy("req-c2", "v1", 9000, configuration=changed)
+        self.assertOutcome(failed, "rolled_back")
+        self.assertEqual(failed.exit_code, 5)
+
+        host = self.inspect()["HostConfig"]
+        self.assertEqual((host["Memory"], host["MemorySwap"]), (512 * 1024 * 1024, 512 * 1024 * 1024))
+        self.assertEqual(host["PortBindings"], {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.port)}]})
+        self.assertEqual(json.loads(self.get("/env"))["ALLOW_ORIGINS"], '["https://a.example.test"]')
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
     def runtime_rollback(self, request_id):
         with self.lock.acquire():
             return self.deployer.rollback(request_id)

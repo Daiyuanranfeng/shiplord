@@ -346,6 +346,42 @@ class NativeSystemdTests(unittest.TestCase):
         self.assertEqual(len(releases), 2)  # exactly current and previous: failed and interrupted candidates are gone
         self.assertEqual(list(Path(f"/var/lib/shiplord/apps/{self.app}/staging").glob("*")), [])
 
+    def write_manifest(self, memory_mb, origins, container_port):
+        manifest = self.project / "ship.toml"
+        lines = []
+        for line in manifest.read_text().splitlines():
+            if line.startswith("frontend_origins = "):
+                line = f"frontend_origins = [{', '.join(json.dumps(origin) for origin in origins)}]"
+            elif line.startswith("container_port = "):
+                line = f"container_port = {container_port}"
+            elif line.startswith("memory_mb = "):
+                line = f"memory_mb = {memory_mb}"
+            lines.append(line)
+        manifest.write_text("\n".join(lines) + "\n")
+
+    def test_14_a_failed_route_change_restarts_the_committed_configuration(self):
+        """The unit name does not encode configuration, so the restart must compare the files a start writes."""
+        self.write_manifest(self.MEMORY_MB, [], 8080)
+        self.assertEqual(self.deploy("v2", 6000)["status"], "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.get("/env/ALLOW_ORIGINS"), "[]")
+
+        # Same binary, commit, sequence, and therefore the same unit: only the configuration differs.
+        self.write_manifest(self.MEMORY_MB + 64, ["https://b.example.test"], 8081)
+        prior = Path("/etc/caddy/ship") / f".prior-{self.app}"
+        prior.write_text("# planted: an earlier route change was interrupted\n")  # makes the routing step fail
+        failed = self.deploy("v2", 6000, check=5)
+        self.assertEqual((failed["status"], failed["kind"]), ("rolled_back", "interrupted"))
+        self.assertFalse(prior.exists())  # the verified restore reconciled the route
+
+        self.assertEqual(self.show("MemoryMax")["MemoryMax"], str(self.MEMORY_MB * 1024 * 1024))
+        unit = Path(f"/etc/systemd/system/shiplord-{self.app}.service").read_text()
+        self.assertIn(f"MemoryMax={self.MEMORY_MB}M\n", unit)
+        self.assertIn(f"SocketBindAllow=tcp:{self.port}\n", unit)
+        self.assertIn('ALLOW_ORIGINS="[]"', Path(f"/etc/shiplord/env/{self.app}/native.env").read_text())
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.get("/env/ALLOW_ORIGINS"), "[]")
+
 
 if __name__ == "__main__":
     unittest.main()
