@@ -31,10 +31,17 @@ class HostSystem(AccountSystem):
     def __init__(self):
         super().__init__()
         self.failing: set[str] = set()
+        self.units = {"ssh.service"}
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         tool = argv[0].rsplit("/", 1)[-1]
-        if tool in ("systemctl", "sshd", "docker"):
+        if tool == "systemctl":
+            self.calls.append(list(argv))
+            if argv[1] == "list-unit-files":
+                listed = [unit for unit in argv[2:] if unit in self.units]
+                return CommandResult(0 if listed else 1, "".join(f"{unit} enabled enabled\n" for unit in listed))
+            return CommandResult(1 if tool in self.failing else 0, "")
+        if tool in ("sshd", "docker"):
             self.calls.append(list(argv))
             return CommandResult(1 if tool in self.failing else 0, "27.3.1" if tool == "docker" else "")
         return super().run(argv, input=input, timeout=timeout)
@@ -148,6 +155,22 @@ class ServerDoctorTests(DoctorTestCase):
     def test_a_stopped_service_or_an_invalid_sshd_or_a_dead_docker_is_reported(self):
         self.system.failing = {"systemctl"}
         self.assertEqual(self.report()["checks"]["caddy"]["service_active"], False)
+
+    def test_the_sshd_check_reports_the_discovered_unit_and_include(self):
+        self.system.units = {"sshd.service"}
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["unit"], sshd["dropin_included"]), (True, "sshd.service", True))
+
+    def test_the_sshd_check_fails_when_the_dropin_is_not_included(self):
+        self.sshd_config.write_text("Port 22\n")
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["dropin_current"], sshd["dropin_included"]), (False, True, False))
+        self.assertIn("sshd", self.failing(self.report()))
+
+    def test_the_sshd_check_fails_when_no_unit_is_installed(self):
+        self.system.units = set()
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["unit"]), (False, None))
 
     def test_caddy_admin_api_reachability_is_reported_without_failing_the_check(self):
         with patch("shiplord.serverdoctor.http_get", side_effect=OSError):

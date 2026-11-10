@@ -3,14 +3,19 @@
 Installs the helper code under a content-addressed version directory, switches
 ``current`` to it atomically, creates the managed directories, makes Caddy import
 the managed route directory, and installs an sshd drop-in that confines
-deployment accounts to the forced-command dispatcher. Re-running changes nothing
+deployment accounts to the forced-command dispatcher. Before the drop-in is
+written, the host's sshd unit is discovered and the main sshd configuration is
+checked to make sure it reads the drop-in directory. Re-running changes nothing
 when everything is already in place.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import hashlib
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
@@ -52,6 +57,10 @@ Match User ship-*
 """
 SSHD = "/usr/sbin/sshd"
 SYSTEMCTL = "/usr/bin/systemctl"
+SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
+SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
+SSHD_INCLUDE_DEPTH = 8
+SSHD_CONFIG = "sshd_config"
 
 
 class BootstrapError(Exception):
@@ -178,7 +187,113 @@ def _install_wrappers(layout: Layout) -> bool:
     return changed
 
 
-def _install_sshd(layout: Layout, system: System) -> bool:
+def _installed_sshd_units(system: System) -> set[str]:
+    """The sshd unit files systemd knows about; empty when none are installed."""
+    result = system.run([SYSTEMCTL, "list-unit-files", "--no-legend", "--no-pager",
+                         *SSHD_SERVICE_UNITS, *SSHD_SOCKET_UNITS])
+    if result.code != 0:
+        return set()
+    installed = set()
+    for line in result.output.splitlines():
+        fields = line.split()
+        if fields and fields[0] in SSHD_SERVICE_UNITS + SSHD_SOCKET_UNITS:
+            installed.add(fields[0])
+    return installed
+
+
+def sshd_units(system: System) -> tuple[str | None, str | None]:
+    """Return the sshd service unit and its socket unit installed on this host, if any."""
+    installed = _installed_sshd_units(system)
+    service = next((unit for unit in SSHD_SERVICE_UNITS if unit in installed), None)
+    socket = next((unit for unit in SSHD_SOCKET_UNITS if unit in installed), None)
+    if service is not None and service.replace(".service", ".socket") in installed:
+        socket = service.replace(".service", ".socket")
+    return service, socket
+
+
+def _unit_active(system: System, unit: str) -> bool | None:
+    """Whether systemd reports ``unit`` active; None when that cannot be determined."""
+    try:
+        return system.run([SYSTEMCTL, "is-active", "--quiet", unit]).code == 0
+    except CommandError:
+        return None
+
+
+def _include_patterns(text: str) -> list[str]:
+    """The arguments of every ``Include`` directive in an sshd configuration file."""
+    patterns = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # sshd_config separates a keyword from its arguments with a space, a tab, or "="; splitting on a
+        # space alone would miss a tab-separated Include, and on "=" alone would truncate a path containing one.
+        match = re.fullmatch(r"([A-Za-z]+)(?:\s*=\s*|\s+)(.*)", stripped)
+        if match is None:
+            continue
+        keyword, arguments = match.groups()
+        if keyword.lower() == "include":
+            patterns.extend(argument.strip('"') for argument in arguments.split())
+    return patterns
+
+
+def _pattern_covers(pattern: str, path: Path) -> bool:
+    """Whether a glob pattern covers ``path``; a wildcard does not cross a path separator."""
+    parts = Path(pattern).parts
+    return len(parts) == len(path.parts) and all(
+        fnmatch.fnmatchcase(actual, expected) for actual, expected in zip(path.parts, parts))
+
+
+def _includes(path: Path, target: Path, base: Path, seen: set[Path], depth: int) -> bool:
+    """Whether ``path``, or a file it includes, reads ``target``."""
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for pattern in _include_patterns(text):
+        candidate = Path(pattern) if Path(pattern).is_absolute() else base / pattern
+        if _pattern_covers(str(candidate), target):
+            return True
+        if depth <= 0:
+            continue
+        for match in sorted(glob.glob(str(candidate))):
+            included = Path(match)
+            if included in seen:
+                continue
+            seen.add(included)
+            if _includes(included, target, base, seen, depth - 1):
+                return True
+    return False
+
+
+def sshd_dropin_included(layout: Layout) -> bool:
+    """Whether the main sshd configuration makes sshd read the Shiplord drop-in file."""
+    dropin = layout.sshd_dropin
+    config = dropin.parent.parent / SSHD_CONFIG
+    return _includes(config, dropin, config.parent, {config}, SSHD_INCLUDE_DEPTH)
+
+
+def _require_sshd_include(layout: Layout) -> None:
+    if sshd_dropin_included(layout):
+        return
+    raise BootstrapError(
+        "the main sshd configuration does not include the Shiplord drop-in: "
+        f"add `Include {layout.sshd_dropin.parent.name}/*.conf` and re-run bootstrap")
+
+
+def _sshd_preflight(layout: Layout, system: System) -> tuple[str, str | None]:
+    """Refuse a host whose sshd policy cannot be verified, before anything is written."""
+    _require_sshd_include(layout)
+    try:
+        unit, socket = sshd_units(system)
+    except CommandError:
+        raise BootstrapError("could not run sshd checks") from None
+    if unit is None:
+        raise BootstrapError("could not find the sshd service unit (looked for ssh.service and sshd.service)")
+    return unit, socket
+
+
+def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None) -> bool:
     path = layout.sshd_dropin
     desired = SSHD_DROPIN.format(keys=layout.authorized_keys).encode()
     _ensure_dir(path.parent, 0o755)
@@ -190,9 +305,12 @@ def _install_sshd(layout: Layout, system: System) -> bool:
         result = system.run([SSHD, "-t"])
         if result.code != 0:
             raise BootstrapError("sshd rejected the Shiplord configuration: " + (result.output.strip() or "no output"))
-        result = system.run([SYSTEMCTL, "try-reload-or-restart", "ssh.service"])
-        if result.code != 0:
-            raise BootstrapError("sshd could not reload the Shiplord configuration: " + (result.output.strip() or "no output"))
+        socket_activated = (socket is not None and _unit_active(system, socket) is True
+                            and _unit_active(system, unit) is False)
+        if not socket_activated:
+            result = system.run([SYSTEMCTL, "try-reload-or-restart", unit])
+            if result.code != 0:
+                raise BootstrapError(f"sshd could not reload {unit}: " + (result.output.strip() or "no output"))
     except (BootstrapError, CommandError) as error:
         if previous is None:
             path.unlink(missing_ok=True)
@@ -209,6 +327,7 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
     """Install or update the host. Safe to repeat; returns which steps changed something."""
     if layout.prefix == Path("/") and os.geteuid() != 0:
         raise BootstrapError("bootstrap must run as root")
+    unit, socket = _sshd_preflight(layout, system)
     changed: dict[str, bool] = {}
     for directory, mode in ((layout.path("/etc/shiplord"), 0o755), (layout.registrations, 0o700),
                             (layout.environments, 0o700), (layout.authorized_keys, 0o755),
@@ -233,7 +352,7 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                 changed["caddy_import"] = RouteManager(layout.caddy_root, lock, caddy).ensure_import().changed
             except RoutingError as error:
                 raise BootstrapError(f"Caddy integration failed ({error.kind}): {error}") from None
-            changed["sshd"] = _install_sshd(layout, system)
+            changed["sshd"] = _install_sshd(layout, system, unit, socket)
     finally:
         os.close(descriptor)
     return {"version": name, "changed": changed}

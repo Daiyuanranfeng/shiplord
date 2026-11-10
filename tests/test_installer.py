@@ -21,11 +21,20 @@ class FakeSystem:
     def __init__(self):
         self.calls = []
         self.results = {}
+        self.units = {"ssh.service"}
+        self.active = set()
 
     def run(self, argv, *, input=None, timeout=60):
         self.calls.append(list(argv))
-        return self.results.get(argv[-1] if argv[0].endswith("systemctl") else argv[0].rsplit("/", 1)[-1],
-                                CommandResult(0, ""))
+        if argv[0].endswith("systemctl"):
+            command = argv[1]
+            if command == "list-unit-files":
+                listed = [unit for unit in argv[2:] if unit in self.units]
+                return CommandResult(0 if listed else 1, "".join(f"{unit} enabled enabled\n" for unit in listed))
+            if command == "is-active":
+                return CommandResult(0 if argv[-1] in self.active else 3, "")
+            return self.results.get(argv[-1], CommandResult(0, ""))
+        return self.results.get(argv[0].rsplit("/", 1)[-1], CommandResult(0, ""))
 
 
 class FakeCaddy:
@@ -54,6 +63,10 @@ class InstallerTestCase(unittest.TestCase):
         caddy.chmod(0o755)
         (caddy / "Caddyfile").write_text("example.org {\n}\n")
         (caddy / "Caddyfile").chmod(0o644)
+        sshd = self.prefix / "etc" / "ssh"
+        sshd.mkdir(parents=True)
+        self.sshd_config = sshd / "sshd_config"
+        self.sshd_config.write_text("Include sshd_config.d/*.conf\n")
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
 
@@ -108,8 +121,9 @@ class BootstrapTests(InstallerTestCase):
         dropin = layout.sshd_dropin.read_text()
         self.assertIn(f"AuthorizedKeysFile {layout.authorized_keys}/%u", dropin)
         self.assertIn("PermitTTY no", dropin)
-        self.assertEqual(self.system.calls, [["/usr/sbin/sshd", "-t"],
-                                              ["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"]])
+        self.assertEqual(self.system.calls[0][:2], ["/usr/bin/systemctl", "list-unit-files"])
+        self.assertIn(["/usr/sbin/sshd", "-t"], self.system.calls)
+        self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
 
     def test_second_run_changes_nothing(self):
         first = self.run_bootstrap()
@@ -119,7 +133,7 @@ class BootstrapTests(InstallerTestCase):
         self.assertEqual(second["version"], first["version"])
         self.assertFalse(any(second["changed"].values()), second)
         self.assertEqual({str(p): p.read_bytes() for p in self.prefix.rglob("*") if p.is_file()}, before)
-        self.assertEqual(len(self.system.calls), calls)
+        self.assertEqual([call[:2] for call in self.system.calls[calls:]], [["/usr/bin/systemctl", "list-unit-files"]])
         self.assertEqual(self.caddy.reloaded, 1)
 
     def test_changed_code_installs_a_new_version_and_keeps_the_old_one(self):
@@ -168,10 +182,93 @@ class BootstrapTests(InstallerTestCase):
         with self.assertRaisesRegex(BootstrapError, "Caddy integration failed"):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
-        self.assertEqual(self.system.calls, [])
+        self.assertNotIn(["/usr/sbin/sshd", "-t"], self.system.calls)
 
 
 class SshdTests(InstallerTestCase):
+    def test_the_installed_sshd_unit_is_discovered_and_reloaded(self):
+        self.system.units = {"sshd.service"}
+        self.run_bootstrap()
+        self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", "sshd.service"], self.system.calls)
+        self.assertNotIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
+
+    def test_an_absent_sshd_unit_is_refused_before_the_dropin_is_written(self):
+        self.system.units = set()
+        with self.assertRaisesRegex(BootstrapError, r"ssh\.service.*sshd\.service"):
+            self.run_bootstrap()
+        self.assertFalse(self.layout.sshd_dropin.exists())
+        self.assertFalse((self.layout.lib / "current").exists())
+
+    def test_a_configuration_that_does_not_include_the_dropin_is_refused(self):
+        self.sshd_config.write_text("Port 22\n")
+        with self.assertRaises(BootstrapError) as raised:
+            self.run_bootstrap()
+        self.assertIn("does not include", str(raised.exception))
+        self.assertIn("Include sshd_config.d/*.conf", str(raised.exception))
+        self.assertNotIn(str(self.prefix), str(raised.exception))
+        self.assertFalse(self.layout.sshd_dropin.exists())
+        self.assertFalse((self.layout.lib / "current").exists())
+        self.assertEqual(self.system.calls, [])
+
+    def test_the_include_may_be_reached_through_another_file(self):
+        (self.sshd_config.parent / "extra.conf").write_text("Include sshd_config.d/*.conf\n")
+        self.sshd_config.write_text("Include extra.conf\n")
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_a_quoted_include_is_accepted(self):
+        self.sshd_config.write_text('Include "sshd_config.d/*.conf"\n')
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_a_tab_separated_include_is_accepted(self):
+        self.sshd_config.write_text("Include\tsshd_config.d/*.conf\n")
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_an_include_path_containing_an_equals_sign_is_read_whole(self):
+        (self.sshd_config.parent / "a=b.d").mkdir()
+        (self.sshd_config.parent / "a=b.d" / "route.conf").write_text("Include sshd_config.d/*.conf\n")
+        self.sshd_config.write_text("Include a=b.d/route.conf\n")
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_a_commented_out_include_does_not_count(self):
+        self.sshd_config.write_text("#Include sshd_config.d/*.conf\nPort 22\n")
+        with self.assertRaisesRegex(BootstrapError, "does not include"):
+            self.run_bootstrap()
+
+    def test_an_include_of_another_directory_does_not_count(self):
+        self.sshd_config.write_text("Include other.d/*.conf\n")
+        with self.assertRaisesRegex(BootstrapError, "does not include"):
+            self.run_bootstrap()
+
+    def test_a_shallower_glob_does_not_count_as_including_the_dropin(self):
+        self.sshd_config.write_text(f"Include {self.sshd_config.parent}/*\n")
+        with self.assertRaisesRegex(BootstrapError, "does not include"):
+            self.run_bootstrap()
+
+    def test_a_removed_include_is_refused_on_a_repeat_bootstrap(self):
+        self.run_bootstrap()
+        self.sshd_config.write_text("Port 22\n")
+        with self.assertRaisesRegex(BootstrapError, "does not include"):
+            self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_a_socket_activated_inactive_service_is_not_restarted(self):
+        self.system.units = {"ssh.service", "ssh.socket"}
+        self.system.active = {"ssh.socket"}
+        result = self.run_bootstrap()
+        self.assertTrue(result["changed"]["sshd"])
+        self.assertIn(["/usr/bin/systemctl", "is-active", "--quiet", "ssh.socket"], self.system.calls)
+        self.assertNotIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
+
+    def test_a_socket_activated_running_service_is_reloaded(self):
+        self.system.units = {"ssh.service", "ssh.socket"}
+        self.system.active = {"ssh.service", "ssh.socket"}
+        self.run_bootstrap()
+        self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", "ssh.service"], self.system.calls)
+
     def test_rejected_sshd_configuration_is_removed(self):
         self.system.results["sshd"] = CommandResult(1, "bad")
         with self.assertRaisesRegex(BootstrapError, "rejected"):

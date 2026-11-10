@@ -35,8 +35,16 @@ PORT = 2222
 class NoSystemd(HostSystem):
     """Real commands, except systemctl, which a container cannot run."""
 
+    def __init__(self, units=frozenset({"ssh.service", "sshd.service"})):
+        self.units = set(units)
+        self.calls = []
+
     def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
         if argv[0].endswith("systemctl"):
+            if argv[1] == "list-unit-files":
+                listed = [unit for unit in argv[2:] if unit in self.units]
+                return CommandResult(0 if listed else 1, "".join(f"{unit} enabled enabled\n" for unit in listed))
             return CommandResult(0, "")
         return super().run(argv, **kwargs)
 
@@ -127,6 +135,17 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertIn("import /etc/caddy/ship/*.caddy", Path("/etc/caddy/Caddyfile").read_text())
         self.assertTrue(subprocess.run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter",
                                         "caddyfile"], capture_output=True).returncode == 0)
+
+    def test_bootstrap_discovers_the_installed_sshd_unit(self):
+        for unit in ("ssh.service", "sshd.service"):
+            with self.subTest(unit):
+                self.layout.sshd_dropin.unlink(missing_ok=True)
+                system = NoSystemd(units={unit})
+                result = bootstrap(self.layout, SOURCE, system, self.caddy)
+                self.assertTrue(result["changed"]["sshd"])
+                self.assertIn(["/usr/bin/systemctl", "list-unit-files", "--no-legend", "--no-pager",
+                               "ssh.service", "sshd.service", "ssh.socket", "sshd.socket"], system.calls)
+                self.assertIn(["/usr/bin/systemctl", "try-reload-or-restart", unit], system.calls)
 
     def test_sshd_match_block_applies_to_deployment_accounts_only(self):
         def effective(user):

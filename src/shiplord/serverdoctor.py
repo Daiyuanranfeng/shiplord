@@ -7,7 +7,7 @@ import shutil
 from http.client import HTTPException
 from pathlib import Path
 
-from .installer import SSHD_DROPIN
+from .installer import SSHD_DROPIN, sshd_dropin_included, sshd_units
 from .layout import Layout
 from .probes import http_get
 from .registry import Registry
@@ -94,7 +94,13 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
                        "admin_api": _admin_api_reachable()}  # informational: deploys cannot verify routing without it
     dropin_ok = layout.sshd_dropin.is_file() and layout.sshd_dropin.read_text() == SSHD_DROPIN.format(keys=layout.authorized_keys)
     valid, _ = _run(system, ["/usr/sbin/sshd", "-t"])
-    checks["sshd"] = {"ok": dropin_ok and valid, "dropin_current": dropin_ok, "config_valid": valid}
+    try:
+        unit, _socket = sshd_units(system)
+    except CommandError:
+        unit = None
+    included = sshd_dropin_included(layout)
+    checks["sshd"] = {"ok": dropin_ok and valid and included and unit is not None, "dropin_current": dropin_ok,
+                      "config_valid": valid, "dropin_included": included, "unit": unit}
     docker, version = _run(system, ["/usr/bin/docker", "info", "--format", "{{.ServerVersion}}"])
     checks["docker"] = {"ok": docker, "version": version if docker else None}
     paths = [layout.var, layout.releases] + ([DOCKER_ROOT] if layout.prefix == Path("/") and DOCKER_ROOT.exists() else [])
