@@ -47,6 +47,41 @@ class RetireTests(unittest.TestCase):
                     self.retire(REGISTRATION, self.state)
                 self.assertNotIn(("discard", "a"), self.order)
 
+    def test_a_missing_release_state_retires_without_a_traceback_and_reports_what_is_kept(self):
+        report = self.retire(REGISTRATION, None)
+        self.assertEqual(self.order, [("unroute", "orders"), "stop"])
+        self.assertEqual(report["removed"], ["public route", "running release"])
+        self.assertIn("application data (the data directory and its volume)", report["retained"])
+        self.assertIn("release artifacts (no release state was recorded, so none were discarded)", report["retained"])
+
+    def test_an_empty_release_state_retires_without_a_traceback(self):
+        report = self.retire(REGISTRATION, {})
+        self.assertEqual(self.order, [("unroute", "orders"), "stop"])
+        self.assertEqual(report["removed"], ["public route", "running release"])
+
+    def test_an_unusable_release_state_is_refused_before_anything_changes(self):
+        for state in ("corrupt", ["current"], {"current": "corrupt"}, {"previous": 1}):
+            with self.subTest(state=state):
+                self.order.clear()
+                with self.assertRaisesRegex(ProvisionError, "release state is unusable, so nothing was changed") as caught:
+                    self.retire(REGISTRATION, state)
+                self.assertEqual(self.order, [])
+                self.assertNotIn("/", str(caught.exception))
+
+    def test_the_report_lists_each_discarded_release_only_when_it_was_verified(self):
+        report = self.retire(REGISTRATION, self.state)
+        self.assertEqual(report["removed"], ["public route", "running release", "the current release's artifacts",
+                                             "the previous release's artifacts"])
+        self.assertEqual(report["retained"], ["application data (the data directory and its volume)"])
+
+    def test_a_discard_warning_is_reported_as_kept_instead_of_removed(self):
+        warning = "an old image could not be removed (it may still be in use)"
+        self.runtime.discard.side_effect = lambda registration, release: (
+            [warning] if release["commit"][0] == "a" else [])
+        report = self.retire(REGISTRATION, self.state)
+        self.assertEqual(report["removed"], ["public route", "running release", "the previous release's artifacts"])
+        self.assertIn(warning, report["retained"])
+
 
 if __name__ == "__main__":
     unittest.main()
