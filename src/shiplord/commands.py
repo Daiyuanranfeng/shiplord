@@ -18,7 +18,7 @@ from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
@@ -303,10 +303,15 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
 
 
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+                    force_stop: bool = False,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress)
+    arguments = {"force_stop": True} if force_stop else {}
+    if force_stop and FORCE_STOP_FEATURE not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    outcome = submit_and_wait(client, action, request_id=request_id, arguments=arguments,
+                              timeout=job_timeout(manifest), on_progress=on_progress)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 
