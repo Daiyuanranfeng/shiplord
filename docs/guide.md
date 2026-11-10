@@ -226,6 +226,55 @@ so it works from a machine that never ran `github setup`; local setup state is k
 CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY`, `SHIPLORD_SSH_KNOWN_HOSTS_FILE`
 (and optionally `SHIPLORD_SSH_PORT`) replace the server alias, and SSH ignores `~/.ssh/config` entirely.
 
+### The Shiplord deploy action
+
+The deploy job's steps — join the tailnet, install the CI SSH identity, deploy by digest, write the job summary —
+are also published as a composite action, so a pipeline you already have can add one step instead of replacing
+its workflow:
+
+```yaml
+      - uses: QueryPlanner/shiplord/deploy@<commit sha> # v1
+        with:
+          check-only: false
+          ssh-private-key: ${{ secrets.SHIPLORD_SSH_PRIVATE_KEY }}
+          ssh-known-hosts: ${{ vars.SHIPLORD_SSH_KNOWN_HOSTS }}
+          deploy-user: ${{ vars.SHIPLORD_DEPLOY_USER }}
+          server-host: ${{ vars.SHIPLORD_SERVER_HOST }}
+          ssh-port: ${{ vars.SHIPLORD_SSH_PORT }}
+          ts-client-id: ${{ vars.SHIPLORD_TS_CLIENT_ID }}
+          ts-audience: ${{ vars.SHIPLORD_TS_AUDIENCE }}
+          ts-tags: ${{ vars.SHIPLORD_TS_TAGS || 'tag:ci' }}
+          image: ghcr.io/owner/orders
+          digest: ${{ steps.build.outputs.digest }}
+          commit: ${{ github.sha }}
+          request-id: gh-${{ github.run_id }}-${{ github.run_attempt }}
+```
+
+**`v1` is not tagged or published yet.** Until it is, pin the action to a full commit SHA of a commit that
+contains `deploy/action.yml`; `shiplord github setup` pins the generated workflow to the same commit it installs.
+The action installs nothing itself, so the job must already have `shiplord` on `PATH` (the generated workflow
+installs the pinned commit) and must be a Linux job with `id-token: write` for the tailnet join.
+
+| Input | Required | Purpose |
+| --- | --- | --- |
+| `check-only` | no (`false`) | Check Tailscale, SSH and the helper with `shiplord status`; deploy nothing |
+| `ssh-private-key` | yes | The CI key; the `SHIPLORD_SSH_PRIVATE_KEY` secret |
+| `ssh-known-hosts` | yes | Pinned host keys; the `SHIPLORD_SSH_KNOWN_HOSTS` variable |
+| `deploy-user` | yes | The account to deploy as; the `SHIPLORD_DEPLOY_USER` variable |
+| `server-host` | yes | The server's tailnet host name; the `SHIPLORD_SERVER_HOST` variable |
+| `ssh-port` | no (empty) | The SSH port when it is not 22 |
+| `ts-client-id` | yes | The Tailscale OIDC client ID; the `SHIPLORD_TS_CLIENT_ID` variable |
+| `ts-audience` | yes | The Tailscale OIDC audience; the `SHIPLORD_TS_AUDIENCE` variable |
+| `ts-tags` | no (`tag:ci`) | The tailnet tags the runner joins with |
+| `image` | yes | The image repository, without a digest (empty for a check-only run) |
+| `digest` | yes | The image digest to deploy (empty for a check-only run) |
+| `commit` | yes | The full commit SHA the release records |
+| `request-id` | yes | An idempotency key, so a retried run never deploys twice |
+
+The key is written to a file under `RUNNER_TEMP` with `umask 077`, passed to `shiplord` through the environment
+(never as an argument), and removed in a final `always()` step. The action declares no outputs, so no secret can
+reach the run page or the calling job.
+
 ## Commands
 
 | Command | Purpose |
