@@ -100,8 +100,8 @@ def render_route(domain: str, port: int) -> bytes:
 
 # --- Caddyfile inspection -------------------------------------------------
 
-def _lines(text: str) -> Iterator[tuple[int, list[str], list[str], int]]:
-    """Yield (line number, tokens, structural tokens, depth before the line)."""
+def _lines(text: str) -> Iterator[tuple[int, list[str], list[bool], int]]:
+    """Yield (line number, tokens, whether each token was quoted, depth before the line)."""
     depth = 0
     heredoc: str | None = None
     for number, raw in enumerate(text.splitlines()):
@@ -110,6 +110,7 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[str], int]]:
                 heredoc = None
             continue
         tokens: list[str] = []
+        quoted: list[bool] = []
         structural: list[str] = []
         i, n = 0, len(raw)
         while i < n:
@@ -128,17 +129,19 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[str], int]]:
                 if j >= n:
                     raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
                 tokens.append("".join(buffer))
+                quoted.append(True)
                 i = j + 1
             else:
                 j = i
                 while j < n and not raw[j].isspace():
                     j += 1
                 tokens.append(raw[i:j])
+                quoted.append(False)
                 structural.append(raw[i:j])
                 i = j
-        if tokens and structural and tokens[-1] == structural[-1] and tokens[-1].startswith("<<") and len(tokens[-1]) > 2:
+        if tokens and not quoted[-1] and tokens[-1].startswith("<<") and len(tokens[-1]) > 2:
             heredoc = tokens[-1][2:]
-        yield number, tokens, structural, depth
+        yield number, tokens, quoted, depth
         for token in structural:
             if token == "{":
                 depth += 1
@@ -148,6 +151,25 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[str], int]]:
                     raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
     if depth != 0 or heredoc is not None:
         raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
+
+
+def _address_tokens(tokens: list[str], quoted: list[bool]) -> tuple[list[str], bool]:
+    """Return the tokens on this line that Caddy reads as a site address, and whether it opens a block.
+
+    A site block begins with its addresses and ends them at the opening brace, so a directive
+    argument such as an upstream, a header value, or a request matcher is never an address, and a
+    hostname inside one does not claim the site. A token that cannot be classified is refused.
+    """
+    addresses: list[str] = []
+    for token, was_quoted in zip(tokens, quoted):
+        if "{" in token or "}" in token:
+            if not was_quoted and token in {"{", "}"}:
+                return addresses, token == "{"  # the block body starts here; the rest is directives
+            raise RoutingError("cannot determine hostnames from a placeholder", "uninspectable")
+        if not was_quoted and token.startswith(("(", "&(")) and token.endswith(")"):
+            continue  # a snippet or named-route definition names no site
+        addresses.append(token)
+    return addresses, False
 
 
 def _addresses(token: str) -> Iterator[str]:
@@ -170,27 +192,35 @@ class _Inspection:
         self.domain, self.own_glob, self.allow_wildcard = domain, own_glob, allow_wildcard_overlap
 
     def scan(self, text: str) -> list[str]:
-        """Check one file for hostname takeover; return path-style imports."""
+        """Check one file for hostname takeover; return path-style imports.
+
+        Only a site block declares addresses, so a hostname is compared only where one can be
+        declared: on a depth-0 line, before its opening brace. A file whose single site block
+        omits the braces reads its first line as the address list and the rest as directives.
+        """
         imports: list[str] = []
-        for _number, tokens, structural, depth in _lines(text):
-            if tokens and tokens[0] == "import" and structural[:1] == ["import"]:
-                imports.extend(tokens[1:])
-            for token in tokens:
+        body = continuing = False
+        for _number, tokens, quoted, depth in _lines(text):
+            if depth != 0 or body or not tokens:
+                continue
+            if tokens[0] == "import" and not quoted[0]:
+                imports.extend(tokens[1:])  # a top-level import substitutes site blocks in place
+                continue
+            addresses, opened = _address_tokens(tokens, quoted)
+            for token in addresses:
                 for address in _addresses(token):
                     if address == self.domain:
                         raise RoutingError("hostname is already served by another configuration", "conflict")
                     if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
                         raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
-            if depth == 0 and tokens and tokens[0] != "import":
-                for token in structural:
-                    if "{" in token and token not in {"{", "}"}:
-                        raise RoutingError("cannot determine hostnames from a placeholder", "uninspectable")
+            continuing = not opened and tokens[-1].endswith(",")  # Caddy continues the address list
+            body = not opened and not continuing  # braces are optional for a single site block
         return imports
 
     def own_import_lines(self, text: str) -> list[int]:
         found = []
-        for number, tokens, structural, depth in _lines(text):
-            if depth == 0 and tokens == ["import", self.own_glob] and structural == tokens:
+        for number, tokens, quoted, depth in _lines(text):
+            if depth == 0 and tokens == ["import", self.own_glob] and not any(quoted):
                 found.append(number)
         return found
 
