@@ -379,6 +379,54 @@ class RealDockerDeployTests(unittest.TestCase):
                          (True, identity(state["current"]), None))
         self.assertEqual(release_id(state["current"]), self.inspect()["Config"]["Labels"]["shiplord.release"])
 
+    def stored_login(self):
+        """A stored docker login for this application whose credential helper records that docker used it.
+
+        The fixture registry is anonymous, so the fetch cannot fail without the login; a helper in the application's
+        own config directory is what proves the fetch was given that directory. It returns no credentials, because a
+        throwaway password would prove nothing more and would put a value in the test.
+        """
+        login = self.layout.registry_logins / self.app
+        login.mkdir(parents=True, exist_ok=True)
+        login.chmod(0o700)
+        record = self.base / "login-record"
+        name = f"shiplord-fixture-{self.app}"
+        helper = Path("/usr/local/bin") / f"docker-credential-{name}"
+        helper.write_text('#!/bin/sh\nprintf "%s %s\\n" "$1" "$(cat)" >> ' + str(record) + '\n'
+                          'printf \'{"ServerURL":"localhost:' + str(REGISTRY_PORT) + '","Username":"","Secret":""}\'\n')
+        helper.chmod(0o755)
+        self.addCleanup(helper.unlink, missing_ok=True)
+        self.addCleanup(shutil.rmtree, login, ignore_errors=True)
+        (login / "config.json").write_text(json.dumps({"credHelpers": {f"localhost:{REGISTRY_PORT}": name}}))
+        (login / "config.json").chmod(0o600)
+        return record
+
+    def test_pruned_image_is_fetched_with_the_stored_login_when_the_release_is_started(self):
+        """`docker image prune -a` is routine host maintenance: the committed release must still come back."""
+        self.assertOutcome(self.deploy("req-i1", "v1", 2500), "succeeded")
+        self.assertOutcome(self.deploy("req-i2", "v2", 2501), "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+
+        docker("rm", "-f", *self.containers())  # the application is down, and host maintenance pruned its image
+        docker("rmi", self.images["v2"]["image"])
+        self.assertNotEqual(docker("image", "inspect", self.images["v2"]["image"], check=False).returncode, 0)
+        record = self.stored_login()  # only from here on: the fetches above must not be credited to it
+
+        # A worker interrupted mid-transaction leaves a journal; recovery starts the committed release again.
+        with self.lock.acquire():
+            self.state.begin("req-i3", self.state.read_state()["current"] | {"sequence": 2502})
+            self.state.advance("runtime-changing")
+        with self.lock.acquire():
+            recovered = self.deployer.recover()
+        self.assertOutcome(recovered, "recovered")
+        self.assertEqual(recovered.detail["target"]["commit"], "b" * 40)
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(docker("image", "inspect", self.images["v2"]["image"], check=False).returncode, 0,
+                         "the start did not fetch the pruned image")
+        self.assertEqual(record.read_text().split(), ["get", f"localhost:{REGISTRY_PORT}"],
+                         "the fetch did not use this application's stored login")
+        self.assertIsNone(self.state.read_journal())
+
     def test_redeploying_a_release_that_is_down_keeps_the_real_rollback_target(self):
         """A CI re-run deploys the same release again with a new request ID; the rollback target must survive."""
         self.assertOutcome(self.deploy("req-r1", "v1", 3000), "succeeded")
