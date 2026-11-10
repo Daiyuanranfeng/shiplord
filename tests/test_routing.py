@@ -6,6 +6,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shiplord import routing
 from shiplord.release_state import HostLock
@@ -32,6 +33,7 @@ class FakeCaddy:
     def validate(self, config: Path) -> None:
         number = len(self.validate_calls) + 1
         self.validate_calls.append({"config": config, "text": config.read_text(),
+                                    "mode": stat.S_IMODE(config.stat().st_mode),
                                     "live": {p.name: p.read_bytes() for p in self.ship.glob("*.caddy")}})
         if number in self.fail_validate:
             raise RoutingError("Caddy command failed", "validation", detail="bad config")
@@ -78,6 +80,9 @@ class RoutingTestCase(unittest.TestCase):
     def snapshot(self):
         """Every file under the Caddy root, for byte-for-byte comparison."""
         return {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+
+    def mode(self, path):
+        return stat.S_IMODE(path.stat().st_mode)
 
     def assertNoTransactionLeftovers(self):
         leftovers = [p.name for p in self.root.rglob(".*") if p.is_file()]
@@ -154,6 +159,31 @@ class ApplyTests(RoutingTestCase):
             render_route("bad domain", 20000)
         with self.assertRaises(RoutingError):
             render_route("orders.example.com", 2019)
+
+    def test_a_route_change_leaves_a_0640_caddyfile_at_0640(self):
+        (self.root / "Caddyfile").chmod(0o640)
+        with self.lock.acquire():
+            self.manager.apply(registration())
+        self.assertEqual(self.mode(self.root / "Caddyfile"), 0o640)
+
+    def test_the_validation_copy_of_the_caddyfile_keeps_its_mode(self):
+        # The copy holds whatever token or password hash the Caddyfile holds, so it must not be wider than it.
+        (self.root / "Caddyfile").chmod(0o640)
+        with self.lock.acquire():
+            self.manager.apply(registration())
+        self.assertEqual([call["mode"] for call in self.caddy.validate_calls], [0o640])
+
+    def test_route_files_are_created_with_an_explicit_mode_regardless_of_umask(self):
+        for umask in (0o077, 0o000):
+            with self.subTest(umask=oct(umask)):
+                (self.ship / "orders.caddy").unlink(missing_ok=True)  # each umask must create the file itself
+                previous = os.umask(umask)
+                try:
+                    with self.lock.acquire():
+                        self.manager.apply(registration())
+                finally:
+                    os.umask(previous)
+                self.assertEqual(self.mode(self.ship / "orders.caddy"), 0o644)
 
 
 class FailureTests(RoutingTestCase):
@@ -474,6 +504,28 @@ class EnsureImportTests(RoutingTestCase):
         with self.lock.acquire():
             self.manager.ensure_import()
         self.assertEqual((self.root / "Caddyfile").read_text(), "example.org {\n}\n" + self.line)
+
+    def test_rewriting_the_caddyfile_preserves_its_owner_and_mode(self):
+        path = self.root / "Caddyfile"
+        path.chmod(0o640)
+        before = path.stat()
+        with self.lock.acquire():
+            self.assertTrue(self.manager.ensure_import().changed)
+        after = path.stat()
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o640, before.st_uid, before.st_gid))
+
+    def test_a_caddyfile_whose_owner_cannot_be_preserved_is_not_replaced(self):
+        path = self.root / "Caddyfile"
+        path.chmod(0o640)
+        before = self.snapshot()
+        with patch("shiplord.routing.os.fchown", side_effect=OSError(1, "operation not permitted")):
+            with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+                self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "precondition")
+        self.assertEqual((self.snapshot(), self.mode(path)), (before, 0o640))
+        self.assertEqual(self.caddy.reload_calls, 0)
+        self.assertNoTransactionLeftovers()
 
     def test_duplicate_imports_and_missing_files_are_refused(self):
         self.write_main(self.MAIN + self.line + self.line)

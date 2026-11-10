@@ -33,6 +33,9 @@ MAX_CONFIG_BYTES = 1024 * 1024
 MAX_IMPORTED_FILES = 64
 MAX_IMPORT_DEPTH = 3
 COMMAND_TIMEOUT_SECONDS = 30
+# A route file holds only a hostname and a loopback port, so it is world-readable like the installer's placeholder
+# route; the Caddyfile, which can hold a token or a password hash, keeps whatever mode it already had instead.
+ROUTE_FILE_MODE = 0o644
 _TEMP_PREFIX = ".tmp-"
 _PRIOR_PREFIX = ".prior-"
 _VALIDATE_PREFIX = ".shiplord-validate-"
@@ -192,7 +195,17 @@ class _Inspection:
         return found
 
 
-def _read_file(directory: int, name: str, *, trusted: bool) -> bytes | None:
+@dataclass(frozen=True)
+class _CaddyFile:
+    """A file read through a directory descriptor, plus the owner and mode a rewrite of it must keep."""
+
+    data: bytes
+    mode: int  # permission bits only; set-id and sticky bits are never carried
+    uid: int
+    gid: int
+
+
+def _read_file(directory: int, name: str, *, trusted: bool) -> _CaddyFile | None:
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     except FileNotFoundError:
@@ -204,7 +217,9 @@ def _read_file(directory: int, name: str, *, trusted: bool) -> bytes | None:
         if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES
                 or (trusted and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022))):
             raise RoutingError("a Caddy file is not safe to use", "uninspectable")
-        return file.read(MAX_CONFIG_BYTES + 1)[:MAX_CONFIG_BYTES]
+        # Taken from the descriptor that was read, so a replacement cannot swap the identity between the two.
+        return _CaddyFile(file.read(MAX_CONFIG_BYTES + 1)[:MAX_CONFIG_BYTES], stat.S_IMODE(info.st_mode) & 0o777,
+                          info.st_uid, info.st_gid)
 
 
 def _read_path(path: str) -> str:
@@ -219,6 +234,14 @@ def _read_path(path: str) -> str:
 
 
 # --- Transactions ---------------------------------------------------------
+
+def _discard(directory: int, name: str) -> None:
+    """Remove a file this module just created; the caller reports why it is going away."""
+    try:
+        os.unlink(name, dir_fd=directory)
+    except OSError:
+        pass
+
 
 class RouteManager:
     """Apply, remove, and reconcile managed routes under the host lock."""
@@ -257,7 +280,8 @@ class RouteManager:
             os.close(ship)
         if current is None:
             return "absent"
-        return "identical" if current == render_route(registration["api_domain"], registration["host_port"]) else "different"
+        rendered = render_route(registration["api_domain"], registration["host_port"])
+        return "identical" if current.data == rendered else "different"
 
     def ensure_import(self) -> RouteResult:
         """Append the managed import to the main Caddyfile once, validated and restorable."""
@@ -272,7 +296,7 @@ class RouteManager:
             main = _read_file(root, "Caddyfile", trusted=True)
             if main is None:
                 raise RoutingError("the main Caddyfile is missing", "precondition")
-            text = main.decode("utf-8", "replace")
+            text = main.data.decode("utf-8", "replace")
             found = _Inspection("", self.own_glob, False).own_import_lines(text)
             if len(found) > 1:
                 raise RoutingError("the main Caddyfile imports the managed routes more than once", "precondition")
@@ -280,7 +304,7 @@ class RouteManager:
                 return RouteResult(changed=False)
             candidate = (text + ("" if not text or text.endswith("\n") else "\n") + f"import {self.own_glob}\n").encode()
             name = _VALIDATE_PREFIX + token
-            self._create(root, name, candidate)
+            self._create(root, name, candidate, preserve=main)
             try:
                 self.commands.validate(self.root / name)
             except RoutingError as error:
@@ -289,7 +313,7 @@ class RouteManager:
             finally:
                 self._unlink(root, name)
             temp = _TEMP_PREFIX + "Caddyfile-" + token
-            self._create(root, temp, candidate)
+            self._create(root, temp, candidate, preserve=main)
             os.link("Caddyfile", prior, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
             self._publish(root, temp, "Caddyfile")
             try:
@@ -357,7 +381,7 @@ class RouteManager:
         main = _read_file(root, "Caddyfile", trusted=True)
         if main is None:
             raise RoutingError("the main Caddyfile is missing", "precondition")
-        main_text = main.decode("utf-8", "replace")
+        main_text = main.data.decode("utf-8", "replace")
         inspection = _Inspection(domain or "", self.own_glob, self.allow_wildcard_overlap)
         import_lines = inspection.own_import_lines(main_text)
         if len(import_lines) != 1:
@@ -367,15 +391,16 @@ class RouteManager:
         others = sorted(name for name in names if name.endswith(".caddy") and name != live)
         other_texts = {}
         for name in others:
-            data = _read_file(ship, name, trusted=True)
-            if data is None:
+            route = _read_file(ship, name, trusted=True)
+            if route is None:
                 raise RoutingError("a managed route disappeared during inspection", "uninspectable")
-            other_texts[name] = data.decode("utf-8", "replace")
+            other_texts[name] = route.data.decode("utf-8", "replace")
         if domain is not None:
             self._scan_hostnames(inspection, main_text, other_texts)
 
         current = _read_file(ship, live, trusted=True)
-        if not force and current == candidate:
+        current_data = current.data if current is not None else None
+        if not force and current_data == candidate:
             return RouteResult(changed=False)
 
         temp = None
@@ -383,14 +408,14 @@ class RouteManager:
             temp = _TEMP_PREFIX + secrets.token_hex(8)
             self._create(ship, temp, candidate)
         try:
-            self._validate(root, main_text, import_lines[0], [f"{self.root}/ship/{name}" for name in others]
+            self._validate(root, main, import_lines[0], [f"{self.root}/ship/{name}" for name in others]
                            + ([f"{self.root}/ship/{temp}"] if temp else []))
         except RoutingError:
             if temp:
                 self._unlink(ship, temp)
             raise
 
-        changed = current != candidate
+        changed = current_data != candidate
         if changed:
             if current is not None:
                 self._remove_if_present(ship, prior)
@@ -434,11 +459,12 @@ class RouteManager:
                         raise RoutingError("Caddy imports too many files to inspect", "uninspectable")
                     queue.append((_read_path(path), os.path.dirname(path), depth + 1))
 
-    def _validate(self, root: int, main_text: str, import_line: int, imports: list[str]) -> None:
-        lines = main_text.splitlines()
+    def _validate(self, root: int, main: _CaddyFile, import_line: int, imports: list[str]) -> None:
+        lines = main.data.decode("utf-8", "replace").splitlines()
         lines[import_line:import_line + 1] = [f"import {path}" for path in imports]
         name = _VALIDATE_PREFIX + secrets.token_hex(8)
-        self._create(root, name, ("\n".join(lines) + "\n").encode())
+        # The candidate embeds the whole Caddyfile, so it is written with the Caddyfile's own owner and mode.
+        self._create(root, name, ("\n".join(lines) + "\n").encode(), preserve=main)
         try:
             try:
                 self.commands.validate(self.root / name)
@@ -472,15 +498,37 @@ class RouteManager:
                                intervention_required=True, detail=cause.detail) from None
 
     @staticmethod
-    def _create(directory: int, name: str, data: bytes) -> None:
+    def _create(directory: int, name: str, data: bytes, *, preserve: _CaddyFile | None = None) -> None:
+        """Create ``name`` exclusively with a mode this module chooses, never one the helper's umask chooses.
+
+        A route file gets ``ROUTE_FILE_MODE``. A copy of the main Caddyfile passes ``preserve`` and keeps the owner,
+        group, and mode of the file it was copied from: the Caddyfile routinely holds an ACME DNS token or a
+        basic-auth hash, and a copy another account can read would expose it. If that owner cannot be kept the copy
+        is refused, so the caller never publishes it.
+        """
+        mode = ROUTE_FILE_MODE if preserve is None else preserve.mode
         try:
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=directory)
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        except OSError:
+            raise RoutingError("could not write a Caddy file", "precondition") from None
+        try:
+            if preserve is not None:
+                os.fchown(descriptor, preserve.uid, preserve.gid)
+            os.fchmod(descriptor, mode)  # the mode given to os.open is masked by the umask; this one is exact
+        except OSError:
+            os.close(descriptor)
+            _discard(directory, name)
+            if preserve is not None:
+                raise RoutingError("the Caddyfile owner cannot be preserved", "precondition") from None
+            raise RoutingError("could not write a Caddy file", "precondition") from None
+        try:
             with os.fdopen(descriptor, "wb") as file:
                 file.write(data)
                 file.flush()
                 os.fsync(file.fileno())
             os.fsync(directory)
         except OSError:
+            _discard(directory, name)
             raise RoutingError("could not write a Caddy file", "precondition") from None
 
     @staticmethod
