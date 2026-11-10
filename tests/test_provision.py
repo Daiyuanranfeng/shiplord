@@ -563,6 +563,81 @@ class RegistryLoginTests(ProvisionTestCase):
         with self.assertRaisesRegex(ProvisionError, "unreadable"):
             self.login()
 
+    def test_a_hand_edited_login_file_is_reported_clearly_without_a_traceback(self):
+        self.provision()
+        self.login()
+        cases = {
+            "top level is not an object": "[]",
+            "auths is not an object": '{"auths": []}',
+            "entry is not an object": '{"auths": {"ghcr.io": "text"}}',
+            "auth is missing": '{"auths": {"ghcr.io": {}}}',
+            "auth is not text": '{"auths": {"ghcr.io": {"auth": 5}}}',
+            "auth is not base64": '{"auths": {"ghcr.io": {"auth": "!!!"}}}',
+            "auth is not username and token": '{"auths": {"ghcr.io": {"auth": "'
+                                              + base64.b64encode(b"nocolon").decode() + '"}}}',
+            "auth is not UTF-8": '{"auths": {"ghcr.io": {"auth": "'
+                                 + base64.b64encode(b"\xff").decode() + '"}}}',
+            "auth has an invalid username": '{"auths": {"ghcr.io": {"auth": "'
+                                            + base64.b64encode(b"a b:secret").decode() + '"}}}',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.config().write_text(text)
+                for operation in ("list", "login"):
+                    with self.assertRaisesRegex(ProvisionError, "config.json") as caught:
+                        if operation == "list":
+                            manage_registry(self.layout, "orders", "list")
+                        else:
+                            self.login()
+                    self.assertNotIn(self.TOKEN, str(caught.exception))
+                self.assertEqual(self.config().read_text(), text)
+
+    def test_a_failed_write_leaves_no_temporary_file_holding_the_token(self):
+        self.provision()
+        for target in ("os.replace", "json.dump"):
+            with self.subTest(target), patch(f"shiplord.provision.{target}", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(ProvisionError, "could not write the registry login") as caught:
+                    self.login()
+                self.assertNotIn(self.TOKEN, str(caught.exception))
+            self.assertEqual(list(self.config().parent.iterdir()), [])
+
+    def test_a_login_file_that_is_not_utf8_or_too_deep_is_reported(self):
+        self.provision()
+        self.config().parent.mkdir(mode=0o700)
+        cases = {"not UTF-8": b'{"auths": {}}\xff', "too deeply nested": ("[" * 100000 + "]" * 100000).encode()}
+        for label, data in cases.items():
+            with self.subTest(label):
+                self.config().write_bytes(data)
+                with self.assertRaisesRegex(ProvisionError, "config.json"):
+                    manage_registry(self.layout, "orders", "list")
+
+    def test_a_login_and_logout_sync_the_login_directory(self):
+        self.provision()
+        modes = []
+        real_fsync = os.fsync
+
+        def record(descriptor):
+            modes.append(os.fstat(descriptor).st_mode)
+            real_fsync(descriptor)
+
+        with patch("shiplord.provision.os.fsync", record):
+            self.login()
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "login must sync the directory")
+        modes.clear()
+        with patch("shiplord.provision.os.fsync", record):
+            manage_registry(self.layout, "orders", "logout", registry="ghcr.io")
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "logout must sync the directory")
+
+    def test_a_login_preserves_entries_for_other_registries(self):
+        self.provision()
+        other = base64.b64encode(b"someone:other-token").decode()
+        self.config().parent.mkdir(mode=0o700)
+        self.config().write_text(json.dumps({"auths": {"docker.io": {"auth": other}}}))
+        self.login()
+        document = json.loads(self.config().read_text())
+        self.assertEqual(document["auths"]["docker.io"], {"auth": other})
+        self.assertEqual(base64.b64decode(document["auths"]["ghcr.io"]["auth"]).decode(), f"deploy-bot:{self.TOKEN}")
+
     def test_through_the_admin_entry_point_and_removed_with_the_application(self):
         self.provision()
         request = envelope("registry", arguments={"operation": "login", "registry": "ghcr.io", "username": "u", "token": self.TOKEN})

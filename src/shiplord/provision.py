@@ -313,8 +313,103 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
 
 
 REGISTRY_HOSTS = ("ghcr.io",)
+REGISTRY_CONFIG = "config.json"
 _LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 _LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
+
+
+def _registry_username(entry: object) -> str:
+    """Decode one ``auth`` value; the error names the problem, never the value or a host path."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("auth"), str):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth entry has no auth value")
+    try:
+        decoded = base64.b64decode(entry["auth"], validate=True).decode("utf-8")
+    except ValueError:
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not valid "
+                             "base64") from None
+    username, separator, _ = decoded.partition(":")
+    if not separator or not _LOGIN_USER.fullmatch(username):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
+                             "username:token")
+    return username
+
+
+def _registry_auths(path: Path) -> dict:
+    """Read the login file's raw ``auths`` mapping; a hand-edited file is an error, not a traceback."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is unreadable") from None
+    try:
+        document = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is unreadable: it is not valid JSON") from None
+    auths = document.get("auths") if isinstance(document, dict) else None
+    if not isinstance(auths, dict):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: auths is not an object")
+    for entry in auths.values():
+        _registry_username(entry)
+    return auths
+
+
+def _remove_registry_config(directory: Path) -> None:
+    """Remove the login file and sync its directory; a missing file or directory is not an error."""
+    if directory.is_symlink():
+        raise ProvisionError(f"{directory} is a symbolic link")
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ProvisionError("could not remove the registry login") from None
+    try:
+        try:
+            os.unlink(REGISTRY_CONFIG, dir_fd=descriptor)
+            os.fsync(descriptor)
+        except FileNotFoundError:
+            pass
+    except OSError:
+        raise ProvisionError("could not remove the registry login") from None
+    finally:
+        os.close(descriptor)
+
+
+def _write_registry_config(directory: Path, auths: dict) -> None:
+    """Publish the login file atomically and sync its directory; a failure leaves no temporary file."""
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink():
+            raise ProvisionError(f"{directory} is a symbolic link")
+        os.chmod(directory, 0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ProvisionError("could not write the registry login") from None
+    temporary = f".config.tmp-{secrets.token_hex(6)}"
+    created = False
+    try:
+        file_descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                                  dir_fd=descriptor)
+        created = True
+        with os.fdopen(file_descriptor, "w") as file:
+            json.dump({"auths": auths}, file)
+            file.flush()
+            if os.geteuid() == 0:
+                os.fchown(file.fileno(), 0, 0)
+            os.fsync(file.fileno())
+        os.replace(temporary, REGISTRY_CONFIG, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        created = False
+        os.fsync(descriptor)
+    except OSError:
+        raise ProvisionError("could not write the registry login") from None
+    finally:
+        try:
+            if created:
+                os.unlink(temporary, dir_fd=descriptor)
+        except OSError:
+            pass
+        os.close(descriptor)
 
 
 def manage_registry(layout: Layout, application_id: str, operation: str, *, registry: str | None = None,
@@ -328,13 +423,10 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
     if not (layout.registrations / f"{app}.json").is_file():
         raise ProvisionError("the application is not provisioned")
     directory = layout.registry_logins / app
-    path = directory / "config.json"
-    try:
-        current = json.loads(path.read_text()).get("auths", {}) if path.exists() else {}
-    except (OSError, ValueError, AttributeError):
-        raise ProvisionError("the registry login file is unreadable; remove and recreate it") from None
+    current = _registry_auths(directory / REGISTRY_CONFIG)
+
     def summary() -> dict:  # registries and usernames only; never a token
-        return {"registries": [{"registry": name, "username": base64.b64decode(entry["auth"]).split(b":", 1)[0].decode()}
+        return {"registries": [{"registry": name, "username": _registry_username(entry)}
                                for name, entry in sorted(current.items())]}
 
     if operation == "list":
@@ -351,23 +443,10 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
         current[registry] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
     else:
         raise ProvisionError("unknown registry operation")
-    try:
-        if not current:
-            path.unlink(missing_ok=True)
-            return summary()
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-        temporary = directory / f".config.tmp-{secrets.token_hex(6)}"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w") as file:
-            json.dump({"auths": current}, file)
-            file.flush()
-            if os.geteuid() == 0:
-                os.fchown(file.fileno(), 0, 0)
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        raise ProvisionError("could not write the registry login") from None
+    if not current:
+        _remove_registry_config(directory)
+        return summary()
+    _write_registry_config(directory, current)
     return summary()
 
 

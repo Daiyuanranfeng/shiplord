@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shiplord.keys import MAX_KEYS, KeyError_, KeyStore, parse_public_key
 
@@ -152,6 +153,52 @@ class StoreTests(KeyTestCase):
         self.store.delete()
         self.store.delete()
         self.assertEqual(self.store.list(), [])
+
+    def test_removal_and_delete_sync_the_key_directory(self):
+        self.store.add("laptop", self.ed)
+        self.store.add("ci", self.other)
+        modes = []
+        real_fsync = os.fsync
+
+        def record(descriptor):
+            modes.append(os.fstat(descriptor).st_mode)
+            real_fsync(descriptor)
+
+        with patch("shiplord.keys.os.fsync", record):
+            self.assertTrue(self.store.remove("ci"))
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "removal must sync the directory")
+        modes.clear()
+        with patch("shiplord.keys.os.fsync", record):
+            self.store.delete()
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "delete must sync the directory")
+        self.store.delete()
+
+    def test_a_symlinked_key_directory_is_refused(self):
+        real = Path(self.root.name) / "keys"
+        real.mkdir()
+        KeyStore(real, "orders", "ship-orders").add("laptop", self.ed)
+        linked = Path(self.root.name) / "linked-keys"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(KeyError_, "directory"):
+            KeyStore(linked, "orders", "ship-orders").list()
+
+    def test_a_writable_key_directory_is_refused(self):
+        self.store.add("laptop", self.ed)
+        Path(self.root.name).chmod(0o777)
+        self.addCleanup(Path(self.root.name).chmod, 0o700)
+        with self.assertRaisesRegex(KeyError_, "directory"):
+            self.store.list()
+
+    def test_a_symlinked_key_file_is_never_followed(self):
+        target = Path(self.root.name) / "elsewhere"
+        target.write_text("keep me")
+        self.store.path.symlink_to(target)
+        with self.assertRaises(KeyError_):
+            self.store.remove("laptop")
+        self.assertEqual(target.read_text(), "keep me")
+        self.store.delete()
+        self.assertFalse(self.store.path.exists())
+        self.assertEqual(target.read_text(), "keep me")
 
 
 if __name__ == "__main__":
