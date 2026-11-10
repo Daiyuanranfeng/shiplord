@@ -30,6 +30,14 @@ MAX_LOG_LINES = 1000
 MIN_FREE_BYTES = 1024 * 1024 * 1024  # refuse to pull when less than this is free: a full disk fails a deploy halfway
 DOCKER_ROOT = Path("/var/lib/docker")
 REVISION_LABEL = "org.opencontainers.image.revision"
+# Everything `docker run` sets that is not derived from the release record. The start and the running check both use
+# these, so a change here can never make the check disagree with what was started.
+PIDS_LIMIT = 512
+RESTART_POLICY = "unless-stopped"
+LOG_DRIVER = "json-file"
+LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}
+SECURITY_OPTIONS = ("no-new-privileges",)
+CAP_DROP = ("ALL",)
 _MACHINE_PLATFORMS = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
 
 
@@ -89,6 +97,53 @@ def _digest(image: str) -> str:
 def _registry(image: str) -> str:
     """The registry host an image reference names, so a message can say where an image has to come from."""
     return image.split("/", 1)[0]
+
+
+def _managed_environment(registration: dict, configuration: dict) -> dict[str, str]:
+    """The environment Shiplord sets on every release; the start and the running check share this one definition."""
+    http = configuration["http"]
+    managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "LOG_LEVEL": "INFO"}
+    if configuration["template"] == "google-adk":
+        managed.update(AGENT_DIR="/app/src", AGENT_NAME=registration["application_id"], RELOAD_AGENTS="false",
+                       SERVE_WEB_INTERFACE="false", ALLOW_ORIGINS=json.dumps(http["frontend_origins"]))
+    return managed
+
+
+def _environment_dict(encoded: str) -> dict[str, str]:
+    """Parse the JSON list of ``KEY=VALUE`` entries Docker records; raises ``ValueError`` on anything unexpected."""
+    entries = json.loads(encoded)
+    if not isinstance(entries, list):
+        raise ValueError("environment is not a list")
+    values = {}
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError("environment entry is not a string")
+        key, separator, value = entry.partition("=")
+        if not separator:
+            raise ValueError("environment entry is not KEY=VALUE")
+        values[key] = value
+    return values
+
+
+def _environment_matches(actual: dict[str, str], expected: dict[str, str]) -> bool:
+    """Every value the start sets must be exactly what the container was created with.
+
+    Extra keys are tolerated: ``.Config.Env`` also carries the image's own ``ENV`` and the base image's ``PATH``,
+    which the start neither sets nor can distinguish from a custom key the operator removed. Values never leave here.
+    """
+    return all(actual.get(key) == value for key, value in expected.items())
+
+
+def _security_options(values: list) -> set:
+    """Docker writes ``no-new-privileges`` or, on some versions, ``no-new-privileges:true``."""
+    return {value[:-len(":true")] if isinstance(value, str) and value.endswith(":true") else value for value in values}
+
+
+def _integer(text: str) -> int | None:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
 
 class Runtime(Protocol):
@@ -542,44 +597,67 @@ class DockerRuntime:
                 "--label", f"shiplord.release={release_id(release)}",
                 "--label", f"shiplord.template={config['template']}",
                 "--label", f"shiplord.shutdown_timeout={timeout}", "--label", f"shiplord.shutdown_action={action}",
-                "--restart", "unless-stopped", "--memory", memory, "--memory-swap", memory, "--pids-limit", "512",
-                "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-                "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--stop-timeout", str(timeout),
-                "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
-                "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
+                "--restart", RESTART_POLICY, "--memory", memory, "--memory-swap", memory,
+                "--pids-limit", str(PIDS_LIMIT), "--log-driver", LOG_DRIVER]
+        for key, value in LOG_OPTIONS.items():
+            argv += ["--log-opt", f"{key}={value}"]
+        for option in SECURITY_OPTIONS:
+            argv += ["--security-opt", option]
+        for capability in CAP_DROP:
+            argv += ["--cap-drop", capability]
+        argv += ["--stop-timeout", str(timeout),
+                 "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
+                 "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
         if custom is not None:
             argv += ["--env-file", str(self.layout.environments / registration["application_id"] / "app.env")]
-        managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "LOG_LEVEL": "INFO"}
-        if config["template"] == "google-adk":
-            managed.update(AGENT_DIR="/app/src", AGENT_NAME=registration["application_id"], RELOAD_AGENTS="false",
-                           SERVE_WEB_INTERFACE="false", ALLOW_ORIGINS=json.dumps(http["frontend_origins"]))
-        for key, value in managed.items():  # after --env-file, so the managed values win
+        for key, value in _managed_environment(registration, config).items():  # after --env-file, so they win
             argv += ["--env", f"{key}={value}"]
         argv.append(release["artifact"]["image"])
         result = self._docker(argv, "start")
         if result.code != 0:
             raise RuntimeFailure("the container could not be started", "start", result.output)
 
-    def is_running(self, registration: dict, release: dict) -> bool:
-        """Is the container running with this release's image, profile, shutdown policy, and storage mount?
+    _RUNNING_INSPECT = (
+        "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}"
+        "|{{index .Config.Labels \"shiplord.shutdown_timeout\"}}"
+        "|{{index .Config.Labels \"shiplord.shutdown_action\"}}"
+        "|{{index .Config.Labels \"shiplord.template\"}}"
+        "|{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}"
+        "|{{.HostConfig.Memory}}"
+        "|{{.HostConfig.MemorySwap}}"
+        "|{{if .HostConfig.PidsLimit}}{{.HostConfig.PidsLimit}}{{else}}0{{end}}"
+        "|{{.HostConfig.RestartPolicy.Name}}"
+        "|{{json .HostConfig.SecurityOpt}}"
+        "|{{json .HostConfig.CapDrop}}"
+        "|{{.HostConfig.LogConfig.Type}}"
+        "|{{json .HostConfig.LogConfig.Config}}"
+        "|{{json .HostConfig.PortBindings}}"
+        "|{{json .Config.Env}}"
+    )
+    _RUNNING_FIELDS = 14  # separators before the JSON environment, which is last so a value may contain "|"
 
-        The container name does not encode configuration, so a name and a readiness answer alone could
-        accept a container that still has the previous mount path. A crash-looping container reports
-        Running=true while Docker waits to restart it; that is not "running" either.
+    def is_running(self, registration: dict, release: dict) -> bool:
+        """Is the container running with every value this release's start consumes?
+
+        The container name does not encode configuration, so a name and a readiness answer alone could accept a
+        container that still runs the previous memory limit, port, origins, or environment. A crash-looping container
+        reports Running=true while Docker waits to restart it; that is not "running" either. Anything absent or
+        unreadable is a mismatch: restarting is always safe and writes the committed configuration.
+
+        The one exception is the operator's own environment file: when it cannot be read there is nothing to compare
+        against, and a start would fail on that same file. The record-derived values above still decide, so a
+        candidate that already replaced them is caught; a running release is not reported down for a file a restart
+        could not fix.
         """
-        result = self._docker(["inspect", "--format",
-                               "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}|"
-                               "{{index .Config.Labels \"shiplord.shutdown_timeout\"}}|"
-                               "{{index .Config.Labels \"shiplord.shutdown_action\"}}|"
-                               "{{index .Config.Labels \"shiplord.template\"}}|"
-                               "{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}",
+        result = self._docker(["inspect", "--format", self._RUNNING_INSPECT,
                                self.container_name(registration, release)], "inspect")
         if result.code != 0:
             return False
-        try:
-            head, timeout_label, action_label, template, mount_list = result.output.strip().split("|")
-        except ValueError:
+        parts = result.output.strip().split("|", self._RUNNING_FIELDS)
+        if len(parts) != self._RUNNING_FIELDS + 1:
             return False
+        (head, timeout_label, action_label, template, mount_list, memory, memory_swap, pids_limit, restart_policy,
+         security_opt, cap_drop, log_driver, log_options, ports, environment) = parts
         fields = head.split()
         if len(fields) != 3:
             return False
@@ -593,14 +671,42 @@ class DockerRuntime:
             return False
         # Containers from helpers predating profiles have no label and use the ADK contract.
         template = "google-adk" if template in absent else template
-        expected = f"volume:{self.volume_name(registration)}:{container_path(release['configuration'])}"
+        configuration = release["configuration"]
+        expected = f"volume:{self.volume_name(registration)}:{container_path(configuration)}"
         # Docker adds one anonymous mount for every VOLUME instruction in an image. Those are compatible when the
         # Shiplord-managed volume is still present exactly once at the configured path.
+        try:
+            custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
+        except EnvironmentError_:
+            custom = None  # unreadable: only the record-derived values can decide; the next start reports the file
+        expected_environment = {**(custom or {}), **_managed_environment(registration, configuration)}
+        try:
+            security = json.loads(security_opt) or []
+            capabilities = json.loads(cap_drop) or []
+            log_config = json.loads(log_options) or {}
+            bindings = json.loads(ports)
+            actual_environment = _environment_dict(environment)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(security, list) or not isinstance(capabilities, list) or not isinstance(log_config, dict):
+            return False
+        memory_mb = configuration["resources"]["memory_mb"]
         return ((running, restarting) == ("true", "false")
                 and _digest(image) == _digest(release["artifact"]["image"])
-                and actual_policy == policy(release["configuration"])
-                and template == release["configuration"]["template"]
-                and mount_list.split().count(expected) == 1)
+                and actual_policy == policy(configuration)
+                and template == configuration["template"]
+                and mount_list.split().count(expected) == 1
+                and _integer(memory) == memory_mb * 1024 * 1024
+                and _integer(memory_swap) == memory_mb * 1024 * 1024
+                and _integer(pids_limit) == PIDS_LIMIT
+                and restart_policy == RESTART_POLICY
+                and _security_options(security) == set(SECURITY_OPTIONS)
+                and set(capabilities) == set(CAP_DROP)
+                and log_driver == LOG_DRIVER
+                and log_config == LOG_OPTIONS
+                and bindings == {f"{configuration['http']['container_port']}/tcp": [
+                    {"HostIp": "127.0.0.1", "HostPort": str(registration["host_port"])}]}
+                and _environment_matches(actual_environment, expected_environment))
 
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))

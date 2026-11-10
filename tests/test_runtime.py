@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -510,10 +511,25 @@ class StartImageTests(RuntimeTestCase):
 
 
 class InspectTests(RuntimeTestCase):
+    MANAGED = ("HOST=0.0.0.0", "PORT=8080", "LOG_LEVEL=INFO", "AGENT_DIR=/app/src", "AGENT_NAME=orders",
+               "RELOAD_AGENTS=false", "SERVE_WEB_INTERFACE=false", "ALLOW_ORIGINS=[]")
+
+    def environment(self, *extra, **overrides):
+        values = dict(item.partition("=")[::2] for item in (*self.MANAGED, *extra))
+        values.update(overrides)
+        return json.dumps([f"{key}={value}" for key, value in values.items()])
+
     def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",),
-                       timeout="<no value>", action="<no value>", template="google-adk"):
-        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64}|{timeout}|{action}|{template}|"
-                                f" {' '.join(mounts)}\n")
+                       timeout="<no value>", action="<no value>", template="google-adk",
+                       memory=512 * 1024 * 1024, memory_swap=512 * 1024 * 1024, pids=512,
+                       restart="unless-stopped", security='["no-new-privileges"]', capabilities='["ALL"]',
+                       log_driver="json-file", log_options='{"max-size":"10m","max-file":"3"}',
+                       ports='{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"20007"}]}',
+                       environment=None, repository="ghcr.io/example/orders"):
+        environment = self.environment() if environment is None else environment
+        return CommandResult(0, f"{state} {repository}@sha256:{image * 64}|{timeout}|{action}|{template}|"
+                                f" {' '.join(mounts)}|{memory}|{memory_swap}|{pids}|{restart}|{security}|"
+                                f"{capabilities}|{log_driver}|{log_options}|{ports}|{environment}\n")
 
     def test_profile_changes_require_a_new_container_even_with_the_same_image_and_identity(self):
         for actual in ("generic", "google-adk", "", "<no value>", "unknown", "google-adk|generic"):
@@ -553,14 +569,12 @@ class InspectTests(RuntimeTestCase):
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
 
     def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
-        mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
-                                 + "|<no value>|<no value>|google-adk| volume:shiplord-orders-artifacts:/app/src/.adk\n")
-        self.docker.results["inspect"] = mirrored
+        self.docker.results["inspect"] = self.inspect_output(repository="localhost:5000/example/orders")
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
-        self.docker.results["inspect"] = CommandResult(0, mirrored.output.replace("b" * 64, "c" * 64))
+        self.docker.results["inspect"] = self.inspect_output(image="c", repository="localhost:5000/example/orders")
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
-        self.docker.results["inspect"] = CommandResult(0, "true false orders:latest|<no value>|<no value>|google-adk|"
-                                                         "volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.docker.results["inspect"] = CommandResult(0, self.inspect_output(repository="orders:latest").output
+                                                       .replace("orders:latest@sha256:" + "b" * 64, "orders:latest"))
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
 
     def test_shutdown_policy_is_part_of_running_identity(self):
@@ -572,6 +586,85 @@ class InspectTests(RuntimeTestCase):
         self.assertTrue(self.runtime.is_running(REGISTRATION, candidate))
         self.docker.results["inspect"] = self.inspect_output(timeout="120", action="bad")
         self.assertFalse(self.runtime.is_running(REGISTRATION, candidate))
+
+    def test_memory_and_memory_swap_are_part_of_running_identity(self):
+        self.docker.results["inspect"] = self.inspect_output(memory=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(memory_swap=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(memory=256 * 1024 * 1024, memory_swap=256 * 1024 * 1024)
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(memory=256)))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_every_fixed_run_value_is_part_of_running_identity(self):
+        changed = {
+            "another pids limit": {"pids": 256},
+            "another restart policy": {"restart": "always"},
+            "another security option": {"security": '["no-new-privileges:false"]'},
+            "no security option": {"security": "null"},
+            "another dropped capability": {"capabilities": '["CHOWN"]'},
+            "no dropped capability": {"capabilities": "null"},
+            "another log driver": {"log_driver": "local"},
+            "another log size": {"log_options": '{"max-size":"1m","max-file":"3"}'},
+            "another log file count": {"log_options": '{"max-size":"10m","max-file":"1"}'},
+            "another published port": {"ports": '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"20008"}]}'},
+            "another container port": {"ports": '{"8081/tcp":[{"HostIp":"127.0.0.1","HostPort":"20007"}]}'},
+            "a public bind": {"ports": '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"20007"}]}'},
+        }
+        for label, fields in changed.items():
+            with self.subTest(label):
+                self.docker.results["inspect"] = self.inspect_output(**fields)
+                self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_the_environment_the_container_was_created_with_is_part_of_running_identity(self):
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment(ALLOW_ORIGINS='["https://old.example"]'))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(origins=["https://new.example"])))
+        self.docker.results["inspect"] = self.inspect_output(environment=self.environment(PORT="8081"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_a_custom_environment_value_is_compared_and_image_keys_are_tolerated(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=placeholder\n")
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", "VERSION=v1", CUSTOM_TOKEN="placeholder"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", CUSTOM_TOKEN="old"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(environment=self.environment("PATH=/usr/bin"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_an_environment_value_containing_the_field_separator_does_not_shift_the_other_fields(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=a|b\n")
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", CUSTOM_TOKEN="a|b"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_an_unusable_environment_file_is_not_a_mismatch_by_itself(self):
+        """A start would fail on the same file, so a restart cannot fix it; the record still decides."""
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("PORT=1\n")  # a managed key: the parser refuses it
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output()
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        path.write_text("OK=1\n")
+        path.chmod(0o644)  # not private to the installing account
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        # The record-derived values are still compared, so a candidate that replaced them is caught.
+        self.docker.results["inspect"] = self.inspect_output(memory=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_absent_or_unreadable_fields_are_a_mismatch(self):
+        for fields in ({"pids": 0}, {"restart": ""}, {"security": "not json"}, {"capabilities": "null"},
+                       {"log_options": "null"}, {"ports": "null"}, {"environment": "not json"},
+                       {"environment": '["no-separator"]'}):
+            with self.subTest(fields=fields):
+                self.docker.results["inspect"] = self.inspect_output(**fields)
+                self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
 
     def test_an_image_declared_mount_does_not_change_release_identity(self):
         self.docker.results["inspect"] = self.inspect_output(
