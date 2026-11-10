@@ -18,9 +18,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from shiplord import github  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
-from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, fetch_host_keys, generate_ci_key,  # noqa: E402
-                             github_setup, github_status, known_hosts_lines, label_for, parse_host_key, resolve_ssh_host,
-                             rotate_key)
+from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, ci_key_labels, fetch_host_keys,  # noqa: E402
+                             generate_ci_key, github_setup, github_status, known_hosts_lines, label_for, parse_host_key,
+                             resolve_ssh_host, rotate_key)
 from shiplord.keys import parse_public_key  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
 from shiplord.workflow import WORKFLOW_PATH, render_workflow  # noqa: E402
@@ -35,8 +35,8 @@ def host_key(seed=1, key_type="ssh-ed25519"):
     return key_type, base64.b64encode(field(key_type.encode()) + field(bytes([seed]) * 32)).decode()
 
 
-def manifest(runtime="docker", with_github=False):
-    value = {"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk", "runtime": runtime,
+def manifest(runtime="docker", with_github=False, server="production"):
+    value = {"schema_version": 1, "name": "orders", "server": server, "template": "google-adk", "runtime": runtime,
              "http": {"api_domain": "orders.example.com", "frontend_origins": [], "container_port": 8080,
                       "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
              "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
@@ -174,8 +174,18 @@ class GitHubTestCase(unittest.TestCase):
         repository = options.pop("repository")
         return github_setup(manifest_value, repository, **options)
 
-    def state(self):
-        return json.loads((self.home / "shiplord" / "ci" / "orders" / "state.json").read_text())
+    def rotate_call(self, server=None, server_name="production", **overrides):
+        server = server or self.server
+        options = dict(admin=server, gh=self.gh, admin_target="appuser@" + HOST, home=self.home, runner=server.runner,
+                       host_keys=lambda target: [host_key(1)], resolve=lambda host: (host, 22))
+        options.update(overrides)
+        return rotate_key(manifest(with_github=True, server=server_name), **options)
+
+    def state_directory(self, server="production"):
+        return self.home / "shiplord" / "ci" / server / "orders"
+
+    def state(self, server="production"):
+        return json.loads((self.state_directory(server) / "state.json").read_text())
 
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
@@ -216,7 +226,7 @@ class SetupTests(GitHubTestCase):
 
     def test_the_private_key_never_leaves_the_machine_except_through_the_secret_and_is_then_deleted(self):
         result = self.setup_call()
-        ci_directory = self.home / "shiplord" / "ci" / "orders"
+        ci_directory = self.state_directory()
         self.assertEqual([p.name for p in ci_directory.iterdir()], ["state.json"])
         self.assertEqual(oct(ci_directory.stat().st_mode & 0o777), "0o700")
         self.assertEqual(oct((ci_directory / "state.json").stat().st_mode & 0o777), "0o600")
@@ -250,6 +260,44 @@ class SetupTests(GitHubTestCase):
         self.assertEqual(len([c for c in self.server.admin_calls if c[1]["operation"] == "add"]), 1)
         self.assertEqual(len([a for a, _ in self.gh_runner.calls if a[:2] == ["secret", "set"]]), 1)
         self.assertEqual(second["steps"]["workflow"], f"unchanged ({WORKFLOW_PATH})")
+
+    def test_the_same_application_name_on_two_servers_keeps_separate_state(self):
+        staging = FakeServer()
+        first = self.setup_call()
+        second = self.setup_call(manifest=manifest(server="staging"), admin=staging, runner=staging.runner)
+        self.assertNotEqual(first["key_label"], second["key_label"])
+        self.assertEqual(set(staging.keys), {second["key_label"]})
+        self.assertTrue((self.state_directory() / "state.json").is_file())
+        self.assertTrue((self.state_directory("staging") / "state.json").is_file())
+        rotated = self.rotate_call()
+        self.assertNotEqual(rotated["key_label"], first["key_label"])
+        self.assertEqual(set(staging.keys), {second["key_label"]})  # the other server's key is untouched
+
+    def test_state_from_the_old_location_is_migrated_and_the_key_reused(self):
+        first = self.setup_call()
+        legacy = self.home / "shiplord" / "ci" / "orders"
+        os.replace(self.state_directory(), legacy)
+        (self.home / "shiplord" / "ci" / "production").rmdir()
+        second = self.setup_call()
+        self.assertEqual(second["key_label"], first["key_label"])
+        self.assertEqual(len([call for call in self.server.admin_calls if call[1]["operation"] == "add"]), 1)
+        self.assertTrue((self.state_directory() / "state.json").is_file())
+        self.assertFalse(legacy.exists())
+
+    def test_an_interrupted_setup_is_resumed_after_the_old_state_is_migrated(self):
+        self.server.fail_add = True
+        with self.assertRaises(GitHubError):
+            self.setup_call()
+        fingerprint = self.state()["fingerprint"]
+        self.assertTrue(Path(self.state()["private_key"]).is_file())
+        legacy = self.home / "shiplord" / "ci" / "orders"
+        os.replace(self.state_directory(), legacy)
+        (self.home / "shiplord" / "ci" / "production").rmdir()
+        self.server.fail_add = False
+        result = self.setup_call()
+        self.assertEqual(result["key_fingerprint"], fingerprint)  # the same key was resumed, not replaced
+        self.assertEqual(set(self.server.keys), {result["key_label"]})
+        self.assertIsNone(self.state()["private_key"])
 
     def test_missing_permission_or_authentication_stops_before_any_change(self):
         self.gh_runner.permission = "WRITE"
@@ -391,10 +439,7 @@ class SetupTests(GitHubTestCase):
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
 class RotationTests(GitHubTestCase):
     def rotate(self, **overrides):
-        options = dict(admin=self.server, gh=self.gh, admin_target="appuser@" + HOST, home=self.home, runner=self.server.runner,
-                       host_keys=lambda target: [host_key(1)], resolve=lambda host: (host, 22))
-        options.update(overrides)
-        return rotate_key(manifest(with_github=True), **options)
+        return self.rotate_call(**overrides)
 
     def setUp(self):
         super().setUp()
@@ -404,13 +449,42 @@ class RotationTests(GitHubTestCase):
         old_secret = self.gh_runner.secrets[SECRET_NAME]
         result = self.rotate()
         self.assertNotEqual(result["key_label"], self.first["key_label"])
+        self.assertEqual(result["old_label"], self.first["key_label"])
+        self.assertEqual(result["old_labels"], [self.first["key_label"]])
         self.assertEqual(self.server.keys, {result["key_label"]: result["key_fingerprint"]})
-        operations = [(c[1]["operation"], c[1]["label"]) for c in self.server.admin_calls[1:]]
-        self.assertEqual(operations, [("add", result["key_label"]), ("remove", self.first["key_label"])])
+        operations = [(c[1]["operation"], c[1].get("label")) for c in self.server.admin_calls[1:]]
+        self.assertEqual(operations, [("list", None), ("add", result["key_label"]), ("remove", self.first["key_label"])])
         self.assertNotEqual(self.gh_runner.secrets[SECRET_NAME], old_secret)
         self.assertEqual(self.server.ssh_events[-1], f"ssh:True:{HOST}")
         self.assertEqual(self.state()["label"], result["key_label"])
-        self.assertEqual([p.name for p in (self.home / "shiplord" / "ci" / "orders").iterdir()], ["state.json"])
+        self.assertEqual([p.name for p in self.state_directory().iterdir()], ["state.json"])
+
+    def test_rotation_works_from_a_machine_that_never_ran_setup(self):
+        shutil.rmtree(self.home)
+        result = self.rotate()
+        self.assertNotEqual(result["key_label"], self.first["key_label"])
+        self.assertEqual(result["old_label"], self.first["key_label"])
+        self.assertEqual(self.server.keys, {result["key_label"]: result["key_fingerprint"]})
+        self.assertEqual(self.state()["label"], result["key_label"])
+        self.assertTrue(self.state()["secret_set"])
+
+    def test_a_key_shiplord_cannot_identify_is_never_removed(self):
+        foreign = "SHA256:" + base64.b64encode(bytes(range(32))).decode().rstrip("=")
+        self.server.keys["personal"] = foreign
+        result = self.rotate()
+        self.assertEqual(self.server.keys["personal"], foreign)
+        self.assertNotIn("personal", result["old_labels"])
+
+    def test_two_leftover_ci_keys_are_both_revoked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, public = generate_ci_key(Path(directory), "orders", "leftover")
+        leftover = label_for(parse_public_key(public).fingerprint)
+        self.server.keys[leftover] = parse_public_key(public).fingerprint
+        result = self.rotate()
+        self.assertEqual(result["old_labels"], sorted([self.first["key_label"], leftover]))
+        self.assertIsNone(result["old_label"])
+        self.assertEqual(result["steps"]["revoke"], f"{', '.join(result['old_labels'])} removed")
+        self.assertEqual(self.server.keys, {result["key_label"]: result["key_fingerprint"]})
 
     def test_a_key_that_fails_verification_is_removed_and_the_old_key_stays_authoritative(self):
         old_secret = self.gh_runner.secrets[SECRET_NAME]
@@ -435,7 +509,7 @@ class RotationTests(GitHubTestCase):
         self.assertEqual(self.gh_runner.secrets[SECRET_NAME], old_secret)
         self.assertEqual(set(self.server.keys), {self.first["key_label"]})
         self.assertEqual(self.state()["label"], self.first["key_label"])
-        self.assertEqual([p.name for p in (self.home / "shiplord" / "ci" / "orders").iterdir()], ["state.json"])
+        self.assertEqual([p.name for p in self.state_directory().iterdir()], ["state.json"])
 
     def test_a_failed_revocation_is_reported_loudly_with_the_new_key_already_live(self):
         self.server.fail_remove = {self.first["key_label"]}
@@ -445,10 +519,21 @@ class RotationTests(GitHubTestCase):
         self.assertIn(self.first["key_label"], str(caught.exception))
         self.assertEqual(len(self.server.keys), 2)
 
-    def test_rotation_needs_a_completed_setup(self):
+    def test_a_failed_local_cache_write_never_leaves_two_ci_keys(self):
+        with patch.object(github, "_save_state", side_effect=OSError("disk full")):
+            result = self.rotate()
+        self.assertEqual(self.server.keys, {result["key_label"]: result["key_fingerprint"]})
+
+    def test_rotation_is_refused_before_any_change_when_the_server_has_no_ci_key(self):
         shutil.rmtree(self.home)
-        with self.assertRaisesRegex(GitHubError, "run `shiplord github setup` first"):
+        self.server.keys.clear()
+        secret = self.gh_runner.secrets[SECRET_NAME]
+        with self.assertRaisesRegex(GitHubError, "run `shiplord github setup` first") as caught:
             self.rotate()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual([c[1]["operation"] for c in self.server.admin_calls[1:]], ["list"])
+        self.assertEqual(self.gh_runner.secrets[SECRET_NAME], secret)
+        self.assertFalse(self.home.exists())
 
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
@@ -534,6 +619,17 @@ class KeyGenerationTests(unittest.TestCase):
             self.assertRegex(label_for(key.fingerprint), r"^ci-[a-z0-9]{8}$")
             other, _ = generate_ci_key(Path(directory), "orders", "key-2")
             self.assertNotEqual(private.read_bytes(), other.read_bytes())
+
+    def test_only_a_label_derived_from_the_key_itself_marks_it_as_the_ci_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, public = generate_ci_key(Path(directory), "orders", "key-1")
+        key = parse_public_key(public)
+        listed = [{"label": label_for(key.fingerprint), "fingerprint": key.fingerprint},
+                  {"label": "personal", "fingerprint": key.fingerprint},
+                  {"label": "ci-abcdef12", "fingerprint": "SHA256:zzz"},
+                  {"label": None, "fingerprint": None}]
+        self.assertEqual(ci_key_labels(listed), [label_for(key.fingerprint)])
+        self.assertEqual(ci_key_labels([]), [])
 
     def test_the_gh_wrapper_sends_values_on_stdin_never_in_arguments(self):
         calls = []

@@ -201,7 +201,8 @@ together, and saves them so the next application's setup does not ask again. Use
 `repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every repository. `--tailscale-client-id` and
 `--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
 production deploy, and gives `id-token: write` only to the jobs that need it. `rotate-key` adds and proves a new key,
-updates GitHub, and only then revokes the old one.
+updates GitHub, and only then revokes the old one. It finds the key to replace in the server's authorized-keys list,
+so it works from a machine that never ran `github setup`; local setup state is kept per server and application.
 
 CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY`, `SHIPLORD_SSH_KNOWN_HOSTS_FILE`
 (and optionally `SHIPLORD_SSH_PORT`) replace the server alias, and SSH ignores `~/.ssh/config` entirely.
