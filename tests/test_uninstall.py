@@ -159,8 +159,26 @@ class PreconditionTests(UninstallTestCase):
             self.assertEqual(self.files(), before)
         self.assertIn("nothing was removed", str(caught.exception))
 
+    def test_an_untrusted_registry_directory_is_refused_before_anything_is_removed(self):
+        self.layout.registrations.chmod(0o777)  # another account could swap a record between the check and the read
+        with self.lock.acquire():
+            before = self.files()
+            with self.assertRaises(UninstallError) as caught:
+                uninstall(self.layout, self.system, self.lock, self.caddy)
+            self.assertEqual(self.files(), before)
+        self.assertEqual(str(caught.exception), "the application registry is not trusted")
+        self.assertNotIn(str(self.prefix), str(caught.exception))  # no host path in the failure
+        self.assertEqual(self.caddy.reloaded, 1)  # only the bootstrap reload
+
 
 class OwnershipTests(UninstallTestCase):
+    def test_an_untrusted_launcher_directory_stops_the_run_where_it_stands(self):
+        self.layout.host.parent.chmod(0o777)
+        with self.assertRaisesRegex(UninstallError, "^the launcher directory is not trusted$"):
+            self.run_uninstall()
+        self.assertTrue(self.layout.host.exists())  # nothing was unlinked from a directory others can rewrite
+        self.assertTrue(self.layout.admin.exists())
+
     def test_a_launcher_shiplord_did_not_write_is_left_in_place(self):
         foreign = "#!/bin/sh\nexec /bin/true\n"
         self.layout.host.write_text(foreign)

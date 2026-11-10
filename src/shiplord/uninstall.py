@@ -52,10 +52,11 @@ def _open(path: Path, message: str) -> int | None:
         raise UninstallError(message) from None
 
 
-def _trusted(descriptor: int) -> None:
+def _trusted(descriptor: int, what: str) -> None:
+    """Refuse a directory another account could rewrite; ``what`` names it without a host path."""
     info = os.fstat(descriptor)
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
-        raise UninstallError("a Shiplord directory is not trusted")
+        raise UninstallError(f"{what} is not trusted")
 
 
 def _entry(directory: int, name: str) -> os.stat_result | None:
@@ -82,17 +83,18 @@ def _read(directory: int, name: str) -> bytes | None:
         return file.read(MAX_ARTIFACT_BYTES)
 
 
-def _remove_artifact(path: Path, matches: Callable[[bytes], bool]) -> bool:
+def _remove_artifact(path: Path, matches: Callable[[bytes], bool], what: str) -> bool:
     """Remove one file only when its current content still satisfies ``matches``.
 
     Returns True when it was removed, and False when it is absent or is not the file bootstrap wrote. The
-    decision is made on the content read through the same descriptor that is used to remove it.
+    decision is made on the content read through the same descriptor that is used to remove it. ``what``
+    names the directory in a refusal, without a host path.
     """
     directory = _open(path.parent, "a Shiplord directory is unavailable")
     if directory is None:
         return False
     try:
-        _trusted(directory)
+        _trusted(directory, what)
         entry = _entry(directory, path.name)
         if entry is None or not stat.S_ISREG(entry.st_mode):
             return False  # a link or a directory at this path is not the file bootstrap wrote
@@ -109,13 +111,13 @@ def _remove_artifact(path: Path, matches: Callable[[bytes], bool]) -> bool:
         os.close(directory)
 
 
-def _remove_empty(path: Path) -> bool:
+def _remove_empty(path: Path, what: str) -> bool:
     """Remove a directory Shiplord created when it is empty; a directory with content is kept."""
     directory = _open(path.parent, "a Shiplord directory is unavailable")
     if directory is None:
         return False
     try:
-        _trusted(directory)
+        _trusted(directory, what)
         try:
             os.rmdir(path.name, dir_fd=directory)
         except FileNotFoundError:
@@ -136,7 +138,7 @@ def _applications(layout: Layout, lock: HostLock) -> list[str]:
     if directory is None:
         return []
     try:
-        _trusted(directory)
+        _trusted(directory, "the application registry")
         try:
             return sorted(record["application_id"] for record in Registry(directory, lock).list())
         except StateError as error:
@@ -162,7 +164,7 @@ def _remove_sshd(layout: Layout, system: System, unit: str | None, socket: str |
     if directory is None:
         return False
     try:
-        _trusted(directory)
+        _trusted(directory, "the sshd drop-in directory")
         entry = _entry(directory, path.name)
         if entry is None or not stat.S_ISREG(entry.st_mode):
             return False
@@ -209,7 +211,8 @@ def _remove_caddy(layout: Layout, lock: HostLock, caddy: CaddyCommands) -> dict:
     except RoutingError as error:
         raise UninstallError(f"Caddy integration failed ({error.kind}): {error}") from None
     result["placeholder"] = _remove_artifact(layout.caddy_root / "ship" / PLACEHOLDER_NAME,
-                                             lambda data: data.startswith(MANAGED_MARKER))
+                                             lambda data: data.startswith(MANAGED_MARKER),
+                                             "the managed Caddy directory")
     return result
 
 
@@ -220,7 +223,7 @@ def _remove_versions(layout: Layout) -> int:
         return 0
     removed = 0
     try:
-        _trusted(directory)
+        _trusted(directory, "the helper directory")
         for name in sorted(os.listdir(directory)):
             entry = _entry(directory, name)
             if entry is None:
@@ -251,12 +254,13 @@ def _remove_versions(layout: Layout) -> int:
 
 def _remove_directories(layout: Layout) -> list[str]:
     """Remove the empty managed directories, children before parents; returns the layout names that went."""
-    removed = [name for name in MANAGED_DIRECTORIES if _remove_empty(getattr(layout, name))]
-    if _remove_empty(layout.caddy_root / "ship"):
+    removed = [name for name in MANAGED_DIRECTORIES
+               if _remove_empty(getattr(layout, name), f"the {name.replace('_', ' ')} directory")]
+    if _remove_empty(layout.caddy_root / "ship", "the managed Caddy directory"):
         removed.append("caddy_ship")
-    if _remove_empty(layout.lib):
+    if _remove_empty(layout.lib, "the helper directory"):
         removed.append("lib")
-    if _remove_empty(layout.path(ETC)):
+    if _remove_empty(layout.path(ETC), "the Shiplord configuration directory"):
         removed.append("etc")
     return removed
 
@@ -301,7 +305,8 @@ def uninstall(layout: Layout, system: System, lock: HostLock, caddy: CaddyComman
     removed = {"caddy": _remove_caddy(layout, lock, caddy)}
     removed["sshd"] = _remove_sshd(layout, system, unit, socket)
     removed["wrappers"] = [path.name for path, launcher in launcher_targets(layout).items()
-                           if _remove_artifact(path, lambda data, text=wrapper_text(layout, launcher): data == text)]
+                           if _remove_artifact(path, lambda data, text=wrapper_text(layout, launcher): data == text,
+                                               "the launcher directory")]
     removed["versions"] = _remove_versions(layout)
     removed["directories"] = _remove_directories(layout)
     return {"status": "uninstalled", "removed": removed,
