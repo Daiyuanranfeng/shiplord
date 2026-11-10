@@ -153,8 +153,8 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[bool], int]]:
         raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
 
 
-def _address_tokens(tokens: list[str], quoted: list[bool]) -> list[str]:
-    """Return the tokens on this line that Caddy reads as a site address.
+def _address_tokens(tokens: list[str], quoted: list[bool]) -> tuple[list[str], bool]:
+    """Return the tokens on this line that Caddy reads as a site address, and whether it opens a block.
 
     A site block begins with its addresses and ends them at the opening brace, so a directive
     argument such as an upstream, a header value, or a request matcher is never an address, and a
@@ -164,12 +164,12 @@ def _address_tokens(tokens: list[str], quoted: list[bool]) -> list[str]:
     for token, was_quoted in zip(tokens, quoted):
         if "{" in token or "}" in token:
             if not was_quoted and token in {"{", "}"}:
-                break  # the block body starts here; the rest of the line is directives
+                return addresses, token == "{"  # the block body starts here; the rest is directives
             raise RoutingError("cannot determine hostnames from a placeholder", "uninspectable")
         if not was_quoted and token.startswith(("(", "&(")) and token.endswith(")"):
             continue  # a snippet or named-route definition names no site
         addresses.append(token)
-    return addresses
+    return addresses, False
 
 
 def _addresses(token: str) -> Iterator[str]:
@@ -206,13 +206,13 @@ class _Inspection:
             if tokens[0] == "import" and not quoted[0]:
                 imports.extend(tokens[1:])  # a top-level import substitutes site blocks in place
                 continue
-            for token in _address_tokens(tokens, quoted):
+            addresses, opened = _address_tokens(tokens, quoted)
+            for token in addresses:
                 for address in _addresses(token):
                     if address == self.domain:
                         raise RoutingError("hostname is already served by another configuration", "conflict")
                     if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
                         raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
-            opened = any(token == "{" and not was_quoted for token, was_quoted in zip(tokens, quoted))
             continuing = not opened and tokens[-1].endswith(",")  # Caddy continues the address list
             body = not opened and not continuing  # braces are optional for a single site block
         return imports
