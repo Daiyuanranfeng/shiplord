@@ -22,12 +22,12 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 from .manifest import validate_app_name, validate_hostname
 from .registry import PORT_RANGE, validate_registration
 from .release_state import HostLock, _directory
-from .system import CommandError, run_command
+from .system import TRUNCATION_MARKER, CommandError, HostSystem, System, run_command
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_IMPORTED_FILES = 64
@@ -40,6 +40,12 @@ _TEMP_PREFIX = ".tmp-"
 _PRIOR_PREFIX = ".prior-"
 _PRIOR_MAIN = ".prior-Caddyfile"
 _VALIDATE_PREFIX = ".shiplord-validate-"
+SYSTEMCTL = "/usr/bin/systemctl"
+CADDY_UNIT = "caddy"
+PACKAGED_ENVIRONMENT_FILES = (Path("/etc/default/caddy"), Path("/etc/sysconfig/caddy"))
+MAX_ENVIRONMENT_BYTES = 64 * 1024
+_REDACTED = "[shiplord:redacted]"
+MIN_REDACTED_LENGTH = 4  # shorter values would replace ordinary words and destroy the diagnostic
 
 
 class RoutingError(Exception):
@@ -62,33 +68,179 @@ class CaddyCommands(Protocol):
     def reload(self) -> None: ...
 
 
+# --- The service environment ----------------------------------------------
+
+def _escape(char: str) -> str:
+    """The character a systemd escape sequence stands for; an unknown escape stands for its character."""
+    return {"n": "\n", "t": "\t", "r": "\r", "s": " "}.get(char, char)
+
+
+def _words(text: str) -> Iterator[str]:
+    """Split a value the way systemctl quotes it: whitespace separates words, quotes and backslashes group."""
+    word: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and quote != "'" and index + 1 < len(text):
+            word.append(_escape(text[index + 1]))
+            index += 2
+            continue
+        if quote is None and char.isspace():
+            if word:
+                yield "".join(word)
+                word = []
+        elif quote is None and char in "\"'":
+            quote = char
+        elif quote == char:
+            quote = None
+        else:
+            word.append(char)
+        index += 1
+    if word:
+        yield "".join(word)
+
+
+def parse_environment_list(text: str) -> dict[str, str]:
+    """The assignments in a systemd ``Environment=`` property value."""
+    variables = {}
+    for word in _words(text):
+        name, separator, value = word.partition("=")
+        if separator and name and "\0" not in value:
+            variables[name] = value
+    return variables
+
+
+def parse_environment_file(text: str) -> dict[str, str]:
+    """The assignments in a systemd environment file; a malformed line is dropped, as systemd drops it."""
+    variables = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        name, separator, value = (part.strip() for part in line.partition("="))
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if value.startswith(('"', "'")):
+            quote, index, characters = value[0], 1, []
+            while index < len(value) and value[index] != quote:
+                if quote == '"' and value[index] == "\\" and index + 1 < len(value):
+                    characters.append(_escape(value[index + 1]))
+                    index += 2
+                    continue
+                characters.append(value[index])
+                index += 1
+            if index != len(value) - 1:
+                continue  # no closing quote at the end of the line: systemd drops the assignment
+            value = "".join(characters)
+        if "\0" not in value:
+            variables[name] = value
+    return variables
+
+
+def _environment_file(path: Path) -> dict[str, str]:
+    """The assignments in one environment file; unreadable, oversized, and non-regular files yield nothing."""
+    try:
+        info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENVIRONMENT_BYTES:
+            return {}
+        with open(path, "rb") as file:
+            return parse_environment_file(file.read(MAX_ENVIRONMENT_BYTES).decode("utf-8", "replace"))
+    except OSError:
+        return {}
+
+
+def _systemd_environment(system: System) -> dict[str, str] | None:
+    """The environment systemd reports for the Caddy unit, or None when that answer cannot be read."""
+    try:
+        result = system.run([SYSTEMCTL, "show", CADDY_UNIT, "--property=Environment",
+                             "--property=EnvironmentFiles"], max_output=MAX_ENVIRONMENT_BYTES)
+    except CommandError:
+        return None
+    if result.code != 0 or result.output.startswith(TRUNCATION_MARKER):
+        return None  # a half-reported value could be a prefix of a secret, which is worse than no value
+    variables: dict[str, str] = {}
+    files: list[Path] = []
+    for line in result.output.splitlines():
+        for property in ("Environment=", "EnvironmentFile=", "EnvironmentFiles="):  # older systemctl used the singular
+            if not line.startswith(property):
+                continue
+            entry = line[len(property):]
+            if property == "Environment=":
+                variables.update(parse_environment_list(entry))
+            else:
+                path = Path(entry.rsplit(" (ignore_errors=", 1)[0])
+                if path.is_absolute():
+                    files.append(path)
+            break
+    for path in files:
+        variables.update(_environment_file(path))
+    return variables
+
+
+def service_environment(system: System, files: Sequence[Path] = PACKAGED_ENVIRONMENT_FILES) -> dict[str, str]:
+    """The variables the Caddy service runs with, from the unit systemd reports or the packaged defaults.
+
+    Empty when no documented source can be read, so validation falls back to its fixed environment. The caller's
+    own environment is never consulted: it is not the service's.
+    """
+    reported = _systemd_environment(system)
+    if reported is not None:
+        return reported
+    variables: dict[str, str] = {}
+    for path in files:
+        variables.update(_environment_file(path))
+    return variables
+
+
+def _host_service_environment() -> dict[str, str]:
+    return service_environment(HostSystem())
+
+
+def _redact(text: str, values: Iterable[str]) -> str:
+    """Remove service-environment values from captured output, longest first, so a secret cannot reach a result."""
+    for value in sorted({value for value in values if len(value) >= MIN_REDACTED_LENGTH}, key=len, reverse=True):
+        text = text.replace(value, _REDACTED)
+    return text
+
+
 class SubprocessCaddy:
-    """Run Caddy and systemd through fixed executables; no shell, minimal environment."""
+    """Run Caddy and systemd through fixed executables; no shell, fixed defaults, and the service's variables."""
 
     ENVIRONMENT = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
 
-    def __init__(self, caddy: str = "/usr/bin/caddy", systemctl: str = "/usr/bin/systemctl",
-                 timeout: float = COMMAND_TIMEOUT_SECONDS):
+    def __init__(self, caddy: str = "/usr/bin/caddy", systemctl: str = SYSTEMCTL,
+                 timeout: float = COMMAND_TIMEOUT_SECONDS,
+                 service_environment: Callable[[], Mapping[str, str] | None] | None = None):
         self.caddy, self.systemctl, self.timeout = caddy, systemctl, timeout
+        # Injected so a caller that already knows the service environment can supply it; the default reads only
+        # the documented service sources, never this process's environment.
+        self.service_environment = service_environment or _host_service_environment
 
     def validate(self, config: Path) -> None:
         # Validation provisions modules (e.g. a local CA), which writes to Caddy's storage. Without HOME, Caddy falls
         # back to ./caddy in the current directory; give it a throwaway home so it never touches real storage or cwd.
+        # The service's variables are applied first and the throwaway directories last, so a service that sets HOME
+        # or XDG_* still cannot make validation write the service's storage.
         with tempfile.TemporaryDirectory(prefix="shiplord-caddy-validate-") as home:
+            service = dict(self.service_environment() or {})
+            environment = {**self.ENVIRONMENT, **service, "HOME": home, "XDG_DATA_HOME": home,
+                           "XDG_CONFIG_HOME": home}
             self._run([self.caddy, "validate", "--config", str(config), "--adapter", "caddyfile"], "validation",
-                      env={**self.ENVIRONMENT, "HOME": home, "XDG_DATA_HOME": home, "XDG_CONFIG_HOME": home})
+                      env=environment, secrets=service.values())
 
     def reload(self) -> None:
         self._run([self.systemctl, "reload", "caddy"], "reload")
 
-    def _run(self, argv: list[str], kind: str, env: dict[str, str] | None = None) -> None:
+    def _run(self, argv: list[str], kind: str, env: dict[str, str] | None = None,
+             secrets: Iterable[str] = ()) -> None:
         try:
             result = run_command(argv, timeout=self.timeout, env=env or self.ENVIRONMENT)
         except CommandError as error:
             message = "Caddy command timed out" if error.kind == "timeout" else "could not start the Caddy command"
-            raise RoutingError(message, kind, detail=error.output) from None
+            raise RoutingError(message, kind, detail=_redact(error.output, secrets)) from None
         if result.code != 0:
-            raise RoutingError("Caddy command failed", kind, detail=result.output)
+            raise RoutingError("Caddy command failed", kind, detail=_redact(result.output, secrets))
 
 
 def render_route(domain: str, port: int) -> bytes:
