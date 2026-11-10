@@ -275,6 +275,9 @@ def _retained(layout: Layout, applications: list[str], removed: dict) -> list[st
         notes.append("a managed Caddy file that Shiplord did not write")
     if os.path.lexists(layout.lib):
         notes.append("the helper directory, which still holds files Shiplord did not write")
+    leftovers = [name for name in MANAGED_DIRECTORIES if os.path.lexists(getattr(layout, name))]
+    if leftovers:
+        notes.append("managed state directories that still hold files: " + ", ".join(leftovers))
     notes.append("the state directory that holds the host lock")
     return notes
 

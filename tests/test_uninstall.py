@@ -41,7 +41,7 @@ class UninstallTestCase(unittest.TestCase):
         (sshd / "sshd_config").write_text("Include sshd_config.d/*.conf\n")
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
-        self.installed = bootstrap(self.layout, SOURCE, self.system, self.caddy)
+        bootstrap(self.layout, SOURCE, self.system, self.caddy)
         self.lock_fd = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, self.lock_fd)
         self.lock = HostLock(self.lock_fd)
@@ -146,6 +146,7 @@ class PreconditionTests(UninstallTestCase):
                      self.layout.jobs / "orders"):
             self.assertTrue(path.exists(), path)
         self.assertTrue(any("provisioned application" in note for note in result["retained"]))
+        self.assertTrue(any("managed state directories" in note and "data" in note for note in result["retained"]))
         self.assertEqual((self.layout.data / "orders" / "keep").read_text(), "application data\n")
 
     def test_an_unreadable_registry_is_refused_before_anything_is_removed(self):
