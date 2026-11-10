@@ -106,11 +106,13 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
     checks["docker"] = {"ok": docker, "version": version if docker else None}
     paths = [layout.var, layout.releases] + ([DOCKER_ROOT] if layout.prefix == Path("/") and DOCKER_ROOT.exists() else [])
     checks["disk"] = {"ok": all(entry["ok"] for entry in map(_free, paths)), "paths": [_free(path) for path in paths]}
-    applications, problems = [], 0
+    applications, problems, ignored = [], 0, []
     try:
         descriptor = os.open(layout.registrations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            registrations = Registry(descriptor, lock).list()
+            registry = Registry(descriptor, lock)
+            registrations = registry.list()
+            ignored = list(registry.stray)
         finally:
             os.close(descriptor)
     except (OSError, StateError):
@@ -131,5 +133,5 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
             entry.update(ok=False, error="state is unreadable")
         problems += 0 if entry["ok"] else 1
         applications.append(entry)
-    checks["applications"] = {"ok": problems == 0, "applications": applications}
+    checks["applications"] = {"ok": problems == 0, "applications": applications, "ignored_files": ignored}
     return {"ok": all(check["ok"] for check in checks.values()), "checks": checks}

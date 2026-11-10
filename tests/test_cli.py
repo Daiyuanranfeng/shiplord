@@ -573,6 +573,29 @@ class CLIInventoryTests(unittest.TestCase):
     def env(self, config: Path) -> dict[str, str]:
         return dict(os.environ, XDG_CONFIG_HOME=str(config))
 
+    def test_doctor_deep_prints_ignored_registry_files_once_and_keeps_the_json_field(self):
+        applications = [{"application": "orders", "deployed": True, "unfinished_transaction": None}]
+        ignored = {"ok": True, "checks": {"applications": {"ok": True, "applications": applications,
+                                                          "ignored_files": ["orders.json~"]}}}
+        clean = {"ok": True, "checks": {"applications": {"ok": True, "applications": applications,
+                                                        "ignored_files": []}}}
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, ignored)):
+                text = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"], env=self.env(config))
+                payload = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep", "--json"],
+                                             env=self.env(config))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, clean)):
+                quiet = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"], env=self.env(config))
+        self.assertEqual(text.exit_code, 0, text.output)
+        self.assertEqual(text.stdout.count("orders.json~"), 1)
+        self.assertIn("Ignored 1 file", text.stdout)
+        self.assertNotIn(str(Path(temp)), text.stdout)
+        self.assertEqual(json.loads(payload.stdout)["checks"]["applications"]["ignored_files"], ["orders.json~"])
+        self.assertEqual(quiet.exit_code, 0, quiet.output)
+        self.assertNotIn("Ignored", quiet.stdout)
+
     def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"
