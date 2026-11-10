@@ -329,15 +329,20 @@ class NativeSystemdTests(unittest.TestCase):
         self.assertEqual(self.get("/version"), "v2")
 
     def test_13_the_deep_doctor_sees_a_healthy_systemd_host(self):
-        result = self.cli_json("doctor", "--server", "production", "--deep", check=3)  # no Docker daemon in this container
+        result = self.cli_json("doctor", "--server", "production", "--deep")  # native-only: Docker is not required
         checks = result["checks"]
-        for name in ("helper", "caddy", "sshd", "disk", "applications"):
+        for name in ("helper", "caddy", "sshd", "ports", "disk", "applications", "consistency"):
             self.assertTrue(checks[name]["ok"], (name, checks[name]))
         self.assertTrue(checks["caddy"]["service_active"])  # the real caddy.service, through real systemctl
-        self.assertFalse(checks["docker"]["ok"])
+        self.assertEqual(checks["docker"],
+                         {"ok": True, "required": False, "available": False, "version": None})
+        self.assertTrue(all(port["external"] for port in checks["ports"]["ports"]))
         application = checks["applications"]["applications"][0]
         self.assertEqual((application["runtime"], application["deployed"], application["unfinished_transaction"]),
                          ("native", True, None))
+        consistency = checks["consistency"]["applications"][0]
+        self.assertEqual((consistency["application"], consistency["ok"], consistency["route"], consistency["running"]),
+                         (self.app, True, "identical", True))
 
     def test_12_old_release_directories_are_removed_once_they_leave_the_retention_window(self):
         self.deploy("v3", 5000)
