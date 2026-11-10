@@ -578,6 +578,21 @@ class DockerRuntime:
         result = self._docker(["logs", "--tail", str(tail), identifiers[0]], "logs", max_output=MAX_LOG_BYTES)
         return result.output
 
+    def release_logs(self, registration: dict, release: dict, tail: int, *, max_bytes: int = MAX_LOG_BYTES) -> str | None:
+        """Read this release's own container's last ``tail`` lines; ``None`` means it has no container.
+
+        ``logs`` reports whichever container is listed first, which after a rollback is the restored release. A failed
+        candidate's container is removed by the restore, so its output is only readable by name, before that happens.
+        """
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        result = self._docker(["logs", "--tail", str(tail), self.container_name(registration, release)], "logs",
+                              max_output=max_bytes)
+        if result.code == 0:
+            return result.output
+        if "no such" in result.output.lower():
+            return None
+        raise RuntimeFailure("the release's container logs could not be read", "logs")
+
     def discard(self, registration: dict, release: dict) -> list[str]:
         """Best-effort removal of a release's image after it left the retained set; returns warnings."""
         result = self._docker(["image", "rm", release["artifact"]["image"]], "cleanup")
