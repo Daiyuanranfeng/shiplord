@@ -374,6 +374,28 @@ class RealDockerDeployTests(unittest.TestCase):
                          (True, identity(state["current"]), None))
         self.assertEqual(release_id(state["current"]), self.inspect()["Config"]["Labels"]["shiplord.release"])
 
+    def test_redeploying_a_release_that_is_down_keeps_the_real_rollback_target(self):
+        """A CI re-run deploys the same release again with a new request ID; the rollback target must survive."""
+        self.assertOutcome(self.deploy("req-r1", "v1", 3000), "succeeded")
+        self.assertOutcome(self.deploy("req-r2", "v2", 3001), "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.state.read_state()["previous"]["commit"], "a" * 40)
+
+        docker("stop", *self.containers())  # the release is down, so the unchanged shortcut cannot fire
+        again = self.deploy("req-r3", "v2", 3001)
+        self.assertOutcome(again, "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+        state = self.state.read_state()
+        self.assertEqual((state["current"]["commit"], state["previous"]["commit"]), ("b" * 40, "a" * 40))
+        self.assertEqual(again.detail["previous"]["commit"], "a" * 40)
+        self.assertEqual(docker("image", "inspect", self.images["v1"]["image"], check=False).returncode, 0,
+                         "the redeploy removed the previous release's image")
+
+        rolled_back = self.runtime_rollback("req-r4")
+        self.assertOutcome(rolled_back, "succeeded")
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertEqual(self.state.read_state()["current"]["commit"], "a" * 40)
+
     def storage_configuration(self, path):
         value = self.configuration()
         if path is not None:

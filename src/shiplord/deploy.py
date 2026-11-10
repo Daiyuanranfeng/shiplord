@@ -184,7 +184,7 @@ class Deployer:
             committed = self.state.read_state()
         except StateError as error:
             return Outcome("failed", 1, {"error": "state_unreadable", "message": str(error)})
-        if committed["previous"] is None:
+        if committed["previous"] is None or committed["previous"] == committed["current"]:
             return Outcome("failed", 1, {"error": "no_previous_release"})
         return self._transition(request_id, committed["previous"], committed)
 
@@ -264,15 +264,15 @@ class Deployer:
                 return self._intervention(failure, probes)
             return self._restore(failure, probes, candidate, before)
         try:
-            self.state.record_commit()
+            committed = self.state.record_commit()
             self.state.clear_after_reconciliation()
         except StateError as error:
             return Outcome("intervention_required", 6, {"error": "commit_unconfirmed", "message": str(error),
                                                        "release": identity(candidate)})
         probes["https"] = self.probes.https(self.registration, candidate)
         probes["dns"] = self.probes.dns(self.registration)
-        warnings = self._retire(before, candidate)
-        return Outcome("succeeded", 0, {"release": identity(candidate), "previous": identity(before["current"]),
+        warnings = self._retire(before, committed)
+        return Outcome("succeeded", 0, {"release": identity(candidate), "previous": identity(committed["previous"]),
                                         "image": prepared, "probes": probes, "warnings": warnings, **self._shutdown_report()})
 
     def _validate_budget(self, candidate: dict, outgoing: dict | None) -> None:
@@ -316,10 +316,14 @@ class Deployer:
                 return
         self.runtime.start(self.registration, release)
 
-    def _retire(self, before: dict, candidate: dict) -> list[str]:
-        """After success, drop the resource of the release that left the two-release retention window."""
+    def _retire(self, before: dict, after: dict) -> list[str]:
+        """After success, drop the resource of the release that left the two-release retention window.
+
+        The window is the state this transaction committed: a redeploy of the current release keeps its previous
+        release, so that release's resource stays even though ``before["previous"]`` names it.
+        """
         dropped = before["previous"]
-        if dropped is None or self._shared_resource(dropped, [candidate, before["current"]]):
+        if dropped is None or self._shared_resource(dropped, [after["current"], after["previous"]]):
             return []  # never remove a resource a retained release still uses
         try:
             return self.runtime.discard(self.registration, dropped)

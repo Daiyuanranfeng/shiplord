@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -431,6 +432,47 @@ class AbandonedCandidateTests(DeployTestCase):
         self.assertEqual(self.runtime.discarded, [])
 
 
+class RedeployRetentionTests(DeployTestCase):
+    """Redeploying the release that is already committed must never replace the real rollback target."""
+
+    def deploy_the_pair(self):
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual(self.state.read_state()["previous"], record())
+
+    def test_a_redeploy_of_the_current_release_that_is_down_keeps_the_rollback_target(self):
+        self.deploy_the_pair()
+        self.runtime.running = set()  # the release is down, so the unchanged shortcut cannot fire
+        outcome = self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.assertEqual(outcome.status, "succeeded")
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("c" * 40, "a" * 40))
+        self.assertEqual(outcome.detail["previous"], identity(record()))  # reported as it was committed
+        self.assertEqual(self.runtime.discarded, [])  # the previous release's image is still there
+        rolled_back = self.run_locked(self.deployer.rollback, "req-4")
+        self.assertEqual(rolled_back.status, "succeeded")
+        self.assertEqual(self.runtime.running, {release_id(record())})  # back on A, not the redeployed B
+        self.assertEqual(self.state.read_state()["current"], record())
+
+    def test_a_redeploy_of_a_current_release_that_is_not_ready_keeps_the_rollback_target(self):
+        self.deploy_the_pair()
+        answers = iter([False])  # running, but not ready when the shortcut is considered
+        self.probes.ready_once = lambda registration, release: next(answers, True)
+        outcome = self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual(self.state.read_state()["previous"], record())
+        self.assertEqual(self.runtime.discarded, [])
+
+    def test_a_new_release_after_a_redeploy_still_rotates_the_rollback_target(self):
+        self.deploy_the_pair()
+        self.runtime.running = set()
+        self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.deploy(request_id="req-4", commit="e", image="f", sequence=1002)
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("e" * 40, "c" * 40))
+        self.assertEqual(self.runtime.discarded, ["ghcr.io/example/orders@sha256:" + "b" * 64])  # A left the window
+
+
 class NativeRetentionTests(DeployTestCase):
     """A native release owns a directory named for its release ID, even when the binary is unchanged."""
 
@@ -460,6 +502,14 @@ class NativeRetentionTests(DeployTestCase):
         self.deploy_native(request_id="req-2", commit="c", sequence=1001)
         self.assertEqual(self.run_locked(self.deployer.rollback, "req-3").status, "succeeded")
         self.assertEqual(self.runtime.discarded, [])
+
+    def test_redeploying_the_committed_native_release_keeps_the_previous_directory(self):
+        self.deploy_native()
+        self.deploy_native(request_id="req-2", commit="c", sequence=1001)
+        self.runtime.running = set()  # the release is down: the unchanged shortcut cannot fire
+        self.assertEqual(self.deploy_native(request_id="req-3", commit="c", sequence=1001).status, "succeeded")
+        self.assertEqual(self.state.read_state()["previous"], native_record())
+        self.assertEqual(self.runtime.discarded, [])  # A's release directory is still there for a rollback
 
 
 class JournalOpenFailureTests(DeployTestCase):
@@ -607,6 +657,20 @@ class RollbackAndStatusTests(DeployTestCase):
         self.assertEqual(outcome.status, "rolled_back")  # nonzero: the rollback itself failed
         self.assertEqual(outcome.exit_code, 5)
         self.assertEqual(self.state.read_state()["current"]["commit"], "c" * 40)
+
+    def test_rollback_refuses_a_previous_release_that_is_the_current_one(self):
+        # A host that ran the older helper can hold `previous == current`: the real rollback target is already gone.
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        committed = self.state.read_state()
+        state = Path(self.temp.name) / "state" / "state.json"
+        state.write_text(json.dumps(dict(committed, previous=committed["current"])) + "\n")
+        state.chmod(0o600)
+        calls = list(self.runtime.calls)
+        outcome = self.run_locked(self.deployer.rollback, "req-3")
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]),
+                         ("failed", 1, "no_previous_release"))
+        self.assertEqual(self.runtime.calls, calls)  # the broken release is not restarted and called a rollback
 
     def test_status_reports_current_previous_running_and_unfinished_work(self):
         self.assertEqual(self.run_locked(self.deployer.status)["current"], None)
