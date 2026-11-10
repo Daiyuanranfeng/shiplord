@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Render every command's result as readable lines, and accept `--json` on
+  `init`, `configure`, and `server add` as the other commands already did.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

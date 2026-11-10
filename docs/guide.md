@@ -213,7 +213,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `server add <alias> --ssh user@host` | Register a trusted SSH login. Never accepts or updates host keys. |
 | `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
-| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
+| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal; `--json` never prompts). |
 | `provision` | Create the application's account, state, port, and key access on the server. |
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
