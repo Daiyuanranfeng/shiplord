@@ -122,6 +122,39 @@ class ServerDoctorTests(DoctorTestCase):
         response, code = run(request, self.layout, self.system, {})
         self.assertEqual((code, response["result"]["ignored_files"]), (0, ["orders.json~"]))
 
+    def test_doctor_reports_stray_registry_files_without_failing(self):
+        self.provision()
+        (self.layout.registrations / "orders.json~").write_text("x")
+        report = self.report()
+        self.assertEqual(report["checks"]["applications"]["ignored_files"], ["orders.json~"])
+        self.assertEqual([entry["application"] for entry in report["checks"]["applications"]["applications"]],
+                         ["orders"])
+        self.assertEqual((report["ok"], report["checks"]["applications"]["ok"]), (True, True))
+        request = {"version": 1, "request_id": "doctor-stray", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["applications"]["ignored_files"]),
+                         (0, ["orders.json~"]))
+        healthy = FakeSsh((ok(report), b"", 0))
+        self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=healthy))[0], 0)
+
+    def test_a_clean_registry_reports_no_ignored_files(self):
+        self.provision()
+        report = self.report()
+        self.assertEqual(report["checks"]["applications"]["ignored_files"], [])
+
+    def test_a_corrupt_registration_still_fails_the_applications_check(self):
+        self.provision()
+        (self.layout.registrations / "orders.json").write_text("{not json")
+        report = self.report()
+        self.assertEqual((report["checks"]["applications"]["ok"], report["ok"]), (False, False))
+        request = {"version": 1, "request_id": "doctor-corrupt", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["applications"]["ok"]), (0, False))
+        broken = FakeSsh((ok(report), b"", 0))
+        self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=broken))[0], 3)
+
     def test_admin_apps_action_rejects_application_identity_and_arguments(self):
         request = {"version": 1, "request_id": "apps-1", "action": "apps", "application_id": None,
                    "commit": None, "arguments": {}}

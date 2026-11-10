@@ -693,6 +693,7 @@ def _render_doctor(result: dict, target: str) -> None:
                     release = "yes" if application.get("deployed") else "no"
                     state = application.get("unfinished_transaction") or "none"
                     typer.echo(f"    {label}: release {release}; unfinished transaction {state}")
+                _render_ignored_files(value.get("ignored_files", []))
     for name, value in checks.items():
         if name not in shown:
             typer.echo(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
