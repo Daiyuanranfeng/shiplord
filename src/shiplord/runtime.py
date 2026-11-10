@@ -352,7 +352,7 @@ class DockerRuntime:
                 return True
         return False
 
-    def _remove_containers(self, registration: dict, state=None) -> None:
+    def _remove_containers(self, registration: dict, state=None, *, force: bool = False) -> None:
         """Gracefully stop whatever runs for the application (under its own recorded policy), then remove it."""
         self.stop_report = []
         journal = state.read_journal() if state is not None else None
@@ -363,7 +363,7 @@ class DockerRuntime:
                 state.clear_stop(identifier)
             else:
                 container = self._outgoing(identifier)
-                self._stop_gracefully(container, state, pending)
+                self._stop_gracefully(container, state, pending, force=force)
                 self._remove(identifier)
                 state.clear_stop(identifier)
 
@@ -375,7 +375,7 @@ class DockerRuntime:
                                  intervention_required=True, kind="ambiguous")
         for container in outgoing:
             if container["status"] in ("running", "paused", "restarting"):
-                self._stop_gracefully(container, state)
+                self._stop_gracefully(container, state, force=force)
             self._remove(container["id"])
             if state is not None:
                 journal = state.read_journal()
@@ -383,7 +383,7 @@ class DockerRuntime:
                 if record is not None and record["container_id"] == container["id"]:
                     state.clear_stop(container["id"])
 
-    def _stop_gracefully(self, container: dict, state=None, record: dict | None = None) -> None:
+    def _stop_gracefully(self, container: dict, state=None, record: dict | None = None, *, force: bool = False) -> None:
         identifier, started = container["id"], self.clock()
         signal = stop_signal(container["signal"])  # validate before changing restart policy or signalling
         if container["status"] == "paused":
@@ -397,17 +397,19 @@ class DockerRuntime:
                     or record["action"] != container["action"] or record["signal"] != signal):
                 raise RuntimeFailure("the saved shutdown intent does not match the container", "stop",
                                      intervention_required=True, kind="shutdown_record_mismatch")
-        elif container["restart_policy"] == "no" and state is not None:
+        elif container["restart_policy"] == "no" and state is not None and not force:
             # A prior helper may have disabled restart before this version added durable stop intent.
             raise RuntimeFailure("the container has a shutdown in progress without a saved intent; manual recovery is required",
                                  "stop", intervention_required=True, kind="shutdown_in_progress")
         elif container["restart_policy"] == "no":
             # Preserve the standalone runtime behavior for callers without a transaction store. Deployer uses the
-            # durable path above, so production recovery always has a saved deadline and phase.
+            # durable path above, so production recovery always has a saved deadline and phase. A forced stop may
+            # reach this legacy state: its intent is in memory only, because a record cannot say restart policy "no".
             deadline = self.wall_clock() if container["action"] == "fail" else self.wall_clock() + container["timeout"]
             record = {"container_id": identifier, "restart_policy": "no", "timeout_seconds": container["timeout"],
                       "action": container["action"], "signal": signal, "deadline_epoch": math.ceil(deadline),
                       "phase": "signalled"}
+            state = None  # nothing to advance or clear: this intent is never persisted
         else:
             record = {"container_id": identifier, "restart_policy": container["restart_policy"],
                       "timeout_seconds": container["timeout"], "action": container["action"], "signal": signal,
@@ -439,13 +441,15 @@ class DockerRuntime:
             phase = record["phase"]
             report["stages"].append("signalled")
         report["stages"].append("waiting")
-        remaining = max(0, min(record["timeout_seconds"], record["deadline_epoch"] - self.wall_clock()))
+        remaining = 0 if force else max(0, min(record["timeout_seconds"], record["deadline_epoch"] - self.wall_clock()))
         if self._wait_exit(identifier, remaining):
             report["stages"].append("exited")
             report["elapsed_seconds"] = round(self.clock() - started, 1)
             return
-        if record["action"] == "fail":
+        if record["action"] == "fail" and not force:
             self._expired(record, report, started)
+        if force:
+            report["stages"].append("force_requested")
         if phase in ("signalled", "kill_pending"):
             if phase != "kill_pending":
                 record = self._advance_stop(state, record, "kill_pending")
@@ -486,7 +490,8 @@ class DockerRuntime:
         report["stages"].append("deadline_expired")
         report["elapsed_seconds"] = round(self.clock() - started, 1)
         raise RuntimeFailure(f"the application did not stop within {record['timeout_seconds']} seconds and its policy is not "
-                             "to force it; it was signalled and may still exit. Run `shiplord recover` once it has",
+                             "to force it; it was signalled and may still exit. Run `shiplord recover` once it has, or "
+                             "`shiplord recover --force-stop` to kill it",
                              "stop", intervention_required=True, kind="shutdown_timeout")
 
 
@@ -497,6 +502,15 @@ class DockerRuntime:
     def stop_with_state(self, registration: dict, state) -> None:
         """Resume or begin a journaled graceful stop for a locked deployment transaction."""
         self._remove_containers(registration, state)
+
+    def force_stop(self, registration: dict, state=None) -> None:
+        """Kill and remove whatever runs for the application, overriding a ``fail`` shutdown deadline.
+
+        This is the explicit escape hatch behind ``shiplord recover --force-stop``: the graceful signal is still
+        sent first, but the wait is zero and the deadline refusal is skipped, so the existing ``kill_pending`` ->
+        ``killed`` path sends ``SIGKILL`` and confirms the exit before the stop record is cleared.
+        """
+        self._remove_containers(registration, state, force=True)
 
     def start(self, registration: dict, release: dict) -> None:
         self._start(registration, release)

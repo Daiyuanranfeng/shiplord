@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -255,6 +256,31 @@ class QueryCommandTests(ClientTestCase):
         code, result = commands.run_job_command(manifest(), self.client, "rollback", request_id="rb-1")
         self.assertEqual((code, result["ok"], result["error"]), (1, False, "no_previous_release"))
         self.assertEqual(calls, ["rc-1", "rb-1"])
+
+    def test_force_stop_requires_the_helper_capability_before_any_job(self):
+        old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",
+               "actions": ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
+                           "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]}
+        with patch.object(self.client, "call", return_value=old) as call:
+            with self.assertRaisesRegex(CommandError, "does not support --force-stop"):
+                commands.run_job_command(manifest(), self.client, "recover", force_stop=True)
+            self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])
+
+    def test_force_stop_is_recorded_in_the_recovery_outcome(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        code, result = commands.run_job_command(manifest(), self.client, "recover", request_id="rc-force",
+                                                force_stop=True)
+        self.assertEqual((code, result["status"]), (0, "recovered"))
+        self.assertTrue(result["forced_stop"]["forced"])
+        self.assertEqual(result["forced_stop"]["signal"], "SIGKILL")
+        self.assertFalse(result["running"])
 
 
 class BackupCommandTests(ClientTestCase):

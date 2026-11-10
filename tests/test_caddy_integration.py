@@ -18,8 +18,8 @@ from pathlib import Path
 
 from shiplord.registry import PORT_RANGE, port_is_free
 from shiplord.release_state import HostLock
-from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy
-from shiplord.system import run_command
+from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, service_environment
+from shiplord.system import CommandResult, HostSystem, run_command
 
 ENABLED = os.environ.get("SHIPLORD_TEST_CADDY") == "1" and shutil.which("caddy")
 
@@ -44,6 +44,15 @@ class AdminCaddy(SubprocessCaddy):
     def reload(self) -> None:
         self._run([self.caddy, "reload", "--config", str(self.caddyfile), "--adapter", "caddyfile",
                    "--address", self.admin], "reload")
+
+
+class NoSystemd(HostSystem):
+    """Real commands, except systemctl, which a container without systemd cannot run."""
+
+    def run(self, argv, **kwargs):
+        if argv[0].endswith("systemctl"):
+            return CommandResult(1, "")
+        return super().run(argv, **kwargs)
 
 
 def upstream(body: bytes):
@@ -247,6 +256,23 @@ class RealCaddyTests(unittest.TestCase):
             self.assertTrue(self.manager.apply(self.registration(port)).changed)
         self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"still served")
         self.assertEqual([p.name for p in self.root.rglob(".*")], [])
+
+    def test_a_caddyfile_that_reads_a_service_variable_validates(self):
+        # A container without systemd cannot report the unit, so this exercises the packaged-defaults path: the
+        # variable the Caddyfile reads has to reach `caddy validate`, or the file is judged broken for no reason.
+        defaults = Path(self.temp.name).resolve() / "default-caddy"
+        defaults.write_text(f'SHIPLORD_TEST_SITE="localhost:{self.http_port}"\n'
+                            'SHIPLORD_TEST_UPSTREAM="127.0.0.1:9999"\n')
+        caddyfile = Path(self.temp.name).resolve() / "variable.Caddyfile"
+        caddyfile.write_text("{\n\tlocal_certs\n\tskip_install_trust\n}\n"
+                             '{$SHIPLORD_TEST_SITE} {\n\treverse_proxy {$SHIPLORD_TEST_UPSTREAM}\n}\n')
+        caddyfile.chmod(0o644)
+        with_variable = SubprocessCaddy(shutil.which("caddy"),
+                                        service_environment=lambda: service_environment(NoSystemd(), (defaults,)))
+        with_variable.validate(caddyfile)  # must not raise: the service has both variables
+        with self.assertRaises(RoutingError) as caught:
+            SubprocessCaddy(shutil.which("caddy"), service_environment=lambda: {}).validate(caddyfile)
+        self.assertEqual(caught.exception.kind, "validation")
 
 
 if __name__ == "__main__":

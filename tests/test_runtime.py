@@ -78,19 +78,30 @@ class FakeStopState:
             raise RuntimeError("simulated worker interruption")
         self.record = dict(record)
 
+    def clear_stop(self, container_id):
+        if self.record is None or self.record["container_id"] != container_id:
+            raise AssertionError("clearing an unknown stop record")
+        self.record = None
+
 
 class StatefulStopDocker:
-    def __init__(self, *, exit_on_signal=False):
+    def __init__(self, *, exit_on_signal=False, action="force", signal="", container_id=ID_A):
         self.status = "running"
         self.restart_policy = "unless-stopped"
         self.calls = []
         self.exit_on_signal = exit_on_signal
         self.exit_on_kill = True
+        self.action = action
+        self.signal = signal
+        self.container_id = container_id
+        self.exists = True
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         argv = list(argv)
         self.calls.append(argv)
         command = argv[1]
+        if command == "ps":
+            return CommandResult(0, self.container_id + "\n" if self.exists else "")
         if command == "update":
             self.restart_policy = "no"
             return CommandResult(0, "")
@@ -101,7 +112,14 @@ class StatefulStopDocker:
                 self.status = "exited"
             return CommandResult(0, "")
         if command == "inspect":
+            if any("RestartPolicy" in argument for argument in argv):
+                return CommandResult(0, f"{self.status} {self.restart_policy} {self.signal}|2|{self.action}\n")
             return CommandResult(0, self.status + "\n")
+        if command == "rm":
+            if self.status == "running":
+                return CommandResult(1, "cannot remove a running container")
+            self.exists = False
+            return CommandResult(0, "")
         raise AssertionError(f"unexpected command: {argv}")
 
 
@@ -166,6 +184,44 @@ class DurableShutdownTests(RuntimeTestCase):
         kills = [call for call in self.stateful.calls if call[1] == "kill" and call[3] == "KILL"]
         self.assertEqual(len(kills), 2)
         self.assertEqual(state.record["phase"], "killed")
+
+
+class ForcedStopTests(RuntimeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.clock = [0.0]
+        self.wall = [100.0]
+        self.stateful = StatefulStopDocker(action="fail")
+        self.runtime = DockerRuntime(self.stateful, self.layout, platform_name="linux/amd64",
+                                     clock=lambda: self.clock[0], sleep=lambda _: None,
+                                     wall_clock=lambda: self.wall[0])
+
+    def kills(self):
+        return [call[3] for call in self.stateful.calls if call[1] == "kill"]
+
+    def test_a_legacy_container_without_a_saved_record_is_killed_and_removed(self):
+        self.stateful.restart_policy = "no"  # an older helper disabled restart but saved no stop intent
+        self.runtime.force_stop(REGISTRATION)
+        self.assertEqual(self.kills(), ["KILL"])  # restart "no" means a previous helper already signalled it
+        self.assertFalse(self.stateful.exists)
+        self.assertTrue(self.runtime.stop_report[0]["forced"])
+
+    def test_a_paused_container_is_still_refused_before_any_signal(self):
+        self.stateful.status, self.stateful.restart_policy = "paused", "no"
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.force_stop(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "paused")
+        self.assertEqual([call for call in self.stateful.calls if call[1] in ("kill", "update", "rm")], [])
+
+    def test_two_live_containers_are_refused_before_anything_is_signalled(self):
+        docker = FakeDocker()
+        docker.results["ps"] = CommandResult(0, f"{ID_A}\n{ID_B}\n")
+        docker.results["inspect"] = CommandResult(0, "running unless-stopped |2|fail\n")
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        with self.assertRaises(RuntimeFailure) as caught:
+            runtime.force_stop(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "ambiguous")
+        self.assertEqual(docker.sub("kill") + docker.sub("update") + docker.sub("rm"), [])
 
 
 class IdentityTests(unittest.TestCase):

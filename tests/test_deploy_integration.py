@@ -33,6 +33,7 @@ from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  #
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
 from shiplord.routing import RoutingError  # noqa: E402
+from shiplord.retire import make_retirer  # noqa: E402
 from shiplord.runtime import DockerRuntime, release_id  # noqa: E402
 from shiplord.system import HostSystem  # noqa: E402
 
@@ -477,12 +478,55 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started, 2)
         self.assertEqual(self.get("/version"), "v8")
 
-    def test_zz_fail_keeps_the_original_and_recovery_waits_for_its_exit(self):
+    def test_zz_fail_force_stop_unblocks_deploy_and_retirement(self):
         self.fresh_container_slate()
+        self.set_data_dir("/app/src/.adk")
         policy = self.policy_configuration(2, "fail")
         self.assertOutcome(self.deploy("req-x1", "v7", 8000, configuration=policy), "succeeded")
         (original,) = self.containers()
         blocked = self.deploy("req-x2", "v8", 8001, configuration=policy)
+        self.assertOutcome(blocked, "intervention_required")
+        self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
+        self.assertIn("--force-stop", blocked.detail["recovery"])
+        self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}", original).stdout.strip(),
+                         "true no")
+        self.assertIsNotNone(self.state.read_journal())
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "intervention_required")  # still draining: nothing is cleared
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}}", original).stdout.strip(), "true")
+
+        with self.lock.acquire():
+            forced = self.deployer.recover(force_stop=True)
+        self.assertOutcome(forced, "recovered")
+        self.assertFalse(forced.detail["running"])
+        self.assertTrue(forced.detail["forced_stop"]["forced"])
+        self.assertEqual(forced.detail["forced_stop"]["signal"], "SIGKILL")
+        self.assertEqual(forced.detail["forced_stop"]["policy"], {"timeout_seconds": 2, "action": "fail"})
+        self.assertIn("forced", forced.detail["forced_stop"]["stages"])
+        self.assertEqual(self.containers(), [])
+        self.assertIsNone(self.state.read_journal())
+        self.assertFalse((self.layout.caddy_root / "ship" / f"{self.app}.caddy").exists())
+
+        following = self.deploy("req-x3", "v8", 8002, configuration=policy)
+        self.assertOutcome(following, "succeeded")
+        self.assertEqual(self.get("/version"), "v8")
+
+        retire = make_retirer(self.layout, HostSystem(), self.lock, FakeCaddy(),
+                              runtime_for=lambda registration: self.runtime)
+        with self.lock.acquire():
+            removed = retire(self.registration, self.state.read_state())
+        self.assertIn("public route", removed["removed"])
+        self.assertIn("running release", removed["removed"])
+        self.assertEqual(self.containers(), [])
+
+    def test_zz_fail_plain_recovery_after_the_process_exits(self):
+        # The release state is shared by this class, so the sequences continue after the forced-stop case.
+        self.fresh_container_slate()
+        policy = self.policy_configuration(2, "fail")
+        self.assertOutcome(self.deploy("req-p1", "v7", 8003, configuration=policy), "succeeded")
+        (original,) = self.containers()
+        blocked = self.deploy("req-p2", "v8", 8004, configuration=policy)
         self.assertOutcome(blocked, "intervention_required")
         self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
         self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
@@ -499,6 +543,7 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIsNone(self.state.read_journal())
         self.assertEqual(self.get("/version"), "v7")
         self.assertEqual(len(self.containers()), 1)
+
     def test_z_image_declared_volume_does_not_break_readiness_or_release_identity(self):
         deployed = self.deploy("req-v6", "v6-volume", 5002)
         self.assertOutcome(deployed, "succeeded")

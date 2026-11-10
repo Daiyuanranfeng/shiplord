@@ -339,6 +339,62 @@ class FailureTests(DeployTestCase):
         self.assertIsNone(self.state.read_journal())
         self.assertEqual(self.deploy(request_id="req-3", commit="e", image="f", sequence=1002).status, "succeeded")
 
+    def test_a_forced_recovery_stops_the_process_removes_the_route_and_clears_the_journal(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.runtime.stop_in_progress = lambda registration: True  # a plain recover would still refuse
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("recovered", 0))
+        self.assertIn("force_stop", self.runtime.names())
+        self.assertEqual(self.runtime.running, set())
+        self.assertFalse(self.route_file.exists())
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(outcome.detail["target"], identity(record()))
+        self.assertFalse(outcome.detail["running"])
+        self.assertEqual(outcome.detail["forced_stop"]["signal"], "SIGKILL")
+        self.assertEqual(outcome.detail["forced_stop"]["policy"], {"timeout_seconds": 10, "action": "fail"})
+        self.assertIn("forced", outcome.detail["forced_stop"]["stages"])
+
+    def test_a_forced_recovery_without_a_journal_still_stops_a_running_process(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.assertTrue(self.runtime.running)
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("recovered", 0))
+        self.assertIn("force_stop", self.runtime.names())
+        self.assertEqual(self.runtime.running, set())
+        self.assertFalse(self.route_file.exists())
+        self.assertEqual(outcome.detail["target"], identity(record()))
+        self.assertFalse(outcome.detail["running"])
+
+    def test_a_forced_recovery_is_refused_for_a_native_runtime(self):
+        native = Deployer(registration=NATIVE_REGISTRATION, state=self.state, routes=self.routes,
+                          runtime=FakeNativeRuntime(), probes=self.probes)
+        outcome = self.run_locked(lambda: native.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2))
+        self.assertEqual(outcome.detail["error"], "invalid_request")
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_failed_forced_stop_keeps_the_journal_and_requires_intervention(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.runtime.force_stop_error = RuntimeFailure(
+            "the container did not exit after being killed", "stop", intervention_required=True, kind="kill_unconfirmed")
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("intervention_required", 6))
+        self.assertEqual(outcome.detail["kind"], "kill_unconfirmed")
+        self.assertIsNotNone(self.state.read_journal())
+
+    def test_a_stop_deadline_names_the_forced_recovery_escape_hatch(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        outcome = self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.assertIn("shiplord recover --force-stop", outcome.detail["recovery"])
+
     def test_a_commit_whose_journal_cleanup_fails_is_flagged_and_recoverable(self):
         with patch.object(ReleaseState, "clear_after_reconciliation", side_effect=StateError("sync failed")):
             outcome = self.deploy()

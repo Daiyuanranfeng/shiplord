@@ -965,10 +965,13 @@ def rollback(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command(rich_help_panel="Troubleshooting")
-def recover(json_output: bool = typer.Option(False, "--json")) -> None:
+def recover(force_stop: bool = typer.Option(
+                False, "--force-stop",
+                help="Kill a process that outlived a fail-policy shutdown deadline; the application stays stopped."),
+            json_output: bool = typer.Option(False, "--json")) -> None:
     """Reconcile an interrupted deployment to the last committed release."""
     manifest = _manifest(json_output)
-    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover",
+    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover", force_stop=force_stop,
                                               on_progress=_progress(json_output)), json_output)
 
 
