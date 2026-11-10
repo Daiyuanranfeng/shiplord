@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `shiplord server remove` and `shiplord server rename`, both with `--json`.
+  Removal refuses while the current directory's `ship.toml` names the alias.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

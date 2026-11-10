@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NoReturn, Optional
 
 import typer
 
@@ -22,7 +22,8 @@ from .configure import ConfigurationError, collect_answers, create_manifest
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
-from .servers import (InvalidTarget, ServerError, SshOptions, SSHCheckError, list_servers, load_server, register_server,
+from .servers import (InvalidAlias, InvalidTarget, NoServerDirectory, ServerError, SshOptions, SSHCheckError,
+                      UnknownServer, list_servers, load_server, register_server, remove_server, rename_server,
                       validate_target)
 from .template import TemplateError, create_project
 from .transport import TransportError, probe_capabilities
@@ -324,6 +325,32 @@ def server_add(alias: str, ssh: str = typer.Option(..., "--ssh")) -> None:
     typer.echo("Server alias saved. Run `shiplord server bootstrap` next. CI host-key setup is not implemented yet.")
 
 
+@server_app.command("remove", rich_help_panel="Administration")
+def server_remove(alias: str, json_output: bool = typer.Option(False, "--json")) -> None:
+    """Remove a registered server alias (local only; nothing is contacted)."""
+    try:
+        remove_server(alias)
+    except (ManifestError, ServerError) as error:
+        _server_failure(error, json_output)
+    if json_output:
+        _emit({"ok": True, "removed": alias}, True)
+        return
+    typer.echo(f"Removed server alias {alias!r}.")
+
+
+@server_app.command("rename", rich_help_panel="Administration")
+def server_rename(old: str, new: str, json_output: bool = typer.Option(False, "--json")) -> None:
+    """Rename a registered server alias (local only; nothing is contacted)."""
+    try:
+        rename_server(old, new)
+    except (ManifestError, ServerError) as error:
+        _server_failure(error, json_output)
+    if json_output:
+        _emit({"ok": True, "alias": new, "previous_alias": old}, True)
+        return
+    typer.echo(f"Renamed server alias {old!r} to {new!r}.")
+
+
 @server_app.command("list", rich_help_panel="Administration")
 def server_list(json_output: bool = typer.Option(False, "--json")) -> None:
     """List the registered servers (local only; nothing is contacted)."""
@@ -346,6 +373,17 @@ def server_list(json_output: bool = typer.Option(False, "--json")) -> None:
 def _fail(message: str, code: int, json_output: bool = False, **details) -> None:
     _emit({"ok": False, "error": message, **details}, json_output)
     raise typer.Exit(code)
+
+
+def _server_failure(error: Exception, json_output: bool = False) -> NoReturn:
+    """Exit with the code that matches a local server-registration failure."""
+    if isinstance(error, (ManifestError, InvalidAlias, InvalidTarget)):
+        code = 2
+    elif isinstance(error, (NoServerDirectory, UnknownServer, SSHCheckError)):
+        code = 3
+    else:
+        code = 1
+    _fail(str(error), code, json_output)
 
 
 def _manifest(json_output: bool = False) -> dict:
