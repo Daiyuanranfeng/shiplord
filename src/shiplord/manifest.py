@@ -151,7 +151,7 @@ def validate_manifest(raw: dict) -> dict:
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases",
                                                    "shutdown_timeout_seconds", "shutdown_timeout_action"})
     timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1,
-                     MAX_READINESS_SECONDS)
+                       MAX_READINESS_SECONDS)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
