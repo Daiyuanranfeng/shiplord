@@ -519,6 +519,30 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIn("running release", removed["removed"])
         self.assertEqual(self.containers(), [])
 
+    def test_zz_fail_plain_recovery_after_the_process_exits(self):
+        # The release state is shared by this class, so the sequences continue after the forced-stop case.
+        self.fresh_container_slate()
+        policy = self.policy_configuration(2, "fail")
+        self.assertOutcome(self.deploy("req-p1", "v7", 8003, configuration=policy), "succeeded")
+        (original,) = self.containers()
+        blocked = self.deploy("req-p2", "v8", 8004, configuration=policy)
+        self.assertOutcome(blocked, "intervention_required")
+        self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
+        self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}", original).stdout.strip(),
+                         "true no")
+        self.assertIsNotNone(self.state.read_journal())
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "intervention_required")  # still draining: nothing is cleared
+        self.assertEqual(self.containers(), [original])
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}}", original).stdout.strip(), "true")
+        docker("kill", "--signal", "KILL", original)  # the process finally exits
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "recovered")
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.get("/version"), "v7")
+        self.assertEqual(len(self.containers()), 1)
+
     def test_z_image_declared_volume_does_not_break_readiness_or_release_identity(self):
         deployed = self.deploy("req-v6", "v6-volume", 5002)
         self.assertOutcome(deployed, "succeeded")
