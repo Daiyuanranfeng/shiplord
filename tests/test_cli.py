@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ from typer.testing import CliRunner
 
 from shiplord import cli
 from shiplord.client import ClientError
-from shiplord.commands import CommandError
+from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.manifest import ManifestError, load_manifest
 
@@ -116,6 +117,10 @@ class CLITests(unittest.TestCase):
         # stdin is not a terminal, so no command may wait for an answer.
         return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
                               env=env, stdin=subprocess.DEVNULL)
+
+    def git(self, directory: str, *args: str) -> None:
+        result = subprocess.run(["git", "-C", directory, *args], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_plan_uses_local_manifest_and_reports_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -248,6 +253,58 @@ class CLITests(unittest.TestCase):
             self.assertEqual(config["http"]["frontend_origins"], ["https://example.com"])
             self.assertNotIn("github", config)
             self.assertIn("has not been checked", result.stdout)
+
+    def test_configure_records_the_image_repository_provision_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend",
+                                 "--image-repository", "owner/orders")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual(config["github"], {"repository": "owner/orders", "deployment_branch": "main"})
+            self.assertEqual(image_repository_for(config, None), "ghcr.io/owner/orders")
+            self.assertNotIn("warning", result.stderr)
+
+    @unittest.skipUnless(shutil.which("git"), "git is needed to infer a repository")
+    def test_configure_infers_the_image_repository_from_the_git_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.git(directory, "init", "-q")
+            self.git(directory, "remote", "add", "origin", "git@github.com:owner/orders.git")
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual(config["github"]["repository"], "owner/orders")
+            self.assertEqual(image_repository_for(config, None), "ghcr.io/owner/orders")
+            self.assertNotIn("warning", result.stderr)
+
+    def test_configure_rejects_an_unusable_image_repository_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for repository in ("orders", "../owner/orders", "owner/orders/tree/main"):
+                with self.subTest(repository=repository):
+                    result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                         "--api-domain", "api.example.com", "--no-frontend",
+                                         "--image-repository", repository)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("owner/repository", result.stderr)
+                    self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_refuses_an_image_repository_for_a_native_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend", "--runtime", "native",
+                                 "--image-repository", "owner/orders")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--image-repository applies only to Docker applications", result.stderr)
+            self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_without_a_terminal_warns_when_no_repository_is_known(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--image-repository", result.stderr)
+            self.assertNotIn("github", load_manifest(Path(directory) / "ship.toml"))
 
     def test_configure_supports_an_explicit_empty_frontend(self):
         with tempfile.TemporaryDirectory() as directory:

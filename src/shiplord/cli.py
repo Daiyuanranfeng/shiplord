@@ -18,7 +18,8 @@ from . import __version__
 from . import commands, github, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
-from .configure import ConfigurationError, collect_answers, create_manifest
+from .configure import (ConfigurationError, collect_answers, create_manifest, resolve_image_repository,
+                        validate_repository)
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
@@ -744,14 +745,27 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
                                                            help="Port the application listens on in its container."),
               health_path: Optional[str] = typer.Option(None, "--health-path",
                                                         help="Path that returns 200 when the application is ready."),
-              memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB.")) -> None:
+              memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB."),
+              image_repository: Optional[str] = typer.Option(
+                  None, "--image-repository",
+                  help="owner/repository that publishes this app's image (default: from the git remote).")) -> None:
     """Create ship.toml in the current directory without overwriting it. At a terminal, missing values are asked."""
     if frontend and no_frontend:
         typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
         raise typer.Exit(2)
+    if image_repository is not None:
+        if runtime == "native":
+            typer.echo("error: --image-repository applies only to Docker applications", err=True)
+            raise typer.Exit(2)
+        try:
+            image_repository = validate_repository(image_repository)
+        except ManifestError as error:
+            typer.echo(f"error: {error}", err=True)
+            raise typer.Exit(2) from None
     given = {"server": server, "api_domain": api_domain, "name": name, "runtime": runtime, "template": template,
              "origins": list(frontend) if frontend else ([] if no_frontend else None),
-             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory}
+             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory,
+             "image_repository": image_repository}
     directory = Path.cwd()
     if _interactive():
         if (directory / "ship.toml").exists() or (directory / "ship.toml").is_symlink():
@@ -760,11 +774,14 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
         try:
             servers = list_servers()[0] if server is None else []
             answers = collect_answers(given, root=directory, servers=servers, ask=_ask, say=typer.echo)
+            summary = [("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime")]
+            if answers["runtime"] == "docker":
+                summary.append(("image repository", "image_repository"))
+            summary += [("hostname", "api_domain"), ("frontend origins", "origins"),
+                        ("container port", "container_port"), ("health path", "readiness_path"),
+                        ("memory (MiB)", "memory_mb")]
             typer.echo("\nship.toml will contain:")
-            for label, key in (("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime"),
-                               ("hostname", "api_domain"), ("frontend origins", "origins"),
-                               ("container port", "container_port"), ("health path", "readiness_path"),
-                               ("memory (MiB)", "memory_mb")):
+            for label, key in summary:
                 value = answers[key]
                 typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
             if not typer.confirm("Write ship.toml?", default=True):
@@ -788,11 +805,17 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
             raise typer.Exit(2)
         answers = dict(given, name=name or directory.name, runtime=runtime or "docker",
                        template=template or "google-adk")
+        answers["image_repository"] = resolve_image_repository(directory, answers["runtime"],
+                                                               answers["image_repository"], ask=None, say=typer.echo)
+        if answers["runtime"] == "docker" and answers["image_repository"] is None:
+            typer.echo("warning: no image repository was recorded, so `shiplord provision` will need "
+                       "--image-repository. Pass --image-repository owner/repository to record it now.", err=True)
     try:
         create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
                         answers["runtime"], answers["template"],
                         **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
-                           if answers[key] is not None})
+                           if answers[key] is not None},
+                        image_repository=answers["image_repository"])
     except (ConfigurationError, ManifestError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from None

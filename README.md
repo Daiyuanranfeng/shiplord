@@ -35,15 +35,24 @@ shiplord init orders --template google-adk
 cd orders
 shiplord configure --server production \
   --api-domain orders-api.example.com \
-  --frontend https://orders.example.com
+  --frontend https://orders.example.com \
+  --image-repository owner/orders
 
 # Create this app's deployment access
 shiplord provision
 ```
 
-For an existing Docker app, run `shiplord configure` in its directory and choose the `generic` template. Shiplord will check that the app answers its readiness URL before it sends visitors to it.
+`--image-repository owner/orders` is the GitHub repository that publishes the app's image. `provision` reads
+`ghcr.io/owner/orders` from `ship.toml`, so it needs no extra flags. In a git checkout you can leave the option
+out: `configure` reads the repository from the `origin` remote when it is a GitHub URL, and asks for it when it is
+not.
 
-For a native Linux program, use the `google-adk` template above. Add `--runtime native` to `shiplord configure` before running `shiplord provision`. Shiplord assumes Docker otherwise.
+For an existing Docker app, run `shiplord configure` in its directory and choose the `generic` template. It records
+the image repository the same way - from the git remote, from `--image-repository owner/repository`, or by asking -
+so `shiplord provision` needs no extra flags. Shiplord will check that the app answers its readiness URL before it
+sends visitors to it.
+
+For a native Linux program, use the `google-adk` template above without `--image-repository` (a native app has no image) and add `--runtime native` to `shiplord configure` before running `shiplord provision`. Shiplord assumes Docker otherwise.
 
 ## Deploy an update
 
