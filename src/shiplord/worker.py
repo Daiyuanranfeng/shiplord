@@ -40,7 +40,7 @@ def run_job(services: HostServices, application_id: str, request_id: str) -> int
                 elif record["action"] == "rollback":
                     result = deployer.rollback(request_id)
                 else:
-                    result = deployer.recover()
+                    result = deployer.recover(force_stop=record["request"].get("force_stop") is True)
                 outcome = _outcome(result.status, result.exit_code, result.detail)
         except StateError as error:
             if "host lock is busy" in str(error):

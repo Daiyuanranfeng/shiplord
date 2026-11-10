@@ -40,6 +40,7 @@ class FakeRuntime:
         self.pull_error = None
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
+        self.force_stop_error = None
         self.discarded: list[str] = []
 
     def pull(self, registration, release):
@@ -66,6 +67,15 @@ class FakeRuntime:
 
     def stop(self, registration):
         self.calls.append(("stop",))
+        self.running = set()
+
+    def force_stop(self, registration, state=None):
+        self.calls.append(("force_stop",))
+        if self.force_stop_error:
+            raise self.force_stop_error
+        self.stop_report = [{"timeout_seconds": 10, "action": "fail", "forced": True,
+                             "stages": ["stop_requested", "signalled", "waiting", "force_requested", "forced"],
+                             "elapsed_seconds": 0.2}]
         self.running = set()
 
     def is_running(self, registration, release):
