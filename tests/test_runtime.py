@@ -40,18 +40,26 @@ class FakeDocker:
         self.results: dict[str, CommandResult] = {}
         self.raise_for: dict[str, CommandError] = {}
 
+    @staticmethod
+    def _key(argv):
+        """The command a call names; a pull with the application's login still names its own command."""
+        rest = list(argv[1:])
+        if rest[:1] == ["--config"]:
+            rest = rest[2:]
+        return " ".join(rest[:2]) if rest[0] in ("image", "volume") else rest[0]
+
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         argv = list(argv)
         self.calls.append(argv)
         self.max_outputs.append(max_output)
         assert argv[0] == "/usr/bin/docker"
-        key = " ".join(argv[1:3]) if argv[1] in ("image", "volume") else argv[1]
+        key = self._key(argv)
         if key in self.raise_for:
             raise self.raise_for[key]
         return self.results.get(key, CommandResult(0, ""))
 
     def sub(self, name):
-        return [c for c in self.calls if (" ".join(c[1:3]) if c[1] in ("image", "volume") else c[1]) == name]
+        return [c for c in self.calls if self._key(c) == name]
 
 
 class RuntimeTestCase(unittest.TestCase):
@@ -438,6 +446,67 @@ class StartTests(RuntimeTestCase):
         self.docker.results["ps"] = CommandResult(0, "")
         self.runtime.stop(REGISTRATION)
         self.assertEqual(self.docker.sub("rm"), [])
+
+
+class StartImageTests(RuntimeTestCase):
+    """A start must fetch a release's image itself: an implicit `docker run` pull is anonymous."""
+
+    IMAGE = "ghcr.io/example/orders@sha256:" + "b" * 64
+
+    def start(self, value=None):
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        self.runtime.start(REGISTRATION, release() if value is None else value)
+
+    def login(self):
+        login = self.layout.registry_logins / "orders"
+        login.mkdir(parents=True, exist_ok=True)
+        (login / "config.json").write_text('{"auths": {}}')
+        return login
+
+    def test_an_image_that_is_on_the_host_is_never_fetched_again(self):
+        self.docker.results["image inspect"] = CommandResult(0, "sha256:" + ID_A + "\n")
+        self.start()
+        self.assertEqual(self.docker.sub("pull"), [])  # a deploy already pulled it in prepare: no registry round trip
+        self.assertEqual(self.docker.calls[0], ["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}", self.IMAGE])
+        self.assertEqual(self.docker.sub("run")[0][-1], self.IMAGE)
+
+    def test_a_missing_image_is_fetched_with_this_applications_login_before_anything_is_stopped(self):
+        login = self.login()
+        self.docker.results["image inspect"] = CommandResult(1, "Error: No such image")
+        self.start()
+        self.assertEqual(self.docker.sub("pull"),
+                         [["/usr/bin/docker", "--config", str(login), "pull", "--quiet", self.IMAGE]])
+        fetched = self.docker.calls.index(self.docker.sub("pull")[0])
+        self.assertLess(fetched, self.docker.calls.index(self.docker.sub("rm")[0]))  # the old release keeps serving
+        self.assertLess(fetched, self.docker.calls.index(self.docker.sub("run")[0]))
+        self.assertEqual(self.docker.sub("run")[0][-1], self.IMAGE)
+
+    def test_a_start_that_cannot_fetch_the_image_leaves_the_previous_release_alone(self):
+        self.login()
+        for host in ("ghcr.io", "localhost:5000"):
+            with self.subTest(host):
+                self.docker.calls.clear()
+                value = release()
+                value["artifact"]["image"] = f"{host}/example/orders@sha256:" + "b" * 64
+                self.docker.results = {"volume inspect": LABELLED_VOLUME, "ps": CommandResult(0, ID_A + "\n"),
+                                       "image inspect": CommandResult(1, "Error: No such image"),
+                                       "pull": CommandResult(1, "unauthorized: authentication required")}
+                with self.assertRaises(RuntimeFailure) as caught:
+                    self.runtime.start(REGISTRATION, value)
+                self.assertEqual(caught.exception.phase, "start")
+                self.assertIn(f"the release's image could not be fetched from {host}", str(caught.exception))
+                self.assertIn("the previous release is still running", str(caught.exception))
+                self.assertEqual(caught.exception.detail, "")  # raw pull output can echo what the pull was given
+                self.assertEqual((self.docker.sub("rm"), self.docker.sub("run")), ([], []))
+
+    def test_a_nearly_full_disk_stops_a_start_before_it_pulls_or_touches_anything(self):
+        self.docker.results["image inspect"] = CommandResult(1, "Error: No such image")
+        with patch("shiplord.runtime.shutil.disk_usage", return_value=type("U", (), {"free": 10 * 2**20})()):
+            with self.assertRaisesRegex(RuntimeFailure, "not enough free disk space.*10 MiB free") as caught:
+                self.runtime.start(REGISTRATION, release())
+        self.assertEqual(caught.exception.phase, "start")
+        self.assertEqual((self.docker.sub("pull"), self.docker.sub("volume inspect"), self.docker.sub("rm"),
+                          self.docker.sub("run")), ([], [], [], []))
 
 
 class InspectTests(RuntimeTestCase):

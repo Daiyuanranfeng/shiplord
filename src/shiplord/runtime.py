@@ -86,6 +86,11 @@ def _digest(image: str) -> str:
     return image.rpartition("@")[2]
 
 
+def _registry(image: str) -> str:
+    """The registry host an image reference names, so a message can say where an image has to come from."""
+    return image.split("/", 1)[0]
+
+
 class Runtime(Protocol):
     def prepare(self, registration: dict, release: dict) -> dict: ...
     def start(self, registration: dict, release: dict) -> None: ...
@@ -123,7 +128,7 @@ class DockerRuntime:
             raise RuntimeFailure(f"docker could not complete ({error.kind})", phase, error.output) from None
 
     # operations -----------------------------------------------------------
-    def _require_free_disk(self) -> None:
+    def _require_free_disk(self, phase: str = "prepare") -> None:
         """Refuse to work when the disk is nearly full: a full disk fails a deploy halfway."""
         probe = DOCKER_ROOT if self.layout.prefix == Path("/") and DOCKER_ROOT.exists() else self.layout.var
         try:
@@ -132,7 +137,7 @@ class DockerRuntime:
             free = MIN_FREE_BYTES  # cannot measure: let docker report its own failure
         if free < MIN_FREE_BYTES:
             raise RuntimeFailure(f"not enough free disk space to pull an image ({free // 2**20} MiB free, "
-                                 f"{MIN_FREE_BYTES // 2**20} MiB needed); nothing was changed", "prepare")
+                                 f"{MIN_FREE_BYTES // 2**20} MiB needed); nothing was changed", phase)
 
     def _inspect_image(self, image: str):
         """Read the platform, revision label, and stop signal of a local image; non-zero means it is absent."""
@@ -141,6 +146,23 @@ class DockerRuntime:
                              '{{.Config.StopSignal}}', image],
                             "prepare")
 
+    def _pull(self, registration: dict, image: str, phase: str = "prepare", failure: str = "") -> None:
+        """Fetch one pinned image with this application's own read-only login.
+
+        This is the one place a pull happens: ``pull`` runs it before the host-wide lock, ``prepare`` reuses it when
+        the verified image is absent, and a start reuses it when a restore finds the image pruned. ``failure`` is the
+        message to raise instead of the generic one, for a caller that must not repeat the pull's raw output.
+        """
+        self._require_free_disk(phase)
+        login = self.layout.registry_logins / registration["application_id"]
+        config = ["--config", str(login)] if (login / "config.json").is_file() else []  # this app's read-only login
+        pulled = self._docker([*config, "pull", "--quiet", image], phase, timeout=PULL_TIMEOUT_SECONDS)
+        if pulled.code == 0:
+            return
+        if failure:  # a pull can echo what it was given, so this caller shows no output at all
+            raise RuntimeFailure(failure, phase)
+        raise RuntimeFailure("the image could not be pulled", phase, pulled.output)
+
     def pull(self, registration: dict, release: dict) -> None:
         """Fetch the pinned image with this application's own read-only login.
 
@@ -148,13 +170,23 @@ class DockerRuntime:
         registry may delay this job, never every other application and every admin command. ``prepare`` verifies
         the result under the lock and only fetches again when the image is not there at all.
         """
-        self._require_free_disk()
-        image = release["artifact"]["image"]
-        login = self.layout.registry_logins / registration["application_id"]
-        config = ["--config", str(login)] if (login / "config.json").is_file() else []  # this app's read-only login
-        pulled = self._docker([*config, "pull", "--quiet", image], "prepare", timeout=PULL_TIMEOUT_SECONDS)
-        if pulled.code != 0:
-            raise RuntimeFailure("the image could not be pulled", "prepare", pulled.output)
+        self._pull(registration, release["artifact"]["image"])
+
+    def _ensure_image(self, registration: dict, image: str) -> None:
+        """Make the release's image available on this host before anything is stopped.
+
+        A deploy has already fetched the candidate in ``prepare``, so a local image is the usual case and costs one
+        ``docker image inspect``, never a registry round trip. A restore - or any start after ``docker image prune -a``
+        - fetches the pinned digest with this application's own login while the previous release keeps serving. The
+        fetch's raw output is dropped: it can echo what it was given, and the message already says where the image
+        has to come from.
+        """
+        present = self._docker(["image", "inspect", "--format", "{{.Id}}", image], "start")
+        if present.code == 0:
+            return
+        self._pull(registration, image, "start",
+                   f"the release's image could not be fetched from {_registry(image)}; "
+                   "the previous release is still running")
 
     def prepare(self, registration: dict, release: dict) -> dict:
         """Verify the image on this host, its platform, revision, and stop signal before anything is stopped.
@@ -499,6 +531,8 @@ class DockerRuntime:
             custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
         except EnvironmentError_ as error:
             raise RuntimeFailure(f"the environment file is unusable: {error}", "start") from None
+        # Before the running release is touched: a restore must fetch a pruned image while the old one still serves.
+        self._ensure_image(registration, release["artifact"]["image"])
         self.check_volume(registration, create=True, provenance=provenance)  # before the running release is touched
         self._remove_containers(registration, state)
         timeout, action = policy(config)
