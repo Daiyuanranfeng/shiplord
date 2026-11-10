@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -36,6 +38,12 @@ retain_successful_releases = 2
 repository = "QueryPlanner/orders"
 deployment_branch = "main"
 '''
+
+
+def public_key_line() -> str:
+    """A syntactically valid ed25519 public key line, without needing ssh-keygen."""
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + bytes(range(32))
+    return "ssh-ed25519 " + base64.b64encode(blob).decode()
 
 
 class ManifestTests(unittest.TestCase):
@@ -266,7 +274,7 @@ class CLITests(unittest.TestCase):
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertEqual(load_manifest(Path(directory) / "ship.toml")["template"], "generic")
 
-    def test_generic_github_setup_rejects_before_saving_tailscale_defaults(self):
+    def test_generic_github_setup_passes_the_profile_gate_and_stops_at_the_server_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ship.toml").write_text(MANIFEST.replace('template = "google-adk"', 'template = "generic"'))
@@ -275,10 +283,57 @@ class CLITests(unittest.TestCase):
                                  "--tailscale-client-id", "throwaway-fixture", "--tailscale-audience",
                                  "api.tailscale.com/throwaway-fixture", "--json",
                                  env=dict(os.environ, XDG_CONFIG_HOME=str(config_home)))
+            self.assertEqual(result.returncode, 3, result.stderr)  # no such server alias in this sandbox
+            self.assertNotIn("generic Docker applications", result.stdout)
+            self.assertFalse((root / ".github").exists())
+            self.assertEqual([p.name for p in root.iterdir() if p.name != "config"], ["ship.toml"])
+
+    def test_github_setup_refuses_conflicting_quality_options_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--quality-workflow", ".github/workflows/checks.yml", "--no-quality-workflow", "--json",
+                                 env=dict(os.environ, XDG_CONFIG_HOME=str(root / "config")))
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("generic Docker applications need a custom workflow", json.loads(result.stdout)["error"])
-            self.assertFalse(config_home.exists())
+            self.assertIn("either --quality-workflow or --no-quality-workflow", json.loads(result.stdout)["error"])
             self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
+
+    def test_keys_add_reads_one_validated_public_key_from_exactly_one_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"))
+            for args in ([], ["--public-key-file", "ci.pub", "--public-key-stdin"]):
+                with self.subTest(args=args):
+                    result = self.invoke(directory, "keys", "add", "--label", "ci", *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("exactly one", json.loads(result.stdout)["error"])
+            broken = root / "broken.pub"
+            broken.write_text("ssh-ed25519 AAAAnotarealkey\n")
+            result = self.invoke(directory, "keys", "add", "--label", "ci", "--public-key-file", str(broken), "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn("AAAAnotarealkey", result.stdout + result.stderr)
+            result = self.invoke(directory, "keys", "add", "--label", "Bad Label", "--public-key-file", str(broken),
+                                 "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("key label", json.loads(result.stdout)["error"])
+            good = root / "ci.pub"
+            good.write_text(public_key_line() + "\n")
+            result = self.invoke(directory, "keys", "add", "--label", "ci", "--public-key-file", str(good), "--json", env=env)
+            self.assertEqual(result.returncode, 3, result.stderr)  # valid input; no server alias exists here
+
+    def test_keys_remove_needs_confirmation_and_keys_commands_need_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"))
+            for command in (["keys", "list"], ["keys", "remove", "--label", "ci"]):
+                with self.subTest(command=command):
+                    self.assertEqual(self.invoke(directory, *command, "--json", env=env).returncode, 2)  # no ship.toml
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "keys", "remove", "--label", "ci", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
 
     def test_configure_refuses_ambiguous_or_invalid_inputs(self):
         cases = [[], ["--frontend", "https://example.com", "--no-frontend"], ["--frontend", "https://example.com/path"]]

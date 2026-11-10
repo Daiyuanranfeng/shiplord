@@ -19,6 +19,7 @@ from . import commands, github, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
 from .configure import ConfigurationError, collect_answers, create_manifest
+from .keys import KeyError_, parse_public_key, validate_label
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
@@ -30,7 +31,9 @@ from .transport import TransportError, probe_capabilities
 app = typer.Typer(no_args_is_help=True, help="Create, provision, and ship applications to a server.")
 server_app = typer.Typer(no_args_is_help=True, help="Manage servers.")
 github_app = typer.Typer(no_args_is_help=True, help="Configure GitHub Actions deployments.")
+keys_app = typer.Typer(no_args_is_help=True, help="Manage the SSH keys that may deploy this application.")
 env_app = typer.Typer(no_args_is_help=True, help="Manage an application's runtime environment on the server.")
+app.add_typer(keys_app, name="keys", rich_help_panel="Administration")
 app.add_typer(env_app, name="env", rich_help_panel="Administration")
 registry_app = typer.Typer(no_args_is_help=True, help="Manage the server's read-only pull login for private images.")
 app.add_typer(registry_app, name="registry", rich_help_panel="Administration")
@@ -1025,6 +1028,72 @@ def registry_status_command(json_output: bool = typer.Option(False, "--json")) -
     _execute(lambda: commands.registry_other(manifest, _admin(manifest, json_output), "list"), json_output)
 
 
+def _key_label(label: str) -> str:
+    try:
+        return validate_label(label)
+    except KeyError_ as error:
+        raise CommandError(str(error)) from None
+
+
+def _read_public_key(public_key_file: Optional[Path], public_key_stdin: bool) -> tuple[str, str]:
+    """One public key from exactly one source: returns (key line without a comment, fingerprint)."""
+    if public_key_stdin == (public_key_file is not None):
+        raise CommandError("provide the public key with exactly one of --public-key-file and --public-key-stdin")
+    try:
+        text = sys.stdin.read() if public_key_stdin else public_key_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise CommandError("could not read the public key") from None
+    try:
+        key = parse_public_key(text)
+    except KeyError_ as error:
+        raise CommandError(str(error)) from None
+    return f"{key.type} {key.blob}", key.fingerprint
+
+
+@keys_app.command("add")
+def keys_add_command(label: str = typer.Option(..., "--label", help="A short name for this key."),
+                     public_key_file: Optional[Path] = typer.Option(None, "--public-key-file", help="File holding the public key."),
+                     public_key_stdin: bool = typer.Option(False, "--public-key-stdin", help="Read the public key from stdin."),
+                     json_output: bool = typer.Option(False, "--json")) -> None:
+    """Register a public key that may deploy this application, without needing a template."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        name = _key_label(label)
+        public_key, fingerprint = _read_public_key(public_key_file, public_key_stdin)
+        result = _admin(manifest, json_output).call("keys", manifest["name"],
+                                                    {"operation": "add", "label": name, "public_key": public_key})
+        return 0, {"ok": True, **result, "label": name, "fingerprint": fingerprint}
+    _execute(action, json_output)
+
+
+@keys_app.command("list")
+def keys_list_command(json_output: bool = typer.Option(False, "--json")) -> None:
+    """List the labels and fingerprints of the keys that may deploy this application."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        listed = _admin(manifest, json_output).call("keys", manifest["name"], {"operation": "list"})
+        return 0, {"ok": True, **listed}
+    _execute(action, json_output)
+
+
+@keys_app.command("remove")
+def keys_remove_command(label: str = typer.Option(..., "--label", help="The label of the key to revoke."),
+                        yes: bool = typer.Option(False, "--yes", help="Confirm that this key loses deploy access."),
+                        json_output: bool = typer.Option(False, "--json")) -> None:
+    """Revoke one key's deploy access. The server refuses to remove the last key."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        name = _key_label(label)
+        if not yes:
+            raise CommandError(f"this removes {name}'s deploy access to {manifest['name']}; rerun with --yes to confirm")
+        result = _admin(manifest, json_output).call("keys", manifest["name"], {"operation": "remove", "label": name})
+        return 0, {"ok": True, **result, "label": name}
+    _execute(action, json_output)
+
+
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
@@ -1033,13 +1102,19 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
                          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
+                         quality_workflow: Optional[str] = typer.Option(None, "--quality-workflow",
+                                                                        help="Reusable workflow to run before deploy."),
+                         no_quality_workflow: bool = typer.Option(False, "--no-quality-workflow",
+                                                                  help="Do not run a quality job before deploy."),
                          force_workflow: bool = typer.Option(False, "--force-workflow"),
                          json_output: bool = typer.Option(False, "--json")) -> None:
     """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow."""
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
-        github.validate_setup_profile(manifest)
+        if quality_workflow is not None and no_quality_workflow:
+            raise CommandError("choose either --quality-workflow or --no-quality-workflow")
+        github.validate_setup_request(manifest, repo)
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
         interactive = sys.stdin.isatty() and not json_output
@@ -1052,7 +1127,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
         target = load_server(manifest["server"])
         result = github.github_setup(manifest, repo, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                      admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
-                                     tailscale=settings, force_workflow=force_workflow)
+                                     tailscale=settings, force_workflow=force_workflow, quality_workflow=quality_workflow,
+                                     include_quality=not no_quality_workflow)
         result["tailscale"] = origin
         return 0, result
     _execute(action, json_output)
