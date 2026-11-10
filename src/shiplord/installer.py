@@ -15,6 +15,7 @@ import fnmatch
 import glob
 import hashlib
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
@@ -225,8 +226,13 @@ def _include_patterns(text: str) -> list[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        keyword, _, arguments = stripped.partition("=") if "=" in stripped else stripped.partition(" ")
-        if keyword.strip().lower() == "include":
+        # sshd_config separates a keyword from its arguments with a space, a tab, or "="; splitting on a
+        # space alone would miss a tab-separated Include, and on "=" alone would truncate a path containing one.
+        match = re.fullmatch(r"([A-Za-z]+)(?:\s*=\s*|\s+)(.*)", stripped)
+        if match is None:
+            continue
+        keyword, arguments = match.groups()
+        if keyword.lower() == "include":
             patterns.extend(argument.strip('"') for argument in arguments.split())
     return patterns
 

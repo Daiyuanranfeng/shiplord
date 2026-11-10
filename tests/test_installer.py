@@ -221,6 +221,18 @@ class SshdTests(InstallerTestCase):
         self.run_bootstrap()
         self.assertTrue(self.layout.sshd_dropin.exists())
 
+    def test_a_tab_separated_include_is_accepted(self):
+        self.sshd_config.write_text("Include\tsshd_config.d/*.conf\n")
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
+    def test_an_include_path_containing_an_equals_sign_is_read_whole(self):
+        (self.sshd_config.parent / "a=b.d").mkdir()
+        (self.sshd_config.parent / "a=b.d" / "route.conf").write_text("Include sshd_config.d/*.conf\n")
+        self.sshd_config.write_text("Include a=b.d/route.conf\n")
+        self.run_bootstrap()
+        self.assertTrue(self.layout.sshd_dropin.exists())
+
     def test_a_commented_out_include_does_not_count(self):
         self.sshd_config.write_text("#Include sshd_config.d/*.conf\nPort 22\n")
         with self.assertRaisesRegex(BootstrapError, "does not include"):
