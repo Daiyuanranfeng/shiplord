@@ -35,13 +35,13 @@ def host_key(seed=1, key_type="ssh-ed25519"):
     return key_type, base64.b64encode(field(key_type.encode()) + field(bytes([seed]) * 32)).decode()
 
 
-def manifest(runtime="docker", with_github=False):
+def manifest(runtime="docker", with_github=False, branch="main"):
     value = {"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk", "runtime": runtime,
              "http": {"api_domain": "orders.example.com", "frontend_origins": [], "container_port": 8080,
                       "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
              "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
     if with_github:
-        value["github"] = {"repository": "Example/orders", "deployment_branch": "main"}
+        value["github"] = {"repository": "Example/orders", "deployment_branch": branch}
     return validate_manifest(value)
 
 
@@ -278,6 +278,62 @@ class SetupTests(GitHubTestCase):
             self.setup_call(manifest=manifest(with_github=True), repository="Other/repo")
         with self.assertRaisesRegex(GitHubError, "owner/repository"):
             self.setup_call(repository="not a repo")
+
+    def test_a_workflow_generated_for_trunk_triggers_and_uses_the_subject_on_trunk(self):
+        result = self.setup_call(deployment_branch="trunk")
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["trunk"]', text)
+        self.assertIn("github.ref == 'refs/heads/trunk'", text)
+        self.assertNotIn("refs/heads/main", text)
+        guidance = result["tailscale_setup"]
+        self.assertEqual(guidance["subject_repository"], "repo:Example/orders:ref:refs/heads/trunk")
+        self.assertEqual(guidance["subject_all_repositories"], "repo:Example/*:ref:refs/heads/trunk")
+        self.assertIn("refs/heads/trunk", " ".join(guidance["steps"]))
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        self.assertEqual(result["steps"]["manifest"], "ship.toml names Example/orders on trunk")
+        expected = render_workflow(manifest() | {"github": {"repository": "Example/orders", "deployment_branch": "trunk"}},
+                                   tooling_ref=REF)
+        self.assertEqual(text, expected)
+
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.setup_call()
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["main"]', text)
+        self.assertIn("github.ref == 'refs/heads/main'", text)
+        self.assertEqual(result["tailscale_setup"]["subject_repository"], "repo:Example/orders:ref:refs/heads/main")
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_a_changed_branch_is_recorded_without_touching_the_rest_of_ship_toml(self):
+        self.setup_call()
+        text = (self.project / "ship.toml").read_text()
+        text = text.replace('deployment_branch = "main"', 'deployment_branch = "main"  # current release branch')
+        (self.project / "ship.toml").write_text(text)
+        self.setup_call(deployment_branch="trunk")
+        updated = (self.project / "ship.toml").read_text()
+        self.assertEqual(updated.count("[github]"), 1)
+        self.assertIn('deployment_branch = "trunk"  # current release branch', updated)
+        self.assertEqual(updated.replace('deployment_branch = "trunk"', 'deployment_branch = "main"'), text)
+        self.assertIn('branches: ["trunk"]', (self.project / WORKFLOW_PATH).read_text())
+
+    def test_a_github_section_without_a_branch_gets_the_default_and_a_chosen_one(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call(deployment_branch="trunk")
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call()
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_an_invalid_deployment_branch_is_refused_before_anything_changes(self):
+        before = (self.project / "ship.toml").read_bytes()
+        for branch in ("main..other", ".hidden", "-main", "release/", "main.lock", "main branch"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(GitHubError) as caught:
+                    self.setup_call(deployment_branch=branch)
+                self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
 
     def test_a_failure_registering_leaves_the_key_for_resumption_and_never_stores_the_secret(self):
         self.server.fail_add = True
@@ -575,11 +631,12 @@ class CheckCiTests(unittest.TestCase):
         self.slept = []
         self.now = [0.0]
 
-    def check(self, timeout=1200):
+    def check(self, timeout=1200, **changes):
         def sleep(seconds):
             self.slept.append(seconds)
             self.now[0] += seconds
-        return check_ci(manifest(with_github=True), gh=self.gh, timeout=timeout, clock=lambda: self.now[0], sleep=sleep)
+        return check_ci(manifest(with_github=True, **changes), gh=self.gh, timeout=timeout,
+                        clock=lambda: self.now[0], sleep=sleep)
 
     def test_a_check_dispatches_check_only_on_the_deployment_branch_and_waits_for_the_new_run(self):
         self.gh_runner.views = [{"status": "in_progress"}, check_view()]
@@ -590,6 +647,15 @@ class CheckCiTests(unittest.TestCase):
         self.assertIn("check_only=true", dispatch)
         self.assertEqual(result["steps"]["Deploy"], "skipped")
         self.assertEqual(self.slept, [10])
+
+    def test_a_check_uses_the_configured_branch_for_the_dispatch_and_the_subject(self):
+        self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}
+        self.gh_runner.views = [check_view("failure", "Join the tailnet")]
+        code, result = self.check(branch="trunk")
+        dispatch = next(a for a, _ in self.gh_runner.calls if a[:2] == ["workflow", "run"])
+        self.assertEqual(dispatch[dispatch.index("--ref") + 1], "trunk")
+        self.assertEqual((code, result["failed_step"]), (1, "Join the tailnet"))
+        self.assertEqual(result["subject_expected"], "repo:Example@1/orders@2:ref:refs/heads/trunk")
 
     def test_a_tailscale_refusal_names_the_subject_github_presents(self):
         self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}

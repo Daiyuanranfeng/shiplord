@@ -180,6 +180,7 @@ shutdown_timeout_action = "fail" # "force" (default) or "fail"
 
 ```sh
 shiplord github setup --repo owner/orders --tooling-ref <commit of Shiplord pushed to GitHub>
+# add --deployment-branch <branch> when the release branch is not main
 git add .github/workflows/shiplord-release.yml ship.toml && git commit   # merge to the deployment branch
 shiplord github check-ci            # joins Tailscale and logs in with the CI key; builds and deploys nothing
 shiplord github status --check-server
@@ -198,7 +199,8 @@ Two things stay with you because they need authority Shiplord does not have: the
 with immutable subjects use `repo:Owner@<id>/name@<id>`, not the plain names), prints the policy line and the
 credential settings with every value filled in, asks for the client ID and audience (not secrets), checks they belong
 together, and saves them so the next application's setup does not ask again. Use the owner-wide subject it suggests,
-`repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every repository. `--tailscale-client-id` and
+`repo:Owner@<id>/*:ref:refs/heads/<deployment branch>` (main unless `[github] deployment_branch` says otherwise),
+to do this once for every repository. `--tailscale-client-id` and
 `--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
 production deploy, and gives `id-token: write` only to the jobs that need it. `rotate-key` adds and proves a new key,
 updates GitHub, and only then revokes the old one.
@@ -221,7 +223,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
-| `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
+| `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| (in an app directory)` | Prerequisites; helper probe (`--deep`: Caddy, sshd, Docker, disk, each application); access, helper, DNS. |
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete

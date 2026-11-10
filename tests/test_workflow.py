@@ -12,15 +12,20 @@ from shiplord.workflow import ACTIONS, WorkflowError, render_workflow
 
 REF = "ab" * 20
 
+BASE_MANIFEST = {"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk",
+                 "runtime": "docker", "http": {"api_domain": "orders.example.com", "frontend_origins": [],
+                 "container_port": 8080, "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
+                 "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
+
 
 def manifest(**changes):
-    value = validate_manifest({"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk",
-                               "runtime": "docker", "http": {"api_domain": "orders.example.com", "frontend_origins": [],
-                               "container_port": 8080, "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
-                               "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2},
-                               "github": {"repository": "Example/orders", "deployment_branch": "main"}})
+    value = validate_manifest({**BASE_MANIFEST, "github": {"repository": "Example/orders", "deployment_branch": "main"}})
     value.update(changes)
     return value
+
+
+def manifest_without_branch():
+    return validate_manifest({**BASE_MANIFEST, "github": {"repository": "Example/orders"}})
 
 
 def parse(text: str) -> dict:
@@ -182,6 +187,21 @@ class WorkflowTests(unittest.TestCase):
         data = parse(render_workflow(other, tooling_ref=REF))
         self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["release/prod"])
         self.assertIn("github.ref == 'refs/heads/release/prod'", data["jobs"]["deploy"]["if"])
+
+    def test_a_workflow_generated_for_trunk_triggers_and_deploys_from_trunk(self):
+        trunk = manifest(github={"repository": "Example/orders", "deployment_branch": "trunk"})
+        text = render_workflow(trunk, tooling_ref=REF)
+        data = parse(text)
+        self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["trunk"])
+        self.assertIn("github.ref == 'refs/heads/trunk'", data["jobs"]["deploy"]["if"])
+        self.assertNotIn("refs/heads/main", text)
+
+    def test_the_deployment_branch_defaults_to_main_when_the_manifest_omits_it(self):
+        value = manifest_without_branch()
+        self.assertEqual(value["github"]["deployment_branch"], "main")
+        data = parse(render_workflow(value, tooling_ref=REF))
+        self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["main"])
+        self.assertIn("github.ref == 'refs/heads/main'", data["jobs"]["deploy"]["if"])
 
     def test_invalid_inputs_are_refused(self):
         for kwargs in ({"tooling_ref": "main"}, {"tooling_ref": REF[:-1]}, {"tooling_ref": REF, "platforms": "linux/386"},

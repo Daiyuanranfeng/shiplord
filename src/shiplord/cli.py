@@ -1030,6 +1030,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
                          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
+                         deployment_branch: Optional[str] = typer.Option(None, "--deployment-branch",
+                                                                        help="Branch releases deploy from (default: the manifest's, or main)."),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
                          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
@@ -1040,19 +1042,20 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
 
     def action() -> tuple[int, dict]:
         github.validate_setup_profile(manifest)
+        branch = github.resolve_deployment_branch(manifest, deployment_branch)  # before asking for anything
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
         interactive = sys.stdin.isatty() and not json_output
         try:
             settings, origin = tailscale.resolve(
                 given, ask=_ask_tailscale if interactive else None,
-                guide=lambda: github.tailscale_guidance(gh, repo, manifest))
+                guide=lambda: github.tailscale_guidance(gh, repo, manifest, branch))
         except tailscale.TailscaleError as error:
             raise CommandError(str(error)) from None
         target = load_server(manifest["server"])
         result = github.github_setup(manifest, repo, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                      admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
-                                     tailscale=settings, force_workflow=force_workflow)
+                                     tailscale=settings, deployment_branch=branch, force_workflow=force_workflow)
         result["tailscale"] = origin
         return 0, result
     _execute(action, json_output)

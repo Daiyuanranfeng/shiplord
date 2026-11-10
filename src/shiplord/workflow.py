@@ -6,6 +6,7 @@ import json
 import re
 
 from . import __version__
+from .manifest import configured_branch
 
 TOOLING_REPOSITORY = "QueryPlanner/shiplord"
 WORKFLOW_PATH = ".github/workflows/shiplord-release.yml"
@@ -41,7 +42,7 @@ def render_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str
         raise WorkflowError("platforms must be linux/amd64, linux/arm64, or both separated by a comma")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", tooling_repository):
         raise WorkflowError("invalid tooling repository")
-    branch = manifest.get("github", {}).get("deployment_branch", "main")
+    branch = configured_branch(manifest)
     app = manifest["name"]
     branch_ref = ("refs/heads/" + branch).replace("'", "''")
     quote = json.dumps
