@@ -36,7 +36,7 @@ and its `current` link, the sshd drop-in, and the managed Caddy import and place
 proven by ownership, not by path alone. A launcher is removed only when its bytes are the ones bootstrap writes;
 the sshd drop-in and Caddy placeholder only when they still start with Shiplord's managed marker; a version
 directory only when its name is one bootstrap generates and it holds the `.complete` marker; and a directory only
-when it is empty. Anything else is left in place and named in the report.
+when it is empty and Shiplord owns it. Anything else is left in place and named in the report.
 
 Application artifacts are never deleted, with or without `--force`: registrations, keys, sudoers rules, routes,
 accounts, `/var/lib/shiplord` state, `/opt/shiplord` releases, and native application data under

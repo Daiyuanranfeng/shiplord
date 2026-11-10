@@ -179,6 +179,19 @@ class OwnershipTests(UninstallTestCase):
         self.assertTrue(self.layout.host.exists())  # nothing was unlinked from a directory others can rewrite
         self.assertTrue(self.layout.admin.exists())
 
+    def test_a_managed_directory_is_removed_when_only_its_parent_is_writable_by_others(self):
+        # /opt is group-writable on a GitHub runner; the empty directory Shiplord owns is still safe to remove.
+        self.layout.releases.parent.chmod(0o777)
+        result = self.run_uninstall()
+        self.assertIn("releases", result["removed"]["directories"])
+        self.assertFalse(os.path.lexists(self.layout.releases))
+
+    def test_a_managed_directory_writable_by_others_is_refused_by_name(self):
+        self.layout.releases.chmod(0o777)
+        with self.assertRaisesRegex(UninstallError, "^the releases directory is not trusted$"):
+            self.run_uninstall()
+        self.assertTrue(self.layout.releases.is_dir())
+
     def test_a_launcher_shiplord_did_not_write_is_left_in_place(self):
         foreign = "#!/bin/sh\nexec /bin/true\n"
         self.layout.host.write_text(foreign)

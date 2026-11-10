@@ -52,6 +52,16 @@ def _open(path: Path, message: str) -> int | None:
         raise UninstallError(message) from None
 
 
+def _open_at(directory: int, name: str, message: str) -> int | None:
+    """Open a child directory through its parent's descriptor; None when it does not exist."""
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise UninstallError(message) from None
+
+
 def _trusted(descriptor: int, what: str) -> None:
     """Refuse a directory another account could rewrite; ``what`` names it without a host path."""
     info = os.fstat(descriptor)
@@ -112,24 +122,35 @@ def _remove_artifact(path: Path, matches: Callable[[bytes], bool], what: str) ->
 
 
 def _remove_empty(path: Path, what: str) -> bool:
-    """Remove a directory Shiplord created when it is empty; a directory with content is kept."""
-    directory = _open(path.parent, "a Shiplord directory is unavailable")
-    if directory is None:
+    """Remove a directory Shiplord created when it is empty; a directory with content is kept.
+
+    ``what`` names the directory in a refusal. The directory itself must be ours and unwritable by another
+    account; its parent only supplies the handle, because ``rmdir`` is atomic and refuses a directory that
+    stopped being empty.
+    """
+    parent = _open(path.parent, "a Shiplord directory is unavailable")
+    if parent is None:
         return False
     try:
-        _trusted(directory, what)
+        child = _open_at(parent, path.name, "a Shiplord directory is unavailable")
+        if child is None:
+            return False
         try:
-            os.rmdir(path.name, dir_fd=directory)
+            _trusted(child, what)
+        finally:
+            os.close(child)
+        try:
+            os.rmdir(path.name, dir_fd=parent)
         except FileNotFoundError:
             return False
         except OSError as error:
             if error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
                 return False  # still holds something: it is reported as retained
             raise UninstallError("could not remove an empty Shiplord directory") from None
-        os.fsync(directory)
+        os.fsync(parent)
         return True
     finally:
-        os.close(directory)
+        os.close(parent)
 
 
 def _applications(layout: Layout, lock: HostLock) -> list[str]:
