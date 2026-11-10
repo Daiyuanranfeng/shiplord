@@ -288,6 +288,10 @@ If a worker is killed mid-deployment the journal remains, further deployments ar
 deployed. `--retire` first removes the route, stops the runtime and discards its releases. Application data (the data
 directory, runtime account and Docker volume) is **never** deleted; remove it by hand when you are sure.
 
+From outside the application's checkout, name it and its server together:
+`shiplord deprovision orders --server hetzner-vm --yes`. Both selectors are required, they are used even when the
+current directory has a `ship.toml` for another application, and no manifest is read.
+
 ## Development
 
 ```sh

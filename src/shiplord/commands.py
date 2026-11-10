@@ -93,9 +93,9 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
                "next": "Point DNS for the API hostname at the server, then run `shiplord deploy`."}
 
 
-def deprovision_application(manifest: dict, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
+def deprovision_application(application_id: str, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
     """Remove the application's server-side access; with ``retire``, first stop it and take down its route."""
-    result = admin.call("deprovision", manifest["name"], {"retire": True} if retire else {})
+    result = admin.call("deprovision", application_id, {"retire": True} if retire else {})
     return 0, {"ok": True, **result, "note": "Application data is never deleted; remove it by hand when you are sure."}
 
 
