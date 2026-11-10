@@ -20,7 +20,7 @@ import shiplord
 from shiplord.admin import run as admin_run
 from shiplord.framing import read_frame, write_frame
 from shiplord.installer import DEPLOY_GROUP, bootstrap
-from shiplord.layout import Layout
+from shiplord.layout import Layout, deployment_user
 from shiplord.protocol import PROTOCOL_VERSION
 from shiplord.routing import SubprocessCaddy
 from shiplord.system import CommandResult, HostSystem
@@ -124,13 +124,31 @@ class HostIntegrationTests(unittest.TestCase):
             time.sleep(0.1)
 
     @staticmethod
-    def admin(action, app, arguments):
+    def admin_response(action, app, arguments):
+        """The response and exit code, so a refused action can be asserted on rather than raising."""
         request = {"version": 1, "request_id": "admin-1", "action": action, "application_id": app, "commit": None,
                    "arguments": arguments}
-        response, code = admin_run(request, Layout(), NoSystemd(), {})
+        return admin_run(request, Layout(), NoSystemd(), {})
+
+    @classmethod
+    def admin(cls, action, app, arguments):
+        response, code = cls.admin_response(action, app, arguments)
         if code != 0:
             raise AssertionError(f"admin {action} failed: {response}")
         return response["result"]
+
+    def provisioned_files(self, app="orders"):
+        """The files a provisioning of this application owns, as bytes; a missing file is reported as None."""
+        paths = (self.layout.authorized_keys / deployment_user(app), self.layout.sudoers_dir / f"shiplord-{app}",
+                 self.layout.registrations / f"{app}.json")
+        return {str(path): (path.read_bytes() if path.exists() else None) for path in paths}
+
+    @staticmethod
+    def accounts(app="orders"):
+        """The deployment account and the group membership, as the host reports them."""
+        passwd = subprocess.run(["getent", "passwd", deployment_user(app)], capture_output=True, text=True)
+        group = subprocess.run(["getent", "group", DEPLOY_GROUP], capture_output=True, text=True)
+        return passwd.returncode, passwd.stdout, group.stdout
 
     def login(self, *remote, stdin=b"", extra=(), user="ship-orders"):
         return ssh(self.client_key, self.known_hosts, user, *remote, stdin=stdin, extra=extra)
@@ -174,6 +192,39 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertEqual(policy["permittty"], "yes")
         self.assertNotIn("ship-human", subprocess.run(["getent", "group", DEPLOY_GROUP],
                                                       capture_output=True, text=True).stdout)
+
+    def test_a_hostname_owned_by_another_application_is_refused_without_a_trace(self):
+        """A conflict must be found before the account, the key, and the sudoers rule exist."""
+        files, accounts = self.provisioned_files(), self.accounts()
+        response, code = self.admin_response("provision", "billing", {
+            "runtime": "docker", "api_domain": "orders.example.com", "image_repository": "ghcr.io/example/billing",
+            "public_key": (self.work / "client.pub").read_text(), "key_label": "laptop"})
+        self.assertEqual(code, 1, response)
+        self.assertIn("hostname is already registered", response["message"])
+        self.assertEqual((self.provisioned_files(), self.accounts()), (files, accounts))
+        for path in (self.layout.authorized_keys / "ship-billing", self.layout.sudoers_dir / "shiplord-billing",
+                     self.layout.environments / "billing", self.layout.app_state / "billing",
+                     self.layout.registrations / "billing.json"):
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(subprocess.run(["getent", "passwd", "ship-billing"], capture_output=True).returncode, 2)
+
+    def test_a_refused_re_provision_grants_no_access(self):
+        """The key handed to a refused re-provision must not be able to deploy, and nothing may change."""
+        replacement = self.work / "replacement"
+        subprocess.run(["ssh-keygen", "-q", "-N", "", "-t", "ed25519", "-f", str(replacement)], check=True)
+        files, accounts = self.provisioned_files(), self.accounts()
+        environment = sorted(path.name for path in (self.layout.environments / "orders").iterdir())
+        response, code = self.admin_response("provision", "orders", {
+            "runtime": "docker", "api_domain": "changed.example.com", "image_repository": "ghcr.io/example/orders",
+            "public_key": (self.work / "replacement.pub").read_text(), "key_label": "replacement"})
+        self.assertEqual(code, 1, response)
+        self.assertIn("differs", response["message"])
+        self.assertEqual((self.provisioned_files(), self.accounts()), (files, accounts))
+        self.assertEqual(sorted(path.name for path in (self.layout.environments / "orders").iterdir()), environment)
+        self.assertNotIn(b"shiplord:replacement", (self.layout.authorized_keys / "ship-orders").read_bytes())
+        refused = ssh(replacement, self.known_hosts, "ship-orders", "/usr/local/libexec/shiplord-dispatch",
+                      stdin=capabilities_frame("orders"))
+        self.assertEqual(refused.returncode, 255, refused.stderr)
 
     def test_an_account_provisioned_after_bootstrap_is_confined(self):
         """The drop-in is written at bootstrap; this account and its key are created afterwards."""
