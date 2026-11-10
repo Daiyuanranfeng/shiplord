@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shiplord.layout import Layout
-from shiplord.runtime import MAX_LOG_BYTES, DockerRuntime, RuntimeFailure, release_id
+from shiplord.runtime import (MAX_FOLLOW_SECONDS, MAX_LOG_BYTES, DockerRuntime, RuntimeFailure, release_id,
+                              validate_follow_timeout, validate_since)
 from shiplord.system import CommandError, CommandResult, run_command
 
 ID_A, ID_B = "a" * 64, "b" * 64
@@ -50,6 +51,44 @@ class FakeDocker:
 
     def sub(self, name):
         return [c for c in self.calls if (" ".join(c[1:3]) if c[1] in ("image", "volume") else c[1]) == name]
+
+
+class StreamingDocker(FakeDocker):
+    """A Docker whose follow stream is scripted; the argv and deadline are what the test inspects."""
+
+    def __init__(self):
+        super().__init__()
+        self.stream_calls: list[tuple[list[str], float]] = []
+        self.chunks = ["one\n", "two\n"]
+        self.reason = "timeout"
+
+    def stream(self, argv, *, timeout, on_chunk):
+        self.stream_calls.append((list(argv), timeout))
+        for chunk in self.chunks:
+            on_chunk(chunk)
+        return self.reason
+
+
+class LabelledDocker:
+    """Answers ``docker ps`` from the labels in its own argv, so release selection is what is under test."""
+
+    def __init__(self, containers):
+        self.containers = containers  # (id, labels) newest first, like docker ps -aq
+        self.calls: list[list[str]] = []
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[1] != "ps":
+            return CommandResult(0, "the current release\n")
+        wanted = {}
+        for part in argv:
+            if part.startswith("label="):
+                key, value = part[len("label="):].split("=", 1)
+                wanted[key] = value
+        matches = [identifier for identifier, labels in self.containers
+                   if all(labels.get(key) == value for key, value in wanted.items())]
+        return CommandResult(0, "\n".join(matches) + ("\n" if matches else ""))
 
 
 class RuntimeTestCase(unittest.TestCase):
@@ -406,13 +445,54 @@ class InspectTests(RuntimeTestCase):
         self.assertFalse(self.runtime.is_running(REGISTRATION, configured))
 
     def test_logs_are_bounded_and_empty_without_a_container(self):
-        self.assertEqual(self.runtime.logs(REGISTRATION, 50), "")
+        self.assertEqual(self.runtime.logs(REGISTRATION, None, 50), "")
+        self.assertEqual(self.docker.sub("ps"), [])  # no release means nothing to look for
         self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
         self.docker.results["logs"] = CommandResult(0, "line1\nline2\n")
-        self.assertEqual(self.runtime.logs(REGISTRATION, 10**9), "line1\nline2\n")
+        self.assertEqual(self.runtime.logs(REGISTRATION, release(), 10**9), "line1\nline2\n")
         self.assertEqual(self.docker.sub("logs")[0][2:4], ["--tail", "1000"])
-        self.runtime.logs(REGISTRATION, -5)
+        self.runtime.logs(REGISTRATION, release(), -5)
         self.assertEqual(self.docker.sub("logs")[1][2:4], ["--tail", "1"])
+
+    def test_logs_pass_since_and_timestamps_to_docker(self):
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        self.docker.results["logs"] = CommandResult(0, "2026-11-10T12:00:00Z line\n")
+        self.runtime.logs(REGISTRATION, release(), 25, since="15m", timestamps=True)
+        self.assertEqual(self.docker.sub("logs")[0][1:], ["logs", "--tail", "25", "--since", "15m", "--timestamps", ID_A])
+
+    def test_follow_streams_the_current_release_for_a_bounded_time(self):
+        docker = StreamingDocker()
+        docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        received = []
+        reason = runtime.follow_logs(REGISTRATION, release(), tail=50, since="15m", timestamps=True, duration=120,
+                                     emit=received.append)
+        self.assertEqual((reason, received), ("timeout", ["one\n", "two\n"]))
+        argv, timeout = docker.stream_calls[0]
+        self.assertEqual(timeout, 120)
+        self.assertEqual(argv[1:], ["logs", "--follow", "--tail", "50", "--since", "15m", "--timestamps", ID_A])
+
+    def test_follow_without_the_current_release_returns_immediately(self):
+        self.assertEqual(self.runtime.follow_logs(REGISTRATION, None, tail=10, duration=120), "unavailable")
+        self.assertEqual(self.docker.sub("logs"), [])
+
+    def test_logs_read_only_the_current_releases_container(self):
+        current, stale = release(), release(commit="c", sequence=900)
+        docker = LabelledDocker([(ID_A, {"shiplord.app": "orders", "shiplord.release": release_id(stale)}),
+                                 (ID_B, {"shiplord.app": "orders", "shiplord.release": release_id(current)})])
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        self.assertEqual(runtime.logs(REGISTRATION, current, 50), "the current release\n")
+        self.assertEqual(docker.calls[-1][-1], ID_B)  # not the older release listed first
+        self.assertEqual(docker.calls[0][4:], ["--filter", "label=shiplord.app=orders",
+                                               "--filter", f"label=shiplord.release={release_id(current)}"])
+
+    def test_a_stopped_container_from_an_older_release_is_never_read(self):
+        stale = release(commit="c", sequence=900)
+        docker = LabelledDocker([(ID_A, {"shiplord.app": "orders", "shiplord.release": release_id(stale)})])
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        self.assertEqual(runtime.logs(REGISTRATION, release(), 50), "")
+        self.assertEqual([call for call in docker.calls if call[1] == "logs"], [])
+        self.assertEqual(runtime.follow_logs(REGISTRATION, release(), tail=50), "unavailable")
 
     def test_discard_reports_but_does_not_raise_when_the_image_is_in_use(self):
         self.assertEqual(self.runtime.discard(REGISTRATION, release()), [])
@@ -444,9 +524,25 @@ class LogTruncationTests(unittest.TestCase):
                                      platform_name="linux/amd64")
 
     def test_the_newest_log_lines_survive_the_log_cap(self):
-        logs = self.runtime.logs(REGISTRATION, 50)
+        logs = self.runtime.logs(REGISTRATION, release(), 50)
         self.assertLessEqual(len(logs), MAX_LOG_BYTES)
         self.assertTrue(logs.endswith("the failure\n"))
+
+
+class LogOptionTests(unittest.TestCase):
+    def test_only_relative_durations_both_runtimes_read_are_accepted(self):
+        for value in ("0s", "30s", "15m", "2h", "99999h"):
+            self.assertEqual(validate_since(value), value)
+        for value in ("", "1d", "5", "15 m", "-15m", "2026-11-10T12:00:00Z", "1h; rm -rf /"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_since(value)
+
+    def test_the_follow_timeout_is_bounded_and_never_a_boolean(self):
+        self.assertEqual(validate_follow_timeout(1), 1)
+        self.assertEqual(validate_follow_timeout(MAX_FOLLOW_SECONDS), MAX_FOLLOW_SECONDS)
+        for value in (0, MAX_FOLLOW_SECONDS + 1, True, "60", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_follow_timeout(value)
 
 
 class StorageMountTests(RuntimeTestCase):

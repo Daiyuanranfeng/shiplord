@@ -331,8 +331,24 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(self.get("/version"), "v1")
         self.assertIsNone(self.state.read_journal())
 
-        logs = self.runtime.logs(self.registration, 50)
+        logs = self.runtime.logs(self.registration, self.state.read_state()["current"], 50, timestamps=True)
         self.assertIn("fixture started version=v1", logs)
+        self.assertRegex(logs, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")  # timestamps are real, not invented
+
+        # A stopped container of another release is never read, even when docker lists it first.
+        stale = docker("run", "-d", "--label", f"shiplord.app={self.app}", "--label", "shiplord.release=000000000000",
+                       self.images["v1"]["image"], "sh", "-c", "echo stale-release").stdout.strip()
+        try:
+            self.assertNotIn("stale-release", self.runtime.logs(self.registration, self.state.read_state()["current"], 50))
+        finally:
+            docker("rm", "-f", stale, check=False)
+
+        # Following is bounded by its own deadline, and it starts from --since.
+        chunks = []
+        self.assertEqual(self.runtime.follow_logs(self.registration, self.state.read_state()["current"], tail=10,
+                                                  since="1h", timestamps=True, duration=2, emit=chunks.append),
+                         "timeout")
+        self.assertIn("fixture started version=v1", "".join(chunks))
 
         # preparation failures leave the running container untouched
         before = self.containers()

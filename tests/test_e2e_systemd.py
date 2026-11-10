@@ -251,7 +251,13 @@ class NativeSystemdTests(unittest.TestCase):
                          ("active", "always", "enabled"))  # enabled: it comes back after a reboot
         binary = next(Path(f"/opt/shiplord/{self.app}").glob("*/app"))
         self.assertEqual((binary.stat().st_uid, oct(binary.stat().st_mode & 0o777)), (0, "0o755"))
-        self.assertIn("fixture started version=v1", self.cli("logs", "--tail", "20", check=0).stdout)  # from journald
+        logs = self.cli("logs", "--tail", "20", "--timestamps", check=0).stdout
+        self.assertIn("fixture started version=v1", logs)  # from journald
+        self.assertRegex(logs, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+        self.assertIn("fixture started version=v1", self.cli("logs", "--tail", "20", "--since", "1h", check=0).stdout)
+        followed = self.cli("logs", "--tail", "50", "--follow", "--timeout", "3", check=0)
+        self.assertIn("fixture started version=v1", followed.stdout)
+        self.assertIn("Outcome: stopped at the timeout", followed.stderr)
 
     def test_04_a_crashed_process_is_restarted_by_systemd(self):
         pid = self.show("MainPID")["MainPID"]

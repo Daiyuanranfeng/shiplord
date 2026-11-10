@@ -28,6 +28,26 @@ def frame(message) -> bytes:
     return buffer.getvalue()
 
 
+class FakeProcess:
+    """A process whose stdout already holds the frames a server would stream."""
+
+    def __init__(self, data=b"", *, returncode=None):
+        self.stdout, self.stdin, self.stderr = io.BytesIO(data), io.BytesIO(), io.BytesIO()
+        self.returncode, self.killed, self.waits = returncode, False, 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed, self.returncode = True, -9
+
+
 class ClientTestCase(HelperTestCase):
     """The client's runner is wired straight into the real privileged helper."""
 
@@ -38,11 +58,17 @@ class ClientTestCase(HelperTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = HelperClient("orders", "admin@server.example.com", runner=self.runner,
-                                   payload_runner=self.payload_runner)
+                                   payload_runner=self.payload_runner, stream_runner=self.stream_runner)
 
     def payload_runner(self, command, header, path, timeout):
         self.commands.append(command)
         return self.runner(command, header + path.read_bytes(), timeout)
+
+    def stream_runner(self, command, payload, timeout):
+        self.commands.append(command)
+        output = io.BytesIO()
+        code = serve(io.BytesIO(payload), output, self.factory)
+        return FakeProcess(output.getvalue(), returncode=code)
 
     def runner(self, command, payload, timeout):
         self.commands.append(command)
@@ -85,6 +111,45 @@ class HelperClientTests(ClientTestCase):
         with self.assertRaises(ClientError) as caught:
             garbage.call("status")
         self.assertEqual(caught.exception.code, 3)
+
+    def follow(self, data, *, on_chunk=lambda chunk: None, request_id="r1"):
+        self.process = FakeProcess(data)
+        client = HelperClient("orders", "a@h", stream_runner=lambda command, payload, timeout: self.process)
+        return client.follow("logs", arguments={"tail": 5, "follow": True}, timeout=10, on_chunk=on_chunk,
+                             request_id=request_id)
+
+    def test_follow_reads_streamed_frames_until_the_final_result(self):
+        chunks = []
+        data = (frame({"status": "stream", "request_id": "r1", "chunk": "one\n"})
+                + frame({"status": "stream", "request_id": "r1", "chunk": "two\n"})
+                + frame({"status": "ok", "request_id": "r1", "result": {"stopped": "timeout", "release": "a" * 12}}))
+        self.assertEqual(self.follow(data, on_chunk=chunks.append),
+                         {"stopped": "timeout", "release": "a" * 12})
+        self.assertEqual(chunks, ["one\n", "two\n"])
+        self.assertTrue(self.process.stdout.closed)
+
+    def test_follow_reports_a_stream_cut_short(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "stream", "request_id": "r1", "chunk": "one\n"}))
+        self.assertEqual(caught.exception.code, 3)
+
+    def test_follow_surfaces_a_server_error_frame_and_closes_the_process(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "error", "request_id": "r1", "error": "failed", "message": "disk is full"}))
+        self.assertEqual(str(caught.exception), "disk is full")
+        self.assertTrue(self.process.killed)  # the process was still running, so it is stopped
+
+    def test_follow_rejects_an_uncorrelated_frame(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "ok", "request_id": "other", "result": {}}))
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_follow_closes_the_process_when_the_caller_interrupts(self):
+        def interrupt(_chunk):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.follow(frame({"status": "stream", "request_id": "r1", "chunk": "one\n"}), on_chunk=interrupt)
+        self.assertTrue(self.process.killed)
 
 
 class DeployFlowTests(ClientTestCase):

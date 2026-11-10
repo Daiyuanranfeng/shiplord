@@ -17,7 +17,8 @@ from .client import AdminClient, ClientError, HelperClient, new_request_id, subm
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
-from .runtime import RuntimeFailure
+from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_LOG_LINES, RuntimeFailure, validate_follow_timeout,
+                      validate_since)
 from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
@@ -296,10 +297,32 @@ def application_status(client: HelperClient, job_id: str | None = None) -> tuple
     return 0, {"ok": True, **response["result"]}
 
 
-def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
-    if not 1 <= tail <= 1000:
-        raise CommandError("--tail must be between 1 and 1000")
-    return 0, {"ok": True, "logs": client.call("logs", arguments={"tail": tail})["result"]["logs"]}
+def application_logs(client: HelperClient, tail: int, *, since: str | None = None, timestamps: bool = False,
+                     follow: bool = False, timeout: int = DEFAULT_FOLLOW_SECONDS,
+                     on_chunk: Callable[[str], None] | None = None) -> tuple[int, dict]:
+    """Read the current release's logs, or stream them for a bounded time when ``follow`` is set."""
+    if not 1 <= tail <= MAX_LOG_LINES:
+        raise CommandError(f"--tail must be between 1 and {MAX_LOG_LINES}")
+    arguments: dict = {"tail": tail}
+    if since is not None:
+        try:
+            arguments["since"] = validate_since(since)
+        except ValueError as error:
+            raise CommandError(str(error)) from None
+    if timestamps:
+        arguments["timestamps"] = True
+    if not follow:
+        return 0, {"ok": True, "logs": client.call("logs", arguments=arguments)["result"]["logs"]}
+    try:
+        duration = validate_follow_timeout(timeout)
+    except ValueError as error:
+        raise CommandError(str(error)) from None
+    if on_chunk is None:
+        raise CommandError("following logs needs an output stream")
+    arguments.update({"follow": True, "timeout": duration})
+    result = client.follow("logs", arguments=arguments, timeout=duration, on_chunk=on_chunk)
+    return 0, {"ok": True, "logs": "", "stopped": result.get("stopped", "ended"),
+               "release": result.get("release")}
 
 
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,

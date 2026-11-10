@@ -231,13 +231,32 @@ class QueryCommandTests(ClientTestCase):
         code, plan = commands.plan_application(manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000)
         self.assertEqual((code, plan["action"], plan["route_change"]), (0, "deploy", "create"))
         self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
-        self.runtime.logs = lambda registration, tail: f"tail={tail}\n"
+        self.runtime.log_output = "tail=5\n"
         self.assertEqual(commands.application_logs(self.client, 5)[1]["logs"], "tail=5\n")
+        self.assertEqual(self.runtime.log_arguments, {"release": None, "tail": 5, "since": None, "timestamps": False})
         for tail in (0, 1001):
             with self.assertRaises(CommandError):
                 commands.application_logs(self.client, tail)
         code, status = commands.application_status(self.client)
         self.assertEqual((code, status["application"]["current"], status["job"]), (0, None, None))
+
+    def test_follow_passes_bounded_arguments_and_returns_the_stop_reason(self):
+        self.runtime.follow_chunks, self.runtime.follow_stopped = ["line\n"], "timeout"
+        chunks = []
+        code, result = commands.application_logs(self.client, 5, since="15m", timestamps=True, follow=True,
+                                                 timeout=30, on_chunk=chunks.append)
+        self.assertEqual((code, chunks, result["stopped"], result["release"]), (0, ["line\n"], "timeout", None))
+        self.assertEqual(self.runtime.follow_arguments,
+                         {"release": None, "tail": 5, "since": "15m", "timestamps": True, "duration": 30})
+
+    def test_log_options_are_validated_before_any_connection(self):
+        options = ({"since": "1d"}, {"since": 5}, {"follow": True, "timeout": 0},
+                   {"follow": True, "timeout": 3601}, {"follow": True, "on_chunk": None})
+        for choice in options:
+            with self.subTest(choice=choice), self.assertRaises(CommandError):
+                commands.application_logs(self.client, 5, **choice)
+        self.assertEqual(self.commands, [])
+
 
     def test_rollback_and_recover_run_as_jobs_and_return_their_exit_codes(self):
         import shiplord.client as client_module

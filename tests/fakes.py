@@ -40,6 +40,11 @@ class FakeRuntime:
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
         self.discarded: list[str] = []
+        self.log_output = ""
+        self.log_arguments: dict | None = None
+        self.follow_chunks: list[str] = []
+        self.follow_stopped = "ended"
+        self.follow_arguments: dict | None = None
 
     def prepare(self, registration, release):
         self.calls.append(("prepare", release_id(release)))
@@ -65,8 +70,16 @@ class FakeRuntime:
     def is_running(self, registration, release):
         return release_id(release) in self.running
 
-    def logs(self, registration, tail):
-        return ""
+    def logs(self, registration, release, tail, *, since=None, timestamps=False):
+        self.log_arguments = {"release": release, "tail": tail, "since": since, "timestamps": timestamps}
+        return self.log_output
+
+    def follow_logs(self, registration, release, *, tail, since=None, timestamps=False, duration=300, emit=lambda c: None):
+        self.follow_arguments = {"release": release, "tail": tail, "since": since, "timestamps": timestamps,
+                                 "duration": duration}
+        for chunk in self.follow_chunks:
+            emit(chunk)
+        return self.follow_stopped
 
     def discard(self, registration, release):
         self.discarded.append(release["artifact"]["image"])

@@ -22,6 +22,7 @@ from .configure import ConfigurationError, collect_answers, create_manifest
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
+from .runtime import DEFAULT_FOLLOW_SECONDS, MAX_FOLLOW_SECONDS, MAX_LOG_LINES
 from .servers import (InvalidTarget, ServerError, SshOptions, SSHCheckError, list_servers, load_server, register_server,
                       validate_target)
 from .template import TemplateError, create_project
@@ -884,27 +885,59 @@ def status(application: Optional[str] = typer.Argument(None, metavar="APP"),
 @app.command(rich_help_panel="Quick start")
 def logs(application: Optional[str] = typer.Argument(None, metavar="APP"),
          server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
-         tail: int = typer.Option(100, "--tail"),
+         tail: int = typer.Option(100, "--tail", help=f"Show at most this many lines (1-{MAX_LOG_LINES})."),
+         since: Optional[str] = typer.Option(None, "--since",
+                                            help="Only lines newer than a duration: 30s, 15m or 2h."),
+         timestamps: bool = typer.Option(False, "--timestamps", help="Prefix each line with its timestamp."),
+         follow: bool = typer.Option(False, "--follow", "-f",
+                                     help="Stream new lines until interrupted or --timeout expires."),
+         timeout: int = typer.Option(DEFAULT_FOLLOW_SECONDS, "--timeout",
+                                     help=f"Stop following after this many seconds (1-{MAX_FOLLOW_SECONDS}, "
+                                          f"default {DEFAULT_FOLLOW_SECONDS})."),
          json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
-    """Show recent application logs (bounded)."""
+    """Show the current release's logs, optionally following them.
+
+    Timestamps are off unless --timestamps is given. --follow streams the current release's
+    output and is bounded: it stops after --timeout seconds (1-3600, default 300) or when
+    interrupted with Ctrl-C.
+    """
+    if follow and json_output:
+        _fail("--follow streams text and cannot be combined with --json", 2, json_output)
     try:
         app_name, server_alias, client = _app_context(application, server, json_output, "logs")
     except (CommandError, ClientError, ManifestError, ServerError) as error:
         _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
+    target = f"{app_name} on {server_alias}" if server_alias else app_name
+    if not json_output:
+        typer.echo(f"Target: {target}", err=True)
+
+    def write(chunk: str) -> None:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
     try:
-        _code, result = commands.application_logs(client, tail)
+        _code, result = commands.application_logs(client, tail, since=since, timestamps=timestamps,
+                                                  follow=follow, timeout=timeout, on_chunk=write)
+    except KeyboardInterrupt:
+        typer.echo("Stopped following logs.", err=True)
+        raise typer.Exit(130)
     except (CommandError, ClientError) as error:
         _fail(_recovery_hint(str(error)), error.code, json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
     if json_output:
         _emit(result, True)
-    else:
-        lines = len(result["logs"].splitlines())
-        target = f"{app_name} on {server_alias}" if server_alias else app_name
-        typer.echo(f"Target: {target}", err=True)
-        typer.echo(f"Outcome: retrieved {lines} log {'line' if lines == 1 else 'lines'}", err=True)
-        sys.stdout.write(result["logs"])
+        return
+    if follow:
+        stopped = result.get("stopped")
+        outcome = {"timeout": "stopped at the timeout", "ended": "the stream ended",
+                   "unavailable": "no logs for the current release"}.get(stopped, stopped)
+        release = result.get("release")
+        typer.echo(f"Outcome: {outcome}" + (f" (release {release})" if release else ""), err=True)
+        return
+    lines = len(result["logs"].splitlines())
+    typer.echo(f"Outcome: retrieved {lines} log {'line' if lines == 1 else 'lines'}", err=True)
+    sys.stdout.write(result["logs"])
 
 
 @app.command(rich_help_panel="Administration")

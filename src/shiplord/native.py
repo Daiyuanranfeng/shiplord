@@ -14,10 +14,11 @@ import secrets
 import shutil
 import stat
 from pathlib import Path
+from typing import Callable
 
 from .environment import EnvironmentError_, load_environment_file
 from .layout import Layout, runtime_user
-from .runtime import RuntimeFailure, release_id
+from .runtime import DEFAULT_FOLLOW_SECONDS, RuntimeFailure, release_id
 from .system import CommandError, System
 
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -234,14 +235,47 @@ class NativeRuntime:
         state = dict(line.split("=", 1) for line in result.output.splitlines() if "=" in line)
         return result.code == 0 and state.get("ActiveState") == "active" and state.get("SubState") == "running"
 
-    def logs(self, registration: dict, tail: int) -> str:
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str:
+        """The journal of the current release's unit only; a unit left by another release is not read."""
+        if not self._current_unit(registration, release):
+            return ""
         tail = max(1, min(int(tail), MAX_LOG_LINES))
+        argv = [JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail)]
+        if since is not None:
+            argv.append(f"--since=-{since}")
+        argv += ["--no-pager", "--output", "short-iso-precise" if timestamps else "cat"]
         try:
-            result = self.system.run([JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail),
-                                      "--no-pager", "--output", "cat"], timeout=30, max_output=MAX_LOG_BYTES)
+            result = self.system.run(argv, timeout=30, max_output=MAX_LOG_BYTES)
         except CommandError:
             return ""
         return result.output if result.code == 0 else ""
+
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str:
+        """Stream the current release's journal until ``duration`` expires; returns the stop reason."""
+        if not self._current_unit(registration, release):
+            return "unavailable"
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        argv = [JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail), "--follow"]
+        if since is not None:
+            argv.append(f"--since=-{since}")
+        argv += ["--no-pager", "--output", "short-iso-precise" if timestamps else "cat"]
+        try:
+            return self.system.stream(argv, timeout=duration, on_chunk=emit)
+        except CommandError as error:
+            raise RuntimeFailure(f"journalctl could not complete ({error.kind})", "logs") from None
+
+    def _current_unit(self, registration: dict, release: dict | None) -> bool:
+        if release is None:
+            return False
+        try:
+            marker = MARKER.search(self.unit_path(registration).read_text())
+        except OSError:
+            return False
+        return bool(marker and marker.group(1) == release_id(release))
+
 
     def discard(self, registration: dict, release: dict) -> list[str]:
         directory = self.release_binary(registration, release).parent

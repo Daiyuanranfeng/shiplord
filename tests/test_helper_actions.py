@@ -137,10 +137,60 @@ class ReadOnlyActionTests(HelperTestCase):
         with self.assertRaises(Exception):
             self.call("status", job_id="../etc/passwd")
 
-    def test_logs_return_the_runtime_output(self):
-        self.runtime.logs = lambda registration, tail: f"tail={tail}\n"
-        self.assertEqual(self.call("logs", tail=7)[0]["result"], {"logs": "tail=7\n"})
-        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=100\n"})
+    def test_logs_return_the_runtime_output_with_the_requested_options(self):
+        self.runtime.log_output = "tail=7\n"
+        self.assertEqual(self.call("logs", tail=7, since="15m", timestamps=True)[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 7, "since": "15m", "timestamps": True})
+        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 100, "since": None, "timestamps": False})
+
+    def test_logs_read_the_release_that_is_current(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.call("logs", tail=5)
+        self.assertEqual(self.runtime.log_arguments["release"], self.state.read_state()["current"])
+
+    def test_logs_never_take_the_host_lock(self):
+        output = io.BytesIO()
+        self.runtime.follow_chunks = ["line\n"]
+        with patch.object(HostLock, "acquire", side_effect=AssertionError("logs must not lock the host")):
+            self.assertEqual(self.call("logs")[0]["result"], {"logs": ""})
+            response, code = dispatch(self.envelope("logs", follow=True, timeout=5), self.registration, self.factory,
+                                      destination=output)
+        self.assertEqual((response, code), (None, 0))
+        self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["status"], "stream")
+
+    def test_follow_streams_frames_and_a_final_result(self):
+        self.runtime.follow_chunks, self.runtime.follow_stopped = ["one\n", "two\n"], "timeout"
+        output = io.BytesIO()
+        response, code = dispatch(self.envelope("logs", tail=5, follow=True, timeout=30), self.registration,
+                                  self.factory, destination=output)
+        self.assertEqual((response, code), (None, 0))
+        stream = io.BytesIO(output.getvalue())
+        frames = [read_frame(stream), read_frame(stream), read_frame(stream)]
+        self.assertEqual(frames[0], {"status": "stream", "request_id": "req-1", "chunk": "one\n"})
+        self.assertEqual(frames[1]["chunk"], "two\n")
+        self.assertEqual(frames[2], {"status": "ok", "request_id": "req-1",
+                                     "result": {"stopped": "timeout", "release": None}})
+        self.assertEqual(stream.read(1), b"")  # nothing follows the final frame
+        self.assertEqual(self.runtime.follow_arguments,
+                         {"release": None, "tail": 5, "since": None, "timestamps": False, "duration": 30})
+
+    def test_a_follow_request_needs_a_destination_stream(self):
+        with self.assertRaises(ProtocolError):
+            self.call("logs", follow=True)
+        self.assertEqual(self.factory_calls, 0)
+
+    def test_log_options_are_validated_before_any_host_state_is_opened(self):
+        bad = [{"since": "1d"}, {"since": 5}, {"timestamps": "yes"}, {"follow": "yes"},
+               {"follow": True, "timeout": 0}, {"timeout": 3601}, {"timeout": "60"}, {"unexpected": 1}]
+        for arguments in bad:
+            with self.subTest(arguments=arguments), self.assertRaises(ProtocolError):
+                self.call("logs", **arguments)
+        self.assertEqual(self.factory_calls, 0)
+
 
     def test_plan_describes_the_change_and_changes_nothing(self):
         commit, arguments = self.deploy_arguments()

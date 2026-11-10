@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from shiplord.system import CommandError, HostSystem, run_command
+from shiplord.system import CommandError, HostSystem, run_command, stream_command
 
 
 class RunCommandTests(unittest.TestCase):
@@ -93,6 +93,64 @@ class RunCommandTests(unittest.TestCase):
 
     def test_host_system_runs_commands(self):
         self.assertEqual(HostSystem().run(["/bin/echo", "ok"]).output, "ok\n")
+
+
+class StreamCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+
+    def script(self, body):
+        path = self.directory / "tool"
+        path.write_text("#!/bin/sh\n" + textwrap.dedent(body))
+        path.chmod(0o755)
+        return str(path)
+
+    def test_output_is_forwarded_while_the_command_still_runs(self):
+        chunks = []
+        reason = stream_command([self.script('printf "one\\n"; sleep 0.2; printf "two\\n"\n')], timeout=5,
+                                on_chunk=chunks.append)
+        self.assertEqual((reason, "".join(chunks)), ("ended", "one\ntwo\n"))
+
+    def test_the_deadline_stops_a_stream_that_never_ends(self):
+        started = time.monotonic()
+        chunks = []
+        reason = stream_command([self.script('printf "start\\n"; while true; do sleep 0.05; done\n')], timeout=0.3,
+                                on_chunk=chunks.append)
+        self.assertEqual((reason, "".join(chunks)), ("timeout", "start\n"))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_the_deadline_kills_the_whole_process_group(self):
+        marker = self.directory / "survived"
+        tool = self.script(f"(sleep 2; touch {marker}) &\nwhile true; do sleep 0.05; done\n")
+        self.assertEqual(stream_command([tool], timeout=0.3, on_chunk=lambda chunk: None), "timeout")
+        time.sleep(2.5)
+        self.assertFalse(marker.exists())
+
+    def test_control_characters_are_replaced_but_newlines_are_kept(self):
+        chunks = []
+        stream_command([self.script('printf "a\\033[0mb\\nsecond\\n"\n')], timeout=5, on_chunk=chunks.append)
+        self.assertEqual("".join(chunks), "a?[0mb\nsecond\n")
+
+    def test_a_character_split_across_reads_is_not_replaced(self):
+        chunks = []
+        stream_command([self.script('printf "\\303\\251%.0s" $(seq 40000)\n')], timeout=30, on_chunk=chunks.append)
+        text = "".join(chunks)
+        self.assertNotIn("\ufffd", text)
+        self.assertEqual(text, "\u00e9" * 40000)
+
+    def test_missing_executable_and_invalid_arguments_are_start_errors(self):
+        for argv, timeout in (([str(self.directory / "absent")], 5), ([], 5), (["tool\0x"], 5),
+                              (["/bin/true"], 0)):
+            with self.subTest(argv=argv), self.assertRaises(CommandError) as caught:
+                stream_command(argv, timeout=timeout, on_chunk=lambda chunk: None)
+            self.assertEqual(caught.exception.kind, "start")
+
+    def test_host_system_streams_commands(self):
+        chunks = []
+        self.assertEqual(HostSystem().stream(["/bin/echo", "ok"], timeout=5, on_chunk=chunks.append), "ended")
+        self.assertEqual("".join(chunks), "ok\n")
 
 
 if __name__ == "__main__":
