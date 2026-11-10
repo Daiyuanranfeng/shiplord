@@ -8,6 +8,7 @@ import os
 import ssl
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -193,6 +194,21 @@ class RealCaddyTests(unittest.TestCase):
         with self.lock.acquire():
             self.manager.apply(self.registration(managed_port(set())))
         self.assertEqual([p.name for p in self.root.rglob(".*")], [])
+
+    def test_a_hardened_caddyfile_stays_hardened_and_usable_after_a_rewrite(self):
+        # The import rewrite is the only transaction that replaces the main Caddyfile, and that file can hold a token.
+        import_line = f"import {self.root}/ship/*.caddy\n"
+        text = self.caddyfile.read_text()
+        self.assertTrue(text.endswith(import_line))
+        self.caddyfile.write_text(text[:-len(import_line)])
+        self.caddyfile.chmod(0o640)
+        port = self.start_upstream(b"hardened")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.ensure_import().changed)
+            self.assertEqual(stat.S_IMODE(self.caddyfile.stat().st_mode), 0o640)
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"hardened")
+        self.assertEqual(stat.S_IMODE(self.caddyfile.stat().st_mode), 0o640)
 
 
 if __name__ == "__main__":
