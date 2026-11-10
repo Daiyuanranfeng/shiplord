@@ -97,10 +97,48 @@ shiplord recover
 Create the DNS record for `--api-domain` at your DNS provider; Shiplord checks DNS and reports it but never
 changes it.
 
-For a native Linux binary, configure with `--runtime native` and deploy with
-`shiplord deploy --binary ./dist/orders --commit <sha>`. Build it for the server's architecture (a Linux ELF;
-x86-64 and arm64 are supported), for example in CI. The binary is uploaded over the same SSH connection,
-verified by size, SHA-256 and ELF header on the server, and run as an unprivileged account under a confined
+### Releasing a native binary
+
+For a native Linux binary, configure with `--runtime native` once, then build and deploy. Shiplord does not
+build anything; it uploads the file you name and verifies it.
+
+```sh
+# 1. build a Linux ELF for the server's CPU (x86-64 shown; use arm64 on an arm64 server)
+GOOS=linux GOARCH=amd64 go build -trimpath -o dist/orders ./cmd/orders
+
+# 2. deploy that exact file, tagged with the commit it was built from
+shiplord deploy --binary ./dist/orders --commit "$(git rev-parse HEAD)"
+```
+
+The second command is the whole release. `--commit` must be the full 40-character lowercase commit SHA of a
+SHA-1 repository; `git rev-parse HEAD` prints exactly that. Shiplord accepts exactly 40 lowercase hex characters,
+so a SHA-256 repository's 64-character id is refused. If you omit `--commit`, `shiplord` runs the same command in
+the application directory, so pass it explicitly when the binary was built from another checkout. `--binary` is
+refused for a Docker manifest, and `--image` is refused for a native one.
+
+Before it connects, the CLI reads the file and refuses it unless all of these hold:
+
+- It is between 1 byte and 1 GiB inclusive.
+- It starts with the ELF magic (`0x7f` then `ELF`), is 64-bit (ELF class 2), and is little-endian (ELF data 1).
+- Its ELF type is 2 (executable) or 3 (position-independent executable).
+- Its `e_machine` is `0x3e` (x86-64) or `0xb7` (arm64). Any other CPU architecture is refused.
+
+The server maps `x86_64`/`amd64` to `linux-amd64` and `aarch64`/`arm64` to `linux-arm64` (anything else defaults
+to `linux-amd64`), compares that with the binary's architecture, and refuses the upload before accepting it when
+they differ. It checks the declared size and SHA-256, and the same ELF header, again before installing the
+release. A macOS or Windows binary, a 32-bit binary, or a binary built for the other architecture cannot be
+deployed.
+
+To see what the server would do without uploading anything, run the read-only preview. Releases are ordered by
+the commit's committer timestamp (`git show -s --format=%ct <sha>`); override it with `--sequence` only when two
+releases need a different order. `--sequence` must not be negative.
+
+```sh
+shiplord plan --binary ./dist/orders --commit "$(git rev-parse HEAD)"
+shiplord deploy --binary ./dist/orders --commit "$(git rev-parse HEAD)" --sequence 1763000000
+```
+
+The binary is uploaded over the same SSH connection, and runs as an unprivileged account under a confined
 systemd unit.
 
 ## Existing Docker applications
