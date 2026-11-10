@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import signal
 import sys
@@ -113,14 +114,14 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
         bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}) if False else ("logs", {"tail": 0}),
                ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}), ("deploy", {}),
                ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}), ("rollback", {"x": 1}),
-               ("recover", {"x": 1})]
+               ("recover", {"x": 1}), ("recover", {"force_stop": "yes"}), ("recover", {"force_stop": 1})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
@@ -442,6 +443,32 @@ class WorkerTests(HelperTestCase):
         self.call("recover", "rc-1")
         self.assertEqual(run_job(self.services, "orders", "rc-1"), 0)
         self.assertEqual(self.finished("rc-1")["outcome"]["status"], "nothing_to_recover")
+
+    def test_a_forced_stop_is_carried_into_the_job_and_its_outcome(self):
+        response, code = self.call("recover", "rc-force", force_stop=True)
+        self.assertEqual((code, response["job"]["action"]), (0, "recover"))
+        stored = json.loads((self.layout.jobs / "orders" / "rc-force.json").read_text())
+        self.assertEqual(stored["request"], {"force_stop": True})
+        self.assertEqual(run_job(self.services, "orders", "rc-force"), 0)
+        outcome = self.finished("rc-force")["outcome"]
+        self.assertEqual((outcome["status"], outcome["exit_code"]), ("recovered", 0))
+        self.assertTrue(outcome["detail"]["forced_stop"]["forced"])
+        self.assertFalse(outcome["detail"]["running"])
+
+    def test_a_plain_recovery_job_carries_no_force_stop(self):
+        self.call("recover", "rc-plain")
+        stored = json.loads((self.layout.jobs / "orders" / "rc-plain.json").read_text())
+        self.assertEqual(stored["request"], {})
+
+
+class NativeRecoverTests(HelperTestCase):
+    RUNTIME = "native"
+
+    def test_a_forced_stop_is_refused_for_a_native_application_before_a_job_exists(self):
+        response, code = self.call("recover", "rc-native", force_stop=True)
+        self.assertEqual((code, response["error"]), (2, "invalid_request"))
+        self.assertEqual(self.launcher.launched, [])
+        self.assertFalse((self.layout.jobs / "orders" / "rc-native.json").exists())
 
 
 class ServeTests(HelperTestCase):

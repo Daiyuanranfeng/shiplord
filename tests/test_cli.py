@@ -847,6 +847,19 @@ class CLIInventoryTests(ServerConfigMixin):
                 patch("shiplord.cli.commands.deploy_application", return_value=(code, deploy_result)):
             return CliRunner().invoke(cli.app, arguments)
 
+    def test_recover_force_stop_reaches_the_command_and_help_lists_it(self):
+        recovered = {"ok": True, "request_id": "rc-1", "status": "recovered", "exit_code": 0,
+                     "running": False, "forced_stop": {"forced": True, "signal": "SIGKILL"}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, recovered)) as run:
+            result = CliRunner().invoke(cli.app, ["recover", "--force-stop", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(run.call_args.kwargs["force_stop"])
+        self.assertEqual(run.call_args.args[2], "recover")
+        plain = CliRunner().invoke(cli.app, ["recover", "--help"], color=True)
+        self.assertIn("--force-stop", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
+
     def test_plan_renders_release_route_storage_and_shutdown_changes(self):
         plan_result = {
             "ok": True, "scope": "server plan; nothing was changed", "action": "deploy",

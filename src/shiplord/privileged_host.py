@@ -20,7 +20,7 @@ from .payload import PayloadError, discard_upload, receive_payload
 from .manifest import GENERIC_DOCKER_FEATURE, ManifestError
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
 from .release_state import StateError
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 
 if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities probe must stay light
@@ -31,7 +31,7 @@ UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to fini
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
 ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
-FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE]
+FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE]
 
 
 class _UploadRejected(Exception):
@@ -143,6 +143,21 @@ def _prepare(request: dict):
         if isinstance(artifact, dict) and artifact.get("kind") == "native":
             return (lambda session, source: _submit_native(session, request, payload, source)), True
         return (lambda session, source: _submit(session, request, "deploy", payload)), False
+    if action == "recover":
+        arguments = _arguments(request, {"force_stop"})
+        force_stop = arguments.get("force_stop", False)
+        if type(force_stop) is not bool:
+            raise ProtocolError("force_stop must be a boolean")
+        if request["commit"] is not None:
+            raise ProtocolError("invalid request")
+        payload = {"force_stop": True} if force_stop else {}
+
+        def recover(session, source):
+            if force_stop and session.registration["runtime"] != "docker":
+                return ({"status": "error", "request_id": request_id, "error": "invalid_request",
+                         "message": "a native application has no shutdown policy to force"}, 2)
+            return _submit(session, request, action, payload)
+        return recover, False
     _arguments(request, set())
     if request["commit"] is not None:
         raise ProtocolError("invalid request")

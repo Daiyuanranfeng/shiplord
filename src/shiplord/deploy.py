@@ -188,27 +188,63 @@ class Deployer:
             return Outcome("failed", 1, {"error": "no_previous_release"})
         return self._transition(request_id, committed["previous"], committed)
 
-    def recover(self) -> Outcome:
+    def recover(self, force_stop: bool = False) -> Outcome:
+        if force_stop and self.registration["runtime"] != "docker":
+            return Outcome("rejected", 2, {"error": "invalid_request",
+                                           "message": "--force-stop applies only to a Docker application"})
         try:
-            if self.state.read_journal() is None:
-                return Outcome("nothing_to_recover", 0, {"current": identity(self.state.read_state()["current"])})
-            target = self.state.reconciliation_target()
             journal = self.state.read_journal()
-            check_recovery_budget(journal["candidate"], target)
+            if journal is None:
+                if not force_stop:
+                    return Outcome("nothing_to_recover", 0, {"current": identity(self.state.read_state()["current"])})
+                target = self.state.read_state()["current"]  # report the release that stays recorded, stopped
+            else:
+                target = self.state.reconciliation_target()
+                check_recovery_budget(journal["candidate"], target)
         except StateError as error:
             return Outcome("intervention_required", 6, {"error": "state_inconsistent", "message": str(error)})
         except ShutdownError as error:
             return Outcome("intervention_required", 6, {"error": "recovery_budget_exceeded", "message": str(error)})
         try:
-            candidate = self.state.read_journal()["candidate"]
-            self._reconcile(target, route=True)
-            self.state.clear_after_reconciliation()
+            candidate = None if journal is None else journal["candidate"]
+            if force_stop:
+                # The explicit escape hatch: kill a process that outlived a `fail` deadline, then leave the
+                # application stopped. Restarting the release that ignores its stop signal would block the next
+                # deploy or retire on the same deadline.
+                forced = self._force_stop()
+                self.routes.reconcile(self.app, None)
+            else:
+                forced = {}
+                self._reconcile(target, route=True)
+            if journal is not None:
+                self.state.clear_after_reconciliation()
             committed = self.state.read_state()
         except (RuntimeFailure, ProbeFailure, RoutingError, _StepFailure, StateError) as failure:
             return Outcome("intervention_required", 6, {"error": "recovery_failed", **self._describe(failure)})
         # The interrupted candidate's artifact goes unless it became the committed release or another one uses it.
-        warnings = self._abandon(candidate, {"current": committed["current"], "previous": committed["previous"]})
-        return Outcome("recovered", 0, {"target": identity(target), "warnings": warnings})
+        warnings = [] if candidate is None else self._abandon(
+            candidate, {"current": committed["current"], "previous": committed["previous"]})
+        running = False if target is None else self.runtime.is_running(self.registration, target)
+        detail = {"target": identity(target), "warnings": warnings}
+        if force_stop:
+            detail.update({"running": running, **forced})
+        return Outcome("recovered", 0, detail)
+
+    def _force_stop(self) -> dict:
+        """Kill whatever runs for the application and report it for the job's audit record."""
+        force_stop = getattr(self.runtime, "force_stop", None)
+        if force_stop is None:
+            raise RuntimeFailure("this runtime cannot stop a process that ignores its signal", "stop")
+        force_stop(self.registration, self.state)
+        for report in getattr(self.runtime, "stop_report", None) or []:
+            if report.get("forced"):
+                return {"forced_stop": {"forced": True, "signal": "SIGKILL",
+                                        "policy": {"timeout_seconds": report["timeout_seconds"],
+                                                   "action": report["action"]},
+                                        "stages": list(report["stages"]),
+                                        "elapsed_seconds": report.get("elapsed_seconds")}}
+        return {}
+
 
     def status(self) -> dict:
         committed = self.state.read_state()
@@ -296,9 +332,12 @@ class Deployer:
 
     def _intervention(self, failure: Exception, probes: dict) -> Outcome:
         """Retain the journal: the stop attempt cannot be retracted, so only a verified recovery may end it."""
+        recovery = "run `shiplord recover` once the application has exited"
+        if getattr(failure, "kind", "") == "shutdown_timeout":
+            recovery += ", or `shiplord recover --force-stop` to kill it"
         return Outcome("intervention_required", 6, {"error": "intervention_required", **self._describe(failure),
                                                      "probes": probes, **self._shutdown_report(),
-                                                     "recovery": "run `shiplord recover` once the application has exited"})
+                                                     "recovery": recovery})
 
     def _advance(self, phase: str) -> None:
         self.progress(phase, {})

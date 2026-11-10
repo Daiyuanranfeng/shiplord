@@ -11,6 +11,7 @@ from unittest.mock import patch
 from shiplord import routing
 from shiplord.release_state import HostLock
 from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, render_route
+from shiplord.system import TRUNCATION_MARKER, CommandError, CommandResult
 
 
 def registration(app="orders", domain="orders.example.com", port=20000):
@@ -878,6 +879,121 @@ class SubprocessCaddyTests(unittest.TestCase):
         with self.assertRaises(RoutingError) as caught:
             SubprocessCaddy("/bin/true", systemctl).reload()
         self.assertEqual(caught.exception.kind, "reload")
+
+    def test_validation_receives_the_environment_the_caddy_service_runs_with(self):
+        out = self.directory / "token"
+        caddy = self.script("caddy", f'printf "%s" "$CF_API_TOKEN" > {out}\n')
+        SubprocessCaddy(caddy, service_environment=lambda: {"CF_API_TOKEN": "fake-token-value"}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), "fake-token-value")
+
+    def test_the_throwaway_directories_override_ones_the_service_sets(self):
+        out = self.directory / "home"
+        caddy = self.script("caddy", f'printf "%s|%s|%s" "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" > {out}\n')
+        service = {"HOME": "/var/lib/caddy", "XDG_DATA_HOME": "/var/lib/caddy", "XDG_CONFIG_HOME": "/var/lib/caddy"}
+        SubprocessCaddy(caddy, service_environment=lambda: service).validate(Path("/x"))
+        home, data, config = out.read_text().split("|")
+        self.assertEqual((home, config), (data, data))
+        self.assertIn("shiplord-caddy-validate-", home)
+        self.assertFalse(Path(home).exists())  # removed afterwards, with anything Caddy wrote there
+
+    def test_a_service_variable_overrides_the_fixed_defaults(self):
+        out = self.directory / "lang"
+        caddy = self.script("caddy", f'printf "%s" "$LANG" > {out}\n')
+        SubprocessCaddy(caddy, service_environment=lambda: {"LANG": "C.UTF-8"}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), "C.UTF-8")
+
+    def test_an_unreadable_service_environment_keeps_the_fixed_environment(self):
+        out = self.directory / "env"
+        caddy = self.script("caddy", f'env > {out}\n')
+        os.environ["SHIPLORD_SECRET_TEST"] = "do-not-leak"
+        self.addCleanup(os.environ.pop, "SHIPLORD_SECRET_TEST", None)
+        SubprocessCaddy(caddy, service_environment=lambda: None).validate(Path("/x"))
+        names = {line.split("=", 1)[0] for line in out.read_text().splitlines()}
+        self.assertNotIn("SHIPLORD_SECRET_TEST", names)
+        self.assertEqual(names & {"PATH", "LANG", "HOME"}, {"PATH", "LANG", "HOME"})
+
+    def test_service_values_are_removed_from_captured_output_but_reach_the_child(self):
+        out = self.directory / "token"
+        token = "fake-token-value"
+        caddy = self.script("caddy", f'printf "%s" "$CF_API_TOKEN" > {out}\nprintf "failed for {token}\\n"\nexit 3\n')
+        with self.assertRaises(RoutingError) as caught:
+            SubprocessCaddy(caddy, service_environment=lambda: {"CF_API_TOKEN": token}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), token)  # the value is what validation is for
+        self.assertNotIn(token, caught.exception.detail)
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIn("[shiplord:redacted]", caught.exception.detail)
+
+
+class FakeSystem:
+    """Answers the systemd probe with scripted output, and records the command it was asked to run."""
+
+    def __init__(self, output="", code=0, error=None):
+        self.output, self.code, self.error = output, code, error
+        self.calls = []
+
+    def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if self.error is not None:
+            raise self.error
+        return CommandResult(self.code, self.output)
+
+
+class ServiceEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+
+    def test_the_unit_probe_asks_for_the_two_documented_properties(self):
+        system = FakeSystem()
+        routing.service_environment(system, ())
+        self.assertEqual(system.calls, [["/usr/bin/systemctl", "show", "caddy",
+                                         "--property=Environment", "--property=EnvironmentFiles"]])
+
+    def test_environment_words_honour_quotes_and_escapes(self):
+        self.assertEqual(routing.parse_environment_list(r'A=1 B="two words" C=three\ four D="line\nbreak"'),
+                         {"A": "1", "B": "two words", "C": "three four", "D": "line\nbreak"})
+        self.assertEqual(routing.parse_environment_list(""), {})
+
+    def test_environment_files_drop_comments_and_malformed_lines(self):
+        text = ('# comment\n; also a comment\nA=1\nB="two words"\nC=\'literal $x\'\nexport D=4\n'
+                'E="unterminated\nF=has space\nG=\n')
+        self.assertEqual(routing.parse_environment_file(text),
+                         {"A": "1", "B": "two words", "C": "literal $x", "F": "has space", "G": ""})
+
+    def test_the_unit_environment_and_its_environment_files_are_applied(self):
+        env_file = self.directory / "caddy.env"
+        env_file.write_text("FROM_FILE=yes\n")
+        for property in ("EnvironmentFiles", "EnvironmentFile"):  # the singular is what older systemctl printed
+            with self.subTest(property):
+                system = FakeSystem(f"Environment=FROM_UNIT=1\n{property}={env_file} (ignore_errors=no)\n")
+                self.assertEqual(routing.service_environment(system, ()), {"FROM_UNIT": "1", "FROM_FILE": "yes"})
+
+    def test_a_relative_environment_file_is_ignored(self):
+        system = FakeSystem("EnvironmentFiles=caddy.env (ignore_errors=no)\n")
+        self.assertEqual(routing.service_environment(system, ()), {})
+
+    def test_a_failed_or_truncated_systemd_answer_falls_back_to_the_packaged_defaults(self):
+        defaults = self.directory / "default-caddy"
+        defaults.write_text("PACKAGED=yes\n")
+        for label, system in {
+            "non-zero exit": FakeSystem("Environment=PARTIAL=1\n", code=1),
+            "truncated": FakeSystem(TRUNCATION_MARKER + "Environment=PARTIAL=1\n"),
+            "cannot run": FakeSystem(error=CommandError("could not start the command", "start")),
+        }.items():
+            with self.subTest(label):
+                self.assertEqual(routing.service_environment(system, (defaults,)), {"PACKAGED": "yes"})
+
+    def test_no_readable_source_yields_no_variables(self):
+        self.assertEqual(routing.service_environment(FakeSystem("", code=1), (self.directory / "absent",)), {})
+
+    def test_a_source_that_is_not_a_regular_file_is_ignored(self):
+        self.assertEqual(routing.service_environment(FakeSystem(), (self.directory,)), {})
+
+    def test_the_process_environment_is_never_read(self):
+        os.environ["SHIPLORD_SECRET_TEST"] = "do-not-leak"
+        self.addCleanup(os.environ.pop, "SHIPLORD_SECRET_TEST", None)
+        self.assertEqual(routing.service_environment(FakeSystem("Environment=\nEnvironmentFiles=\n"), ()), {})
 
 
 if __name__ == "__main__":
