@@ -64,7 +64,13 @@ def job_view(session: AppSession, record: dict) -> dict:
     state = record["state"]
     if state in ("queued", "running") and not session.services.launcher.is_active(
             session.application_id, record["request_id"]):
-        state = "interrupted"
+        # The worker records its outcome before its unit exits, so the record can be newer than the caller's copy:
+        # a finished record means the job ended, not that the worker vanished.
+        latest = session.jobs.get(record["request_id"])
+        if latest is not None and latest["state"] == "finished":
+            record, state = latest, "finished"
+        else:
+            state = "interrupted"
     return {"request_id": record["request_id"], "action": record["action"], "state": state, "phase": record["phase"],
             "submitted_at": record["submitted_at"], "started_at": record["started_at"],
             "finished_at": record["finished_at"], "outcome": record["outcome"]}

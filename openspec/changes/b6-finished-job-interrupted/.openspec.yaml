@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-10
+goal: Report a finished job as finished, not interrupted, when its unit is
+  already gone

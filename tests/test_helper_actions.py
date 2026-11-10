@@ -16,12 +16,12 @@ from shiplord.host import HostDeadline  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.jobs import JobError  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
-from shiplord.privileged_host import dispatch, serve  # noqa: E402
+from shiplord.privileged_host import dispatch, job_view, serve  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION, ProtocolError  # noqa: E402
 from shiplord.registry import Registry  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
-from shiplord.services import HostServices  # noqa: E402
+from shiplord.services import AppSession, HostServices  # noqa: E402
 from shiplord.worker import run_job  # noqa: E402
 
 
@@ -205,6 +205,32 @@ class DeployJobTests(HelperTestCase):
         self.assertEqual(self.call("status", job_id="req-1")[0]["result"]["job"]["state"], "queued")
         self.launcher.active = False
         self.assertEqual(self.call("status", job_id="req-1")[0]["result"]["job"]["state"], "interrupted")
+
+    def test_a_job_that_finished_while_its_unit_vanished_is_not_reported_as_interrupted(self):
+        self.submit_deploy()
+        with AppSession(self.services, "orders") as session:
+            stale = session.jobs.get("req-1")  # a status poll read this while the worker was still queued
+            self.assertEqual(stale["state"], "queued")
+            self.assertEqual(run_job(self.services, "orders", "req-1"), 0)  # the worker records the outcome, then exits
+            self.launcher.active = False  # the unit is gone before the poll asks systemd whether it is active
+            job = job_view(session, stale)
+        self.assertEqual((job["state"], job["outcome"]["status"], job["outcome"]["exit_code"]), ("finished", "succeeded", 0))
+
+    def test_a_finished_job_is_reported_as_finished_even_when_its_unit_is_gone(self):
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        self.launcher.active = False
+        job = self.call("status", job_id="req-1")[0]["result"]["job"]
+        self.assertEqual((job["state"], job["outcome"]["exit_code"]), ("finished", 0))
+
+    def test_a_job_whose_record_disappears_with_its_worker_is_reported_as_interrupted(self):
+        self.submit_deploy()
+        with AppSession(self.services, "orders") as session:
+            stale = session.jobs.get("req-1")
+            (self.layout.jobs / "orders" / "req-1.json").unlink()  # no recorded outcome can be confirmed
+            self.launcher.active = False
+            job = job_view(session, stale)
+        self.assertEqual(job["state"], "interrupted")
 
     def test_a_flood_of_distinct_requests_is_capped_but_dead_jobs_do_not_count(self):
         from shiplord.jobs import MAX_PENDING_JOBS
