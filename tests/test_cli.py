@@ -253,6 +253,8 @@ class CLITests(unittest.TestCase):
             self.assertEqual(config["http"]["frontend_origins"], ["https://example.com"])
             self.assertNotIn("github", config)
             self.assertIn("has not been checked", result.stdout)
+            # Without a terminal and without a GitHub remote there is nothing to infer, so say what provision needs.
+            self.assertIn("--image-repository", result.stderr)
 
     def test_configure_records_the_image_repository_provision_reads(self):
         with tempfile.TemporaryDirectory() as directory:
