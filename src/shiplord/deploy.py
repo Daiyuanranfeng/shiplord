@@ -237,7 +237,9 @@ class Deployer:
         try:
             self.state.begin(request_id, candidate, storage_provenance=storage_provenance)
         except StateError as error:
-            return Outcome("failed", 1, {"error": "journal_unavailable", "message": str(error)})
+            warnings = [] if self._journal_present() else self._abandon(candidate, before)
+            return Outcome("failed", 1, {"error": "journal_unavailable", "message": str(error),
+                                         "warnings": warnings})
         probes: dict = {}
         try:
             self._advance("runtime-changing")
@@ -315,11 +317,10 @@ class Deployer:
         self.runtime.start(self.registration, release)
 
     def _retire(self, before: dict, candidate: dict) -> list[str]:
-        """After success, drop the image of the release that left the two-release retention window."""
+        """After success, drop the resource of the release that left the two-release retention window."""
         dropped = before["previous"]
-        in_use = [candidate["artifact"], (before["current"] or {}).get("artifact")]
-        if dropped is None or dropped["artifact"] in in_use:  # never remove an image a retained release uses
-            return []
+        if dropped is None or self._shared_resource(dropped, [candidate, before["current"]]):
+            return []  # never remove a resource a retained release still uses
         try:
             return self.runtime.discard(self.registration, dropped)
         except RuntimeFailure as failure:
@@ -354,14 +355,29 @@ class Deployer:
             self.routes.reconcile(self.app, self.registration)
 
     def _abandon(self, candidate: dict, before: dict) -> list[str]:
-        """Remove what a failed candidate left on the host, unless a retained release uses the same artifact."""
-        retained = [release["artifact"] for release in (before["current"], before["previous"]) if release]
-        if candidate["artifact"] in retained:
+        """Remove what a failed candidate left on the host, unless a retained release uses the same resource."""
+        if self._shared_resource(candidate, [before["current"], before["previous"]]):
             return []
         try:
             return self.runtime.discard(self.registration, candidate)
         except RuntimeFailure as failure:
             return [str(failure)]
+
+    @staticmethod
+    def _shared_resource(release: dict, retained: list[dict | None]) -> bool:
+        """Whether discarding ``release`` would remove a resource one of the retained releases still uses."""
+        if release["artifact"]["kind"] == "native":
+            # A native release owns a directory named for its release ID: the same binary under another commit is a
+            # separate directory, so the artifact comparison would leave it behind.
+            return any(other is not None and release_id(other) == release_id(release) for other in retained)
+        return any(other is not None and other["artifact"] == release["artifact"] for other in retained)
+
+    def _journal_present(self) -> bool:
+        """Whether a journal record may reference the candidate; an unreadable journal counts as present."""
+        try:
+            return self.state.read_journal() is not None
+        except StateError:
+            return True
 
     def _restore(self, failure: Exception, probes: dict, candidate: dict, before: dict) -> Outcome:
         """Return to the last committed release; clear the journal only after verifying that."""

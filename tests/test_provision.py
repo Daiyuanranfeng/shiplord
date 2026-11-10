@@ -590,6 +590,39 @@ class DeprovisionTests(ProvisionTestCase):
             again = deprovision(self.layout, self.system, self.lock, "orders")
         self.assertFalse(any(again["removed"].values()), again)
 
+    def make_route(self, application_id="orders"):
+        ship = self.layout.caddy_root / "ship"
+        ship.mkdir(parents=True, exist_ok=True)
+        for directory in (self.layout.caddy_root, ship):
+            directory.chmod(0o755)
+        route = ship / f"{application_id}.caddy"
+        route.write_text(f"{application_id}.example.com {{\n\trespond 200\n}}\n")
+        route.chmod(0o644)
+        return route
+
+    def test_removes_the_job_directory_and_a_stale_route_file(self):
+        self.provision()
+        jobs = self.layout.jobs / "orders"
+        jobs.mkdir(mode=0o700, parents=True)
+        jobs.chmod(0o700)
+        (jobs / "req-1.json").write_text("{}\n")
+        route = self.make_route()
+        (route.parent / ".prior-orders").write_text(route.read_text())
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertTrue(result["removed"]["jobs_directory"])
+        self.assertTrue(result["removed"]["route"])
+        self.assertFalse(jobs.exists())
+        self.assertFalse(route.exists())
+        self.assertFalse((route.parent / ".prior-orders").exists())
+
+    def test_an_application_with_no_jobs_or_route_reports_no_removal_for_them(self):
+        self.provision()
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertNotIn("jobs_directory", result["removed"])
+        self.assertNotIn("route", result["removed"])
+
     def test_other_applications_are_untouched(self):
         self.provision("orders")
         self.provision("billing", public_key=ed25519(2))
