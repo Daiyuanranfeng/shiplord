@@ -352,16 +352,70 @@ class ConflictTests(RoutingTestCase):
     def main_with(self, text):
         self.write_main(self.MAIN + text + f"\nimport {self.root}/ship/*.caddy\n")
 
+    def assertApplies(self, text):
+        """The hostname is free: the route is installed, then removed for the next case."""
+        self.main_with(text)
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def inspect(self, text):
+        return routing._Inspection("orders.example.com", f"{self.root}/ship/*.caddy", False).scan(text)
+
     def test_hostname_forms_in_the_main_caddyfile_are_conflicts(self):
         forms = ["orders.example.com {\n}", "https://orders.example.com {\n}", "http://orders.example.com:8080 {\n}",
                  "orders.example.com:443 {\n}", "ORDERS.Example.com {\n}", "a.example.com, orders.example.com {\n}",
                  "a.example.com,orders.example.com {\n}", '"orders.example.com" {\n}',
                  "orders.example.com. {\n}", "https://ORDERS.example.com.:443 {\n}",
-                 "site.example.net {\n\theader Link https://orders.example.com/x\n}"]
+                 "orders.example.com { respond ok }"]
         for form in forms:
             with self.subTest(form=form):
                 self.main_with(form)
                 self.assertConflict()
+
+    def test_addresses_spread_over_lines_are_all_compared(self):
+        self.main_with("a.example.com,\norders.example.com {\n}")
+        self.assertConflict()
+
+    def test_hostnames_inside_directive_values_are_not_site_addresses(self):
+        cases = {
+            "reverse_proxy upstream": "site.example.net {\n\treverse_proxy https://orders.example.com\n}",
+            "header value": 'site.example.net {\n\theader Link https://orders.example.com/x\n}',
+            "host matcher": "site.example.net {\n\t@api host orders.example.com\n\trespond @api ok\n}",
+            "handle body": ("site.example.net {\n\thandle /api/* {\n\t\treverse_proxy orders.example.com:8443\n\t}\n}"),
+            "one-line body": "site.example.net { reverse_proxy https://orders.example.com }",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertApplies(text)
+
+    def test_a_wildcard_inside_a_directive_value_does_not_overlap(self):
+        self.assertApplies("site.example.net {\n\treverse_proxy https://*.example.com\n}")
+
+    def test_a_hostname_in_another_route_upstream_is_not_a_conflict(self):
+        other = self.write_route("billing.caddy",
+                                 "billing.example.com {\n\treverse_proxy https://orders.example.com\n}\n")
+        expected = other.read_bytes()
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+        self.assertEqual(other.read_bytes(), expected)
+
+    def test_a_directive_import_is_not_followed_for_site_addresses(self):
+        (self.root / "legacy.conf").write_text("reverse_proxy https://orders.example.com\n")
+        self.assertApplies(f"site.example.net {{\n\timport {self.root}/legacy.conf\n}}")
+
+    def test_a_brace_less_single_site_reads_only_its_address_line(self):
+        self.assertEqual(self.inspect("legacy.example.net\n\nreverse_proxy https://orders.example.com\n"), [])
+        self.assertEqual(self.inspect("legacy.example.net\n\nheader X {$SOME_TOKEN}\n"), [])
+
+    def test_a_brace_less_single_site_address_still_conflicts(self):
+        with self.assertRaises(RoutingError) as caught:
+            self.inspect("orders.example.com\n\nreverse_proxy 127.0.0.1:20000\n")
+        self.assertEqual(caught.exception.kind, "conflict")
+
+    def test_a_quoted_placeholder_site_address_is_refused(self):
+        self.main_with('"{$SITE_ADDRESS}" {\n}')
+        self.assertConflict("uninspectable")
 
     def test_internationalized_spellings_of_a_hostname_are_the_same_site(self):
         self.assertEqual(list(routing._addresses("bücher.example.org.")), ["xn--bcher-kva.example.org"])
@@ -559,6 +613,12 @@ class EnsureImportTests(RoutingTestCase):
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.ensure_import()
         self.assertTrue(caught.exception.intervention_required)
+
+
+class TokenizerTests(unittest.TestCase):
+    def test_the_quoted_flag_marks_only_the_quoted_tokens(self):
+        first = next(routing._lines('a.com "b c" { # comment\n'))
+        self.assertEqual((first[1], first[2]), (["a.com", "b c", "{"], [False, True, False]))
 
 
 class SubprocessCaddyTests(unittest.TestCase):

@@ -180,6 +180,19 @@ class RealCaddyTests(unittest.TestCase):
         self.assertEqual(run_command([shutil.which("caddy"), "validate", "--config", str(self.caddyfile),
                                       "--adapter", "caddyfile"], env=dict(os.environ, HOME=str(self.data_home))).code, 0)
 
+    def test_a_hostname_in_an_upstream_or_header_value_is_not_a_conflict(self):
+        # Caddy accepts this configuration, so the hostname really is only a directive value.
+        with open(self.caddyfile, "a") as file:
+            file.write("legacy.example.net {\n\treverse_proxy https://orders.example.com\n"
+                       "\theader Link https://orders.example.com/x\n}\n")
+        self.assertEqual(run_command([shutil.which("caddy"), "validate", "--config", str(self.caddyfile),
+                                      "--adapter", "caddyfile"],
+                                     env=dict(os.environ, HOME=str(self.data_home))).code, 0)
+        port = self.start_upstream(b"proxied")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"proxied")
+
     def test_reload_failure_with_caddy_stopped_restores_the_file_and_flags_intervention(self):
         port = managed_port(set())
         self.process.terminate()
