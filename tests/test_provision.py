@@ -328,6 +328,10 @@ class AccountRemovalTests(ProvisionTestCase):
 
 
 class KeyManagementTests(ProvisionTestCase):
+    def tree(self):
+        """Every path under the layout, so a refused call can be shown to have created nothing."""
+        return sorted(str(path.relative_to(self.layout.prefix)) for path in self.layout.prefix.rglob("*"))
+
     def test_add_list_and_remove_keys(self):
         self.provision()
         self.assertEqual(manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2)), {"changed": True})
@@ -349,6 +353,35 @@ class KeyManagementTests(ProvisionTestCase):
                                   ("add", {"label": "Bad Label", "public_key": ed25519(3)})):
             with self.subTest(operation=operation), self.assertRaises(ProvisionError):
                 manage_key(self.layout, "orders", operation, **kwargs)
+
+    def test_key_operations_on_an_unprovisioned_application_are_refused(self):
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError) as caught:
+                manage_key(self.layout, "orders", operation, **kwargs)
+            self.assertEqual(str(caught.exception), "the application is not provisioned")
+            self.assertNotIn(str(self.layout.authorized_keys), str(caught.exception))
+            self.assertNotIn(str(self.layout.prefix), str(caught.exception))
+            self.assertNotIn(ed25519(2).split()[1], str(caught.exception))
+
+    def test_a_refused_key_operation_creates_no_file_and_no_directory(self):
+        before = self.tree()
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError):
+                manage_key(self.layout, "orders", operation, **kwargs)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(list(self.layout.authorized_keys.iterdir()), [])
+        self.assertFalse((self.layout.environments / "orders").exists())
+
+    def test_a_stray_key_file_does_not_make_an_application_provisioned(self):
+        stray = self.layout.authorized_keys / "ship-orders"
+        stray.write_text("")
+        before = self.tree()
+        with self.assertRaisesRegex(ProvisionError, "not provisioned"):
+            manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2))
+        self.assertEqual(stray.read_text(), "")
+        self.assertEqual(self.tree(), before)
 
 
 class EnvironmentTests(ProvisionTestCase):

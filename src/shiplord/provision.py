@@ -229,10 +229,18 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
             "created": created}
 
 
+def _require_provisioned(layout: Layout, application_id: str) -> None:
+    """Refuse an application that provision has not created; its environment directory marks it as provisioned."""
+    directory = layout.environments / application_id
+    if not directory.is_dir() or directory.is_symlink():
+        raise ProvisionError("the application is not provisioned")
+
+
 def manage_key(layout: Layout, application_id: str, operation: str, *, label: str | None = None,
                public_key: str | None = None) -> dict:
     """Add, remove, or list keys for a provisioned application."""
     app = validate_app_name(application_id)
+    _require_provisioned(layout, app)
     store = KeyStore(layout.authorized_keys, app, deployment_user(app))
     try:
         if operation == "list":
@@ -256,10 +264,8 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
     be read is still replaced or removed, so a corrupt file never needs a manual root shell to repair.
     """
     app = validate_app_name(application_id)
-    directory = layout.environments / app
-    if not directory.is_dir() or directory.is_symlink():
-        raise ProvisionError("the application is not provisioned")
-    path = directory / "app.env"
+    _require_provisioned(layout, app)
+    path = layout.environments / app / "app.env"
     if operation == "clear":
         try:
             load_environment_file(path)  # only to report that the file it removes could not be read
