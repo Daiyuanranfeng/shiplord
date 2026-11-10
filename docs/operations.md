@@ -7,6 +7,7 @@
 | `/usr/local/sbin/shiplord-host` | root 0755 | Helper reached through sudo by one application account. |
 | `/usr/local/sbin/shiplord-admin` | root 0755 | Administration entry point (bootstrap-installed, admin sudo only). |
 | `/usr/local/sbin/shiplord-worker` | root 0755 | Runs a queued job; started by the helper as a transient unit. |
+| `/usr/local/sbin/shiplord-boot-recovery` | root 0755 | Runs once per boot; finishes transactions a restart interrupted. |
 | `/usr/local/libexec/shiplord-dispatch` | root 0755 | Forced command for SSH logins. |
 | `/usr/local/lib/shiplord/<version>/` | root 0755 | Immutable helper code; `current` is switched atomically. |
 | `/etc/shiplord/apps/<app>.json` | root 0600 | Registration: account, runtime, hostname, image repository, host port. |
@@ -76,13 +77,26 @@ A `fail`-policy deadline exits 6 with `kind: shutdown_timeout`; Shiplord never s
 container keeps running with its restart policy set to `no`, and the journal remains available. After it exits,
 `shiplord recover` restores the committed release. If recovery reports `shutdown_timeout`, the process is still draining.
 
-A real reboot is not part of the automated tests. Docker containers use `--restart unless-stopped` and native
-units are enabled, but behavior after a power loss has not been verified.
+A reboot is safe. Bootstrap installs and enables `shiplord-boot-recovery.service`, a oneshot unit for
+`multi-user.target` that runs once per boot, ordered after Docker and Caddy, and then exits. It looks for
+applications whose `journal.json` is still open and finishes each transaction with the same code
+`shiplord recover` uses, so the committed release serves again without a person running anything.
+
+The unit is bounded and deferential. `TimeoutStartSec=900` bounds one run, and a start-rate limit keeps a
+restart loop from recovering over and over. `Wants=` (not `Requires=`) means a host whose Docker or Caddy
+failed still boots and reports what it could not recover. It takes the host lock per application, and
+defers when another operation holds that lock or when a job's worker is still alive, rather than
+recovering underneath a running transaction. With no open journal it does nothing.
+
+It writes only to the journal. A recovery it could not finish makes the unit fail, which `systemctl status
+shiplord-boot-recovery` and `journalctl -u shiplord-boot-recovery` show; a host where it deferred is
+recovered by running `shiplord recover` yourself.
 
 ## Troubleshooting
 
 - `access denied`: the application is not provisioned for your key, or `provision` has not run.
-- `recovery_required`: an earlier job was interrupted; run `shiplord recover`.
+- `recovery_required`: an earlier job was interrupted. The boot recovery unit normally finishes it at the
+  next boot; run `shiplord recover` if that unit deferred or failed.
 - `stale_release`: a newer release is already deployed. Use `rollback` or `--allow-older` deliberately.
 - Public HTTPS check fails but the deploy succeeded: DNS or certificate issuance has not settled; `doctor` shows
   which. The server-side result separates local readiness, proxy routing, HTTPS, and DNS.
