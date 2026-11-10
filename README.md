@@ -72,7 +72,7 @@ shiplord rollback
 shiplord recover
 ```
 
-Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
+Use `shiplord env set --from-file .env.production` to set app secrets. Preview the key names it would add or remove with `shiplord env diff --from-file .env.production`. Shiplord does not print or log secret values.
 
 ## Learn more
 

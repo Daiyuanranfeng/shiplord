@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -12,9 +13,10 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from shiplord import cli
-from shiplord.client import ClientError
+from shiplord.client import AdminClient, ClientError
 from shiplord.commands import CommandError
 from shiplord.configure import ConfigurationError, create_manifest
+from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
 
 MANIFEST = '''schema_version = 1
@@ -787,3 +789,76 @@ class CLIInventoryTests(unittest.TestCase):
         server_data = json.loads(server.stdout)
         self.assertEqual(server_data["helper_version"], "0.2.0")
         self.assertEqual(server_data["client"]["version"], "0.2.0")
+
+
+class EnvironmentDiffCLITests(unittest.TestCase):
+    SECRET = "postgres://app:cli-secret@db/orders"
+    MANIFEST = {"name": "orders", "server": "production"}
+
+    def invoke(self, *arguments: str, input_text: str | None = None, current=("KEEP", "REMOVE")):
+        calls = []
+
+        def runner(command, payload, timeout):
+            calls.append((command, payload))
+            buffer = io.BytesIO()
+            write_frame(buffer, {"status": "ok", "request_id": "x", "result": {"keys": list(current)}})
+            return buffer.getvalue(), b"", 0
+
+        with patch("shiplord.cli._manifest", return_value=self.MANIFEST), \
+             patch("shiplord.cli._admin", return_value=AdminClient("admin@server.example.com", runner=runner)):
+            result = CliRunner().invoke(cli.app, list(arguments), input=input_text)
+        return result, calls
+
+    def assert_key_only_requests(self, calls) -> None:
+        for command, payload in calls:
+            sent = read_frame(io.BytesIO(payload))
+            self.assertEqual(sent["action"], "environment")
+            self.assertEqual(sent["arguments"], {"operation": "keys"})
+            self.assertNotIn(self.SECRET.encode(), payload)
+            self.assertNotIn(self.SECRET, " ".join(command))
+
+    def test_text_and_json_report_added_and_removed_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.env"
+            candidate.write_text(f"KEEP={self.SECRET}\nADD={self.SECRET}-added\n")
+            text, calls = self.invoke("env", "diff", "--from-file", str(candidate))
+            data, json_calls = self.invoke("env", "diff", "--from-file", str(candidate), "--json")
+        self.assertEqual(text.exit_code, 0, text.output)
+        self.assertIn("Added: ADD", text.stdout)
+        self.assertIn("Removed: REMOVE", text.stdout)
+        self.assertIn("Key names only", text.stdout)
+        self.assertNotIn("KEEP", text.stdout)
+        self.assertEqual(json.loads(data.stdout)["added"], ["ADD"])
+        self.assertEqual(json.loads(data.stdout)["removed"], ["REMOVE"])
+        self.assertNotIn("KEEP", data.stdout)
+        for result in (text, data):
+            self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assert_key_only_requests(calls + json_calls)
+
+    def test_stdin_is_supported_and_a_value_change_alone_is_not_a_change(self):
+        result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=f"KEEP={self.SECRET}\n",
+                                    current=("KEEP",))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Added: none", result.stdout)
+        self.assertIn("Removed: none", result.stdout)
+        self.assertNotIn("KEEP", result.stdout)
+        self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assert_key_only_requests(calls)
+
+    def test_invalid_input_fails_before_the_remote_call(self):
+        for payload, expected in (("PORT=1\n", "managed by Shiplord"), ("not a line\n", "not KEY=VALUE"),
+                                  ("", "no variables")):
+            with self.subTest(payload=payload):
+                result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=payload)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn(expected, result.stdout)
+                self.assertEqual(calls, [])
+        result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=f"BAD LINE {self.SECRET}\n")
+        self.assertEqual(result.exit_code, 2)
+        self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+        result, calls = self.invoke("env", "diff", "--from-file", "/does/not/exist.env")
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("could not read the environment file", result.stdout)
+        self.assertEqual(calls, [])

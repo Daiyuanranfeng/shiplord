@@ -141,6 +141,40 @@ class AdminCommandTests(unittest.TestCase):
         _, listing = commands.set_environment(manifest(), AdminClient("a@h", runner=FakeSsh((ok({"keys": ["A"]}), b"", 0))), "keys")
         self.assertNotIn("note", listing)
 
+    def test_environment_diff_reports_only_key_name_changes(self):
+        secret, other = "postgres://u:first-secret@db/x", "postgres://u:second-secret@db/y"
+        ssh = FakeSsh((ok({"keys": ["KEEP", "REMOVE"]}), b"", 0))
+        code, output = commands.diff_environment(manifest(), AdminClient("a@h", runner=ssh),
+                                                 f"KEEP={other}\nADD={secret}\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(output["added"], ["ADD"])
+        self.assertEqual(output["removed"], ["REMOVE"])
+        self.assertEqual(output["operation"], "diff")
+        self.assertIn("key names only", output["note"].lower())
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["action"], "environment")
+        self.assertEqual(sent["arguments"], {"operation": "keys"})
+        self.assertNotIn(secret.encode(), ssh.calls[0][1])
+        self.assertNotIn(other.encode(), ssh.calls[0][1])
+        self.assertNotIn("secret", str(output).lower())
+
+    def test_environment_diff_with_only_a_value_change_is_empty(self):
+        ssh = FakeSsh((ok({"keys": ["KEEP"]}), b"", 0))
+        code, output = commands.diff_environment(manifest(), AdminClient("a@h", runner=ssh), "KEEP=another-secret\n")
+        self.assertEqual((code, output["added"], output["removed"]), (0, [], []))
+        self.assertEqual(read_frame(io.BytesIO(ssh.calls[0][1]))["arguments"], {"operation": "keys"})
+        self.assertNotIn("another-secret", str(output))
+
+    def test_invalid_environment_diff_input_is_refused_before_any_connection(self):
+        ssh = FakeSsh()
+        client = AdminClient("a@h", runner=ssh)
+        for text, expected in (("", "no variables"), ("# only a comment\n\n", "no variables"),
+                               ("PORT=1\n", "managed by Shiplord"), ("BAD LINE\n", "not KEY=VALUE"),
+                               ("A=1\nA=2\n", "set more than once")):
+            with self.subTest(text=text), self.assertRaisesRegex(CommandError, expected):
+                commands.diff_environment(manifest(), client, text)
+        self.assertEqual(ssh.calls, [])
+
 
 class RegistryCommandTests(unittest.TestCase):
     TOKEN = "ghp_exampleTOKEN1234567890"

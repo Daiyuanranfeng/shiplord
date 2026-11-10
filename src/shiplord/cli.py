@@ -582,6 +582,13 @@ def _render_public_check(public: object) -> None:
     typer.echo(f"Public HTTPS: {state}{suffix}")
 
 
+def _render_environment_diff(_code: int, result: dict) -> None:
+    for label in ("added", "removed"):
+        names = result.get(label) or []
+        typer.echo(f"{label.capitalize()}: {', '.join(names) if names else 'none'}")
+    typer.echo(result.get("note") or "Key names only.")
+
+
 def _render_status(application: str, server: str | None, result: dict) -> None:
     status = result.get("application", {})
     current = status.get("current")
@@ -936,6 +943,21 @@ def env_set(from_file: Path = typer.Option(..., "--from-file", help="A KEY=VALUE
             raise CommandError("could not read the environment file") from None
         return commands.set_environment(manifest, _admin(manifest, json_output), "set", text)
     _execute(action, json_output)
+
+
+@env_app.command("diff")
+def env_diff(from_file: Path = typer.Option(..., "--from-file", help="A KEY=VALUE file; use - for stdin."),
+             json_output: bool = typer.Option(False, "--json")) -> None:
+    """Preview which key names `env set` would add or remove. Values are never printed or compared."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        try:
+            text = sys.stdin.read() if str(from_file) == "-" else from_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise CommandError("could not read the environment file") from None
+        return commands.diff_environment(manifest, _admin(manifest, json_output), text)
+    _execute(action, json_output, _render_environment_diff)
 
 
 @env_app.command("keys")
