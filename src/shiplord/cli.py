@@ -255,7 +255,7 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
            deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, Docker, disk, and applications (sudo)."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
-    """Check local prerequisites or a server's protocol capabilities."""
+    """Check local prerequisites or a server's protocol capabilities; without a manifest, check local only."""
     if local and server:
         _emit({"ok": False, "error": "choose either --local or --server"}, json_output)
         raise typer.Exit(2)
@@ -291,25 +291,26 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
             typer.echo(f"Client: shiplord {__version__} at {result['client']['executable']}")
             typer.echo(f"Server helper: {response['helper_version']}")
         return
-    if not local:
-        manifest = _manifest(json_output)
-        def action() -> tuple[int, dict]:
-            code, result = commands.application_doctor(manifest, _helper(manifest))
-            result["client"] = _client_details()
-            return code, result
-        _execute(action, json_output, lambda code, result: _render_doctor(
-            result, f"{manifest['name']} on {manifest['server']}"))
+    if local or not _manifest_present():
+        result = _local_checks()
+        if json_output:
+            _emit(result, True)
+        else:
+            _render_doctor(result, "local machine")
+            if not local:
+                typer.echo("Server readiness was not checked: this directory has no ship.toml.")
+                typer.echo("Next: run `shiplord configure` here to create an application, or run "
+                           "`shiplord doctor --server <alias>` to check a registered server.")
+        if not result["ok"]:
+            raise typer.Exit(3)
         return
-    checks = {name: bool(shutil.which(name)) for name in ("ssh", "git", "gh")}
-    ok = all(checks.values())
-    result = {"ok": ok, "scope": "local prerequisites only; server readiness was not checked",
-              "checks": checks, "client": _client_details()}
-    if json_output:
-        _emit(result, True)
-    else:
-        _render_doctor(result, "local machine")
-    if not ok:
-        raise typer.Exit(3)
+    manifest = _manifest(json_output)
+    def action() -> tuple[int, dict]:
+        code, result = commands.application_doctor(manifest, _helper(manifest))
+        result["client"] = _client_details()
+        return code, result
+    _execute(action, json_output, lambda code, result: _render_doctor(
+        result, f"{manifest['name']} on {manifest['server']}"))
 
 
 @server_app.command("add", rich_help_panel="Setup")
@@ -353,6 +354,18 @@ def _manifest(json_output: bool = False) -> dict:
         return load_manifest()
     except ManifestError as error:
         _fail(str(error), 2, json_output)
+
+
+def _manifest_present() -> bool:
+    """A ship.toml that exists stays authoritative, even when it is a link that does not resolve."""
+    return Path("ship.toml").exists() or Path("ship.toml").is_symlink()
+
+
+def _local_checks() -> dict:
+    """The local prerequisite report shared by `--local` and the fallback when no manifest is present."""
+    checks = {name: bool(shutil.which(name)) for name in ("ssh", "git", "gh")}
+    return {"ok": all(checks.values()), "scope": "local prerequisites only; server readiness was not checked",
+            "checks": checks, "client": _client_details()}
 
 
 def _helper(manifest: dict) -> HelperClient:
