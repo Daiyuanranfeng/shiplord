@@ -86,9 +86,12 @@ class FakeCaddy:
         self.validated = 0
         self.reloaded = 0
         self.fail_reload = False
+        self.unavailable_at: int | None = None
 
     def validate(self, config):
         self.validated += 1
+        if self.validated == self.unavailable_at:
+            raise RoutingError("could not start /usr/bin/caddy", "unavailable")
 
     def reload(self):
         self.reloaded += 1
@@ -161,7 +164,7 @@ class BootstrapTests(InstallerTestCase):
                              f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B {layout.lib}/current/{launcher} "$@"\n')
         self.assertIn(f"import {layout.caddy_root}/ship/*.caddy", (layout.caddy_root / "Caddyfile").read_text())
         self.assertTrue((layout.caddy_root / "ship" / "00-shiplord.caddy").exists())
-        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (1, 1))
+        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (2, 1))  # probe, managed import
         dropin = layout.sshd_dropin.read_text()
         self.assertIn(f"AuthorizedKeysFile {layout.authorized_keys}/%u", dropin)
         self.assertIn("PermitTTY no", dropin)
@@ -222,11 +225,41 @@ class BootstrapTests(InstallerTestCase):
         with self.assertRaisesRegex(BootstrapError, "symbolic link"):
             self.run_bootstrap()
 
-    def test_missing_caddy_is_a_clear_failure_after_code_install(self):
+    def test_missing_caddy_configuration_directory_is_a_clear_failure_before_code_install(self):
         (self.layout.caddy_root / "Caddyfile").unlink()
         self.layout.caddy_root.rmdir()
         with self.assertRaisesRegex(BootstrapError, "Caddy is not installed"):
             self.run_bootstrap()
+        self.assertFalse((self.layout.lib / "current").exists())
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_missing_caddy_binary_names_caddy_and_how_to_install_it(self):
+        self.caddy.unavailable_at = 1
+        with self.assertRaisesRegex(
+                BootstrapError, r"Caddy is not installed.*install the caddy package.*/usr/bin/caddy"):
+            self.run_bootstrap()
+        self.assertEqual(self.caddy.validated, 1)  # the probe; nothing else ran
+        self.assertFalse(self.layout.lib.exists())
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_missing_caddy_binary_leaves_the_previous_helper_active(self):
+        first = self.run_bootstrap()
+        current = os.readlink(self.layout.lib / "current")
+        dropin = self.layout.sshd_dropin.read_bytes()
+        self.caddy.validated = 0
+        self.caddy.unavailable_at = 1
+        with self.assertRaisesRegex(BootstrapError, "Caddy is not installed"):
+            self.run_bootstrap()
+        self.assertEqual(os.readlink(self.layout.lib / "current"), current)
+        self.assertEqual(self.layout.sshd_dropin.read_bytes(), dropin)
+        self.assertEqual(os.readlink(self.layout.lib / "current"), first["version"])
+
+    def test_an_unavailable_caddy_during_the_import_keeps_the_distinct_kind(self):
+        self.caddy.unavailable_at = 2  # the probe passes; the managed-import validation cannot start Caddy
+        with self.assertRaisesRegex(BootstrapError, r"Caddy integration failed \(unavailable\)") as caught:
+            self.run_bootstrap()
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertFalse((self.layout.lib / "current").exists())
         self.assertFalse(self.layout.sshd_dropin.exists())
 
     def test_caddy_failure_stops_before_touching_sshd(self):

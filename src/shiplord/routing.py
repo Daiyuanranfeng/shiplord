@@ -46,6 +46,8 @@ PACKAGED_ENVIRONMENT_FILES = (Path("/etc/default/caddy"), Path("/etc/sysconfig/c
 MAX_ENVIRONMENT_BYTES = 64 * 1024
 _REDACTED = "[shiplord:redacted]"
 MIN_REDACTED_LENGTH = 4  # shorter values would replace ordinary words and destroy the diagnostic
+# A fixed, valid configuration that proves Caddy can run at all; it is never written to the host's Caddy root.
+CADDY_PROBE = b'http://127.0.0.1:1 {\n\trespond "ok"\n}\n'
 
 
 class RoutingError(Exception):
@@ -237,10 +239,25 @@ class SubprocessCaddy:
         try:
             result = run_command(argv, timeout=self.timeout, env=env or self.ENVIRONMENT)
         except CommandError as error:
-            message = "Caddy command timed out" if error.kind == "timeout" else "could not start the Caddy command"
-            raise RoutingError(message, kind, detail=_redact(error.output, secrets)) from None
+            if error.kind == "timeout":
+                raise RoutingError("Caddy command timed out", kind, detail=_redact(error.output, secrets)) from None
+            # A command that never started proves nothing about a Caddyfile, so it is not the caller's kind.
+            raise RoutingError(f"could not start {argv[0]}", "unavailable",
+                               detail=_redact(error.output, secrets)) from None
         if result.code != 0:
             raise RoutingError("Caddy command failed", kind, detail=_redact(result.output, secrets))
+
+
+def probe_caddy(commands: CaddyCommands) -> None:
+    """Prove the Caddy command can run, before anything on the host is written.
+
+    The configuration is fixed and trivial, so a refusal means Caddy itself is unusable rather than that an
+    operator's Caddyfile is wrong. A missing or unstartable binary is reported as ``unavailable``.
+    """
+    with tempfile.TemporaryDirectory(prefix="shiplord-caddy-probe-") as directory:
+        config = Path(directory) / "Caddyfile"
+        config.write_bytes(CADDY_PROBE)
+        commands.validate(config)
 
 
 def render_route(domain: str, port: int) -> bytes:
@@ -508,6 +525,8 @@ class RouteManager:
             try:
                 self.commands.validate(self.root / name)
             except RoutingError as error:
+                if error.kind == "unavailable":
+                    raise  # Caddy never ran, so it cannot have rejected the Caddyfile
                 raise RoutingError("Caddy rejected the Caddyfile with the managed import", "validation",
                                    detail=error.detail) from None
             finally:
@@ -713,6 +732,8 @@ class RouteManager:
             try:
                 self.commands.validate(self.root / name)
             except RoutingError as error:
+                if error.kind == "unavailable":
+                    raise  # Caddy never ran, so it cannot have rejected the candidate or the existing file
                 baseline_ok = True
                 try:
                     self.commands.validate(self.root / "Caddyfile")

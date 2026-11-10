@@ -18,7 +18,7 @@ from pathlib import Path
 
 from shiplord.registry import PORT_RANGE, port_is_free
 from shiplord.release_state import HostLock
-from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, service_environment
+from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_caddy, service_environment
 from shiplord.system import CommandResult, HostSystem, run_command
 
 ENABLED = os.environ.get("SHIPLORD_TEST_CADDY") == "1" and shutil.which("caddy")
@@ -157,6 +157,16 @@ class RealCaddyTests(unittest.TestCase):
         return {"schema_version": 1, "application_id": "orders", "deployment_uid": 1001,
                 "deployment_user": "ship-orders", "runtime": "docker", "api_domain": domain,
                 "host_port": port, "image_repository": "ghcr.io/example/orders", "max_memory_mb": 4096}
+
+    def test_the_caddy_probe_validates_a_minimal_configuration(self):
+        probe_caddy(SubprocessCaddy(caddy=shutil.which("caddy")))
+
+    def test_a_missing_caddy_binary_is_reported_as_unavailable(self):
+        absent = str(self.root / "absent")
+        with self.assertRaises(RoutingError) as caught:
+            probe_caddy(SubprocessCaddy(caddy=absent))
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn(absent, str(caught.exception))
 
     def test_apply_update_and_remove_change_real_traffic(self):
         first = self.start_upstream(b"first")
