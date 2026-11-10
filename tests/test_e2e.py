@@ -51,6 +51,8 @@ class EndToEndTests(unittest.TestCase):
         cls.project.mkdir(exist_ok=True)
         cls.executable = shutil.which("shiplord")
         cls.environment = dict(os.environ, XDG_CONFIG_HOME=str(cls.config), HOME="/root")
+        # A developer's real Tailscale token must never reach a test: `github setup` would call the API.
+        cls.environment.pop("TAILSCALE_API_KEY", None)
         cls.setup_fake_gh()
         cls.setup_accounts_and_ssh()
         cls.setup_caddy()

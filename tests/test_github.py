@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from shiplord import github  # noqa: E402
+from shiplord import github, tailscale  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, fetch_host_keys, generate_ci_key,  # noqa: E402
@@ -176,6 +176,64 @@ class GitHubTestCase(unittest.TestCase):
 
     def state(self):
         return json.loads((self.home / "shiplord" / "ci" / "orders" / "state.json").read_text())
+
+
+class TailscaleCredentialTests(unittest.TestCase):
+    """The automatable half of issue #48: create the trust credential when a token is present."""
+
+    TOKEN = "tskey-api-throwaway-fixture-value"
+
+    def setUp(self):
+        self.gh = GitHub(FakeGh())
+
+    def create(self, *, environ, oidc=None):
+        if oidc is not None:
+            self.gh.runner.oidc = oidc
+        self.requests = []
+
+        def transport(url, headers, body):
+            self.requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        return github.tailscale_credential(self.gh, "Example/orders", manifest(), environ=environ,
+                                           transport=transport)
+
+    def test_without_a_token_the_printed_instructions_are_the_fallback(self):
+        self.assertIsNone(self.create(environ={}))
+        self.assertIsNone(self.create(environ={tailscale.API_TOKEN_ENV: "  "}))
+
+    def test_a_token_creates_the_owner_wide_credential_so_later_repositories_reuse_it(self):
+        settings, warnings = self.create(environ={tailscale.API_TOKEN_ENV: self.TOKEN},
+                                         oidc={"use_default": True, "sub_claim_prefix": "repo:Example@11/orders@22"})
+        self.assertEqual(settings, {"SHIPLORD_TS_CLIENT_ID": "id123456",
+                                    "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        self.assertEqual(warnings, [])
+        (url, headers, body), = self.requests
+        payload = json.loads(body)
+        self.assertEqual(payload["subject"], "repo:Example@11/*:ref:refs/heads/main")
+        self.assertEqual((payload["issuer"], payload["scopes"], payload["tags"]),
+                         (tailscale.GITHUB_ISSUER, ["auth_keys"], ["tag:ci"]))
+        self.assertEqual(payload["description"], "shiplord: Example/orders")
+        self.assertNotIn(self.TOKEN, json.dumps(settings) + json.dumps(warnings) + json.dumps(payload))
+
+    def test_extra_tags_are_created_with_the_credential(self):
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        github.tailscale_credential(self.gh, "Example/orders", manifest(), tags=["tag:ci", "tag:deploy"],
+                                    environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=transport)
+        self.assertEqual(json.loads(requests[0][2])["tags"], ["tag:ci", "tag:deploy"])
+
+    def test_a_refusal_does_not_echo_the_token(self):
+        def refusing(url, headers, body):
+            return 401, json.dumps({"message": f"bad token {self.TOKEN}"}).encode()
+        with self.assertRaises(tailscale.TailscaleError) as caught:
+            github.tailscale_credential(self.gh, "Example/orders", manifest(),
+                                        environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=refusing)
+        self.assertNotIn(self.TOKEN, str(caught.exception))
 
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
@@ -385,6 +443,7 @@ class SetupTests(GitHubTestCase):
     def test_the_remaining_manual_steps_are_stated_and_no_run_is_claimed(self):
         text = " ".join(self.setup_call()["remaining"])
         self.assertIn("Tailscale", text)
+        self.assertIn("TAILSCALE_API_KEY", text)
         self.assertIn("No GitHub Actions run has been performed", text)
 
 
