@@ -14,6 +14,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Add `shiplord recover <app> --server <alias>`, so an interrupted deployment can be
   reconciled from any directory without a checkout, and print that target-specific
   command in human-readable `status` output.
+- Add `shiplord server remove` and `shiplord server rename`, both with `--json`.
+  Removal refuses while the current directory's `ship.toml` names the alias.
 
 ### Fixed
 

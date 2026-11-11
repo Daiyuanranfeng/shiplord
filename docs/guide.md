@@ -387,6 +387,8 @@ reach the run page or the calling job.
 | --- | --- |
 | `server add <alias> --ssh user@host` | Register a trusted SSH login. Never accepts or updates host keys. |
 | `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
+| `server remove <alias>` | Delete an alias. Refuses while the current directory's `ship.toml` names it. |
+| `server rename <old> <new>` | Rename an alias. Refuses when the new alias already exists. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
 | `provision` | Create the application's account, state, port, and key access on the server. |
@@ -402,6 +404,10 @@ reach the run page or the calling job.
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete
 environments.
+
+Shiplord keeps no registry of manifests, so `server remove` can only check the `ship.toml` in the directory where you
+run it. A manifest elsewhere that names the alias is not detected; update or remove that manifest first. Renaming does
+not edit any manifest, so a manifest that names the old alias must be updated to the new one.
 
 ### Exit codes
 
