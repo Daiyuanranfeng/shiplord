@@ -16,6 +16,7 @@ LIB = "/usr/local/lib/shiplord"
 HOST_PATH = "/usr/local/sbin/shiplord-host"
 ADMIN_PATH = "/usr/local/sbin/shiplord-admin"
 WORKER_PATH = "/usr/local/sbin/shiplord-worker"
+BOOT_PATH = "/usr/local/sbin/shiplord-boot-recovery"
 DISPATCH_PATH = "/usr/local/libexec/shiplord-dispatch"
 ETC = "/etc/shiplord"
 VAR = "/var/lib/shiplord"
@@ -60,6 +61,8 @@ class Layout:
     def admin(self) -> Path: return self.path(ADMIN_PATH)
     @property
     def worker(self) -> Path: return self.path(WORKER_PATH)
+    @property
+    def boot(self) -> Path: return self.path(BOOT_PATH)
     @property
     def dispatch(self) -> Path: return self.path(DISPATCH_PATH)
     @property

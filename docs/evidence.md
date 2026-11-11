@@ -33,7 +33,7 @@ into it. A row here is not a pass.
 | Real sshd, sudo, useradd, visudo: bootstrap, provisioning, the SSH forced-command path | `tests/linux/run.sh host` | 9/9 passed |
 | Real Docker daemon and registry: the deploy engine, rollback, recovery, retention | `tests/linux/run.sh docker` | 1/1 passed (full deploy/rollback/recovery/retention lifecycle) |
 | The real `shiplord` CLI against real sshd, sudo, Caddy, Docker; two applications; GitHub setup and CI simulation | `tests/linux/run.sh e2e` | 24/24 passed |
-| The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy` | `tests/linux/run.sh systemd` | 13/13 passed |
+| The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy`; then a real container reboot with an open journal | `tests/linux/run.sh systemd` | 13/13 passed, then boot recovery 2/2 (interrupt phase) and 5/5 (verify phase, after `docker restart`) |
 | The generated project, against the template's own 1,200-test suite | `uv run pytest tests` in a project made by `shiplord init` | 1,196 passed; 5 failed, of which 2 also fail on the untouched template on this machine and 3 passed when rerun alone (load flakes) |
 
 These counts are from that audit. The unit baseline on `main` at `97047f1` is 1126 tests, 94 skipped
@@ -92,12 +92,15 @@ the latest completed `main` run (42913399156, `97047f1`) had all 12 jobs green. 
 | Older queued deployment | `test_deploy`, e2e 10 |
 | SSH disconnect during deployment | systemd 09 (client killed; the transient unit finishes) |
 | Helper killed mid-deploy | systemd 10 (worker `SIGKILL`ed; journal; `recover`), Docker lifecycle (simulated kill) |
+| Helper killed mid-deploy, then the host reboots | `tests/linux/run.sh systemd`: the worker is `SIGKILL`ed, the container is restarted, and `shiplord-boot-recovery.service` finishes the transaction at boot (journal closed, committed release serving, no person ran `recover`) |
 | Incompatible helper version | `test_protocol`, `test_helper_actions`, `test_provision` |
 | Private-key upload to GitHub fails | `test_github` (setup resumes; rotation leaves the old key working) |
 | Rollback itself fails | `test_deploy` (exit 5, previous restored; exit 6 when restoration fails) |
 
-A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is
-unverified. This is still true on `main`; see [`release-gate.md`](release-gate.md) criterion 3.
+A real machine reboot was not performed. A container reboot with real systemd as PID 1 was: `tests/linux/run.sh
+systemd` leaves an interrupted transaction's journal open, restarts the container, and
+`shiplord-boot-recovery.service` finishes that transaction during boot. An unclean power loss, and a host whose
+disk is lost mid-fsync, remain unverified. See [`release-gate.md`](release-gate.md) criterion 3.
 
 ## What running it for real found
 
@@ -288,4 +291,5 @@ Still open:
 - CI installs Shiplord's own dependencies unpinned (`pip install -e .`); a new release of one could change CI results.
 - Native services can still connect to other loopback services (only binding is restricted), and Docker applications share
   the default bridge network; see the README's *Limits of the confinement*.
-- Behavior across reboot or power loss; two truly concurrent deployments; a genuinely full disk.
+- Behavior across an unclean power loss (the reboot test uses a clean `docker restart`); two truly concurrent
+  deployments; a genuinely full disk.

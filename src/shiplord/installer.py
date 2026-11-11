@@ -2,11 +2,11 @@
 
 Installs the helper code under a content-addressed version directory, switches
 ``current`` to it atomically, creates the managed directories, makes Caddy import
-the managed route directory, and installs an sshd drop-in that confines
-deployment accounts to the forced-command dispatcher. Before the drop-in is
-written, the host's sshd unit is discovered and the main sshd configuration is
-checked to make sure it reads the drop-in directory. Re-running changes nothing
-when everything is already in place.
+the managed route directory, installs a boot-time recovery unit, and installs an
+sshd drop-in that confines deployment accounts to the forced-command dispatcher.
+Before the drop-in is written, the host's sshd unit is discovered and the main sshd
+configuration is checked to make sure it reads the drop-in directory. Re-running
+changes nothing when everything is already in place.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
     "worker_launcher.py": "shiplord.worker",
+    "boot_launcher.py": "shiplord.boot",
     "dispatch_launcher.py": "shiplord.dispatch",
 }
 LAUNCHER_TEMPLATE = (
@@ -67,6 +68,31 @@ Match Group {group}
 """
 SSHD = "/usr/sbin/sshd"
 SYSTEMCTL = "/usr/bin/systemctl"
+BOOT_UNIT = "shiplord-boot-recovery.service"
+# One boot-time recovery for the whole host: it exits as soon as it has looked at every application, so no service
+# runs between boots. Wants=, not Requires=: a host whose Docker or Caddy failed must still boot, and the unit
+# reports what it could not recover instead of holding the boot. The journal is the only place it writes.
+BOOT_UNIT_TEMPLATE = """\
+# Managed by Shiplord. Do not edit.
+[Unit]
+Description=Shiplord recovery for deployments interrupted by a restart
+Documentation=https://github.com/QueryPlanner/shiplord
+Wants=docker.service caddy.service
+After=docker.service caddy.service
+ConditionPathIsDirectory={app_state}
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart={wrapper}
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+"""
 SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
 SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
 SSHD_INCLUDE_DEPTH = 8
@@ -213,10 +239,64 @@ def _install_wrappers(layout: Layout) -> bool:
     return changed
 
 
+def systemd_running(root: Path = Path("/run/systemd/system")) -> bool:
+    """Whether systemd is the running init system; the directory exists only while it is."""
+    return root.is_dir()
+
+
+def _systemctl(system: System, *arguments: str) -> CommandResult:
+    try:
+        return system.run([SYSTEMCTL, *arguments], timeout=60)
+    except CommandError:
+        raise BootstrapError("could not run systemctl") from None
+
+
+def boot_recovery_unit(layout: Layout) -> bytes:
+    """The rendered boot recovery unit: it runs the installed wrapper, not a path in the source tree."""
+    return BOOT_UNIT_TEMPLATE.format(wrapper=layout.boot, app_state=layout.app_state).encode()
+
+
+def _install_boot_unit(layout: Layout, system: System) -> bool:
+    """Write, reload, and enable the boot recovery unit; return whether anything changed."""
+    path = layout.systemd_units / BOOT_UNIT
+    _ensure_dir(path.parent, 0o755)
+    changed = _write_atomic(path, boot_recovery_unit(layout), 0o644)
+    if not systemd_running():
+        return changed  # nothing can be enabled before the host boots systemd; the unit file waits, inert
+    if changed and _systemctl(system, "daemon-reload").code != 0:
+        raise BootstrapError("systemd could not reload its units")
+    if _systemctl(system, "is-enabled", BOOT_UNIT).code != 0:
+        if _systemctl(system, "enable", BOOT_UNIT).code != 0:
+            raise BootstrapError("systemd could not enable the boot recovery unit")
+        changed = True
+    return changed
+
+
+def remove_boot_recovery(layout: Layout, system: System) -> bool:
+    """Disable and remove the boot recovery unit; idempotent, and safe when it was never installed.
+
+    Removing the unit only stops recovery from running at boot; no application state is touched. This is the
+    hook a ``shiplord server uninstall`` command calls; nothing in the CLI removes units yet.
+    """
+    path = layout.systemd_units / BOOT_UNIT
+    if not path.exists() and not path.is_symlink():
+        return False
+    if systemd_running() and _systemctl(system, "disable", BOOT_UNIT).code != 0:
+        raise BootstrapError("systemd could not disable the boot recovery unit")
+    try:
+        path.unlink()
+    except OSError:
+        raise BootstrapError("could not remove the boot recovery unit") from None
+    if systemd_running() and _systemctl(system, "daemon-reload").code != 0:
+        raise BootstrapError("systemd could not reload its units")
+    return True
+
+
 def launcher_targets(layout: Layout) -> dict[Path, str]:
     """The launcher script bootstrap installs at each entry-point path."""
     return {layout.host: "host_launcher.py", layout.admin: "admin_launcher.py",
-            layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
+            layout.worker: "worker_launcher.py", layout.boot: "boot_launcher.py",
+            layout.dispatch: "dispatch_launcher.py"}
 
 
 def wrapper_text(layout: Layout, launcher: str) -> bytes:
@@ -615,6 +695,7 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
             changed["code"] = _install_version(layout, name, files)
             changed["current"] = _switch_current(layout, name)
             changed["wrappers"] = _install_wrappers(layout)
+            changed["boot_recovery"] = _install_boot_unit(layout, system)
             changed["sshd_group"] = _ensure_deployment_group(system)
             changed["sshd"] = _install_sshd(layout, system, unit, socket)
             collected, warnings = _collect_old_versions(layout)

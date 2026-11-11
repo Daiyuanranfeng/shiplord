@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from test_installer import SOURCE, FakeCaddy, FakeSystem  # noqa: E402
 from shiplord.admin import run as admin_run  # noqa: E402
-from shiplord.installer import bootstrap  # noqa: E402
+from shiplord.installer import BOOT_UNIT, bootstrap  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.release_state import HostLock  # noqa: E402
 from shiplord.system import CommandResult  # noqa: E402
@@ -79,9 +79,11 @@ class RemovalTests(UninstallTestCase):
         self.assertEqual(result["removed"]["caddy"], {"import": True, "placeholder": True})
         self.assertTrue(result["removed"]["sshd"])
         self.assertEqual(result["removed"]["wrappers"], ["shiplord-host", "shiplord-admin", "shiplord-worker",
-                                                         "shiplord-dispatch"])
+                                                         "shiplord-boot-recovery", "shiplord-dispatch"])
+        self.assertTrue(result["removed"]["boot_recovery"])
         self.assertEqual(result["removed"]["versions"], 1)
-        for path in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.dispatch, self.layout.lib,
+        for path in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.boot,
+                     self.layout.dispatch, self.layout.systemd_units / BOOT_UNIT, self.layout.lib,
                      self.layout.sshd_dropin, self.layout.path("/etc/shiplord"), self.layout.caddy_root / "ship",
                      self.layout.releases):
             self.assertFalse(os.path.lexists(path), path)
@@ -99,7 +101,8 @@ class RemovalTests(UninstallTestCase):
         self.run_uninstall()
         again = self.run_uninstall()
         self.assertEqual(again["removed"], {"caddy": {"import": False, "placeholder": False}, "sshd": False,
-                                            "wrappers": [], "versions": 0, "directories": []})
+                                            "boot_recovery": False, "wrappers": [], "versions": 0,
+                                            "directories": []})
         self.assertEqual(again["status"], "uninstalled")
 
     def test_a_host_that_was_never_bootstrapped_reports_nothing_removed(self):

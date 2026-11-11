@@ -18,9 +18,9 @@ import stat
 from pathlib import Path
 from typing import Callable
 
-from .installer import (BootstrapError, COMPLETE_MARKER, MANAGED_MARKER, SSHD, SYSTEMCTL, VERSION_PATTERN,
-                        _unit_active, _write_atomic, launcher_targets, remove_version_tree, sshd_units,
-                        wrapper_text)
+from .installer import (BOOT_UNIT, BootstrapError, COMPLETE_MARKER, MANAGED_MARKER, SSHD, SYSTEMCTL,
+                        VERSION_PATTERN, _unit_active, _write_atomic, launcher_targets, remove_boot_recovery,
+                        remove_version_tree, sshd_units, wrapper_text)
 from .layout import ETC, Layout
 from .registry import Registry
 from .release_state import HostLock, StateError
@@ -181,6 +181,20 @@ def _sshd_units(layout: Layout, system: System) -> tuple[str | None, str | None]
         raise UninstallError("could not run sshd checks; nothing was removed") from None
 
 
+def _remove_boot_recovery(layout: Layout, system: System) -> bool:
+    """Disable and remove the boot recovery unit bootstrap wrote, and nothing else."""
+    path = layout.systemd_units / BOOT_UNIT
+    try:
+        if not path.read_bytes().startswith(MANAGED_MARKER):
+            return False  # a unit Shiplord did not write is left in place
+    except OSError:
+        return False
+    try:
+        return remove_boot_recovery(layout, system)
+    except BootstrapError as error:
+        raise UninstallError(str(error)) from None
+
+
 def _remove_sshd(layout: Layout, system: System, unit: str | None, socket: str | None) -> bool:
     """Remove the drop-in and reload sshd; put the drop-in back if sshd then rejects the configuration."""
     path = layout.sshd_dropin
@@ -328,6 +342,7 @@ def uninstall(layout: Layout, system: System, lock: HostLock, caddy: CaddyComman
     unit, socket = _sshd_units(layout, system)  # refuse a host that cannot be reloaded before the first change
     removed = {"caddy": _remove_caddy(layout, lock, caddy)}
     removed["sshd"] = _remove_sshd(layout, system, unit, socket)
+    removed["boot_recovery"] = _remove_boot_recovery(layout, system)
     removed["wrappers"] = [path.name for path, launcher in launcher_targets(layout).items()
                            if _remove_artifact(path, lambda data, text=wrapper_text(layout, launcher): data == text,
                                                "the launcher directory")]

@@ -8,7 +8,8 @@
 #   host     bootstrap, provisioning, and the SSH forced-command path
 #   docker   the deploy engine against the host Docker daemon and a local registry
 #   e2e      the real CLI against sshd, sudo, Caddy, Docker (systemctl/systemd-run are shimmed)
-#   systemd  the native lifecycle against real systemd as PID 1
+#   systemd  the native lifecycle against real systemd as PID 1, then a real reboot that leaves an
+#            interrupted transaction for shiplord-boot-recovery.service to finish
 #
 # Needs Docker. The docker and e2e modes use the host daemon through its socket and host networking;
 # the systemd mode runs a privileged container. Everything it creates is removed afterwards.
@@ -54,22 +55,39 @@ run_e2e() {
   oneshot -v /var/run/docker.sock:/var/run/docker.sock --network host -- \
     'bash /shims.sh && env SHIPLORD_TEST_E2E=1 python -m unittest tests.test_e2e -v 2>&1 | tail -80'
 }
+wait_for_systemd() { # wait_for_systemd <container>
+  local name=$1 state=""
+  for _ in $(seq 1 60); do
+    state=$(docker exec "$name" systemctl is-system-running 2>/dev/null || true)
+    case "$state" in running|degraded) return 0;; esac
+    sleep 2
+  done
+  echo "systemd did not boot in $name (state: $state)"
+  return 1
+}
+
 run_systemd() {
   local name=shiplord-sysd-$$
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --privileged --cgroupns=host --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     --name "$name" "$image" >/dev/null
-  trap 'docker rm -f "'"$name"'" >/dev/null 2>&1 || true' RETURN
-  local state=""
-  for _ in $(seq 1 45); do
-    state=$(docker exec "$name" systemctl is-system-running 2>/dev/null || true)
-    case "$state" in running|degraded) break;; esac; sleep 2
-  done
-  [ "$state" = running ] || [ "$state" = degraded ] || { echo "systemd did not boot (state: $state)"; return 1; }
+  # EXIT, not RETURN: a failed stage aborts the script, and a privileged container must not be left behind.
+  trap 'docker rm -f "'"$name"'" >/dev/null 2>&1 || true' EXIT
+  wait_for_systemd "$name"
   docker exec "$name" bash -c 'rm -rf /work /tmp/e2e && mkdir /work'
   tar -C "$repo" --exclude=.venv --exclude=.git --exclude=__pycache__ --exclude='*.egg-info' -cf - . | docker exec -i "$name" tar -C /work -xf -
   docker exec "$name" bash -c 'cd /work && pip install -q -e . 2>&1 | tail -2'
   docker exec -e SHIPLORD_TEST_SYSTEMD=1 "$name" bash -c 'set -o pipefail; cd /work && python -m unittest tests.test_e2e_systemd -v 2>&1 | tail -60'
+  # Only a reboot proves the boot unit recovers on its own: leave a journal open, restart the container,
+  # then assert from inside the rebooted host that the release serves and nobody ran `shiplord recover`.
+  echo "== boot recovery: leaving an interrupted transaction"
+  docker exec -e SHIPLORD_TEST_SYSTEMD=1 -e SHIPLORD_BOOT_PHASE=interrupt "$name" \
+    bash -c 'set -o pipefail; cd /work && python -m unittest tests.test_boot_recovery -v 2>&1 | tail -40'
+  echo "== boot recovery: rebooting"
+  docker restart -t 30 "$name" >/dev/null
+  wait_for_systemd "$name"
+  docker exec -e SHIPLORD_TEST_SYSTEMD=1 -e SHIPLORD_BOOT_PHASE=verify "$name" \
+    bash -c 'set -o pipefail; cd /work && python -m unittest tests.test_boot_recovery -v 2>&1 | tail -40'
 }
 
 mode=${1:-}

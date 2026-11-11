@@ -94,7 +94,7 @@ BACKED_UP = {"ok": True, "status": "succeeded", "archive": "shiplord-backup-orde
              "application": {"restarted": True, "running": True}}
 UNINSTALLED = {
     "status": "uninstalled",
-    "removed": {"caddy": {"import": True, "placeholder": False}, "sshd": True,
+    "removed": {"caddy": {"import": True, "placeholder": False}, "sshd": True, "boot_recovery": True,
                 "wrappers": ["shiplord-host", "shiplord-admin"], "versions": 2, "directories": ["registrations"]},
     "retained": ["the state directory that holds the host lock"], "applications": [],
 }
@@ -429,7 +429,8 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli._admin_target", {"return_value": self.uninstall_admin()})]),
                 {"ok": True, **UNINSTALLED,
                  "note": "Application data is never deleted; remove it by hand when you are sure."},
-                ("Removed:", "the managed Caddy import", "the launchers: shiplord-host, shiplord-admin",
+                ("Removed:", "the managed Caddy import", "the boot recovery unit",
+                 "the launchers: shiplord-host, shiplord-admin",
                  "Left in place:", "Application data is never deleted", "shiplord server bootstrap")),
             Case("server remove", lambda as_json: self.invoke(
                 ["server", "remove", "production"], as_json,

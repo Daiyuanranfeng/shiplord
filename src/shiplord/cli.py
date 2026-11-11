@@ -566,6 +566,8 @@ def _render_uninstall(result: dict) -> None:
         lines.append("the managed Caddy placeholder route")
     if removed.get("sshd"):
         lines.append("the sshd drop-in")
+    if removed.get("boot_recovery"):
+        lines.append("the boot recovery unit")
     if removed.get("wrappers"):
         lines.append("the launchers: " + ", ".join(removed["wrappers"]))
     if removed.get("versions"):
