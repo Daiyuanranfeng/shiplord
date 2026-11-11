@@ -74,8 +74,8 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         if not isinstance(force, bool):
             raise ProtocolError("force must be true or false")
         return uninstall(layout, system, lock, SubprocessCaddy(), force=force)
-    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb",
-                             "update"},
+    allowed = {"provision": {"runtime", "api_domain", "hostnames", "image_repository", "public_key", "key_label",
+                             "max_memory_mb", "update"},
                "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text", "key", "value"},
                "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]
@@ -83,11 +83,11 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         raise ProtocolError("unknown arguments")
     if action == "provision":
         required = {"runtime", "api_domain", "image_repository", "public_key", "key_label"}
-        if not required <= set(args) or set(args) - required - {"max_memory_mb", "update"}:
+        if not required <= set(args) or set(args) - required - {"hostnames", "max_memory_mb", "update"}:
             raise ProtocolError("missing arguments")
         if "update" in args and args["update"] is not True:
             raise ProtocolError("update must be true")
-        extra = {key: args[key] for key in ("max_memory_mb", "update") if key in args}
+        extra = {key: args[key] for key in ("hostnames", "max_memory_mb", "update") if key in args}
         apply_route = None
         if extra.get("update") is True:
             def apply_route(registration: dict):

@@ -24,6 +24,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Removal refuses while the current directory's `ship.toml` names the alias.
 - Add `shiplord provision --update` to apply a changed hostname or memory
   ceiling without removing the application's state, environment, or keys.
+- Serve additional hostnames per application: `http.hostnames` (or
+  `--hostname`, repeatable) and `http.www_redirect` (`--www`) redirect
+  permanently to the canonical `http.api_domain`, keeping the path and query
+  string. The extra hostnames are part of the registration, so a deployment
+  cannot add or drop them.
 
 ### Fixed
 

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
-from .manifest import validate_app_name, validate_hostname
+from .manifest import validate_app_name, validate_hostname, validate_hostnames
 from .registry import PORT_RANGE, validate_registration
 from .release_state import HostLock, _directory
 from .system import TRUNCATION_MARKER, CommandError, HostSystem, System, run_command
@@ -33,8 +33,9 @@ MAX_CONFIG_BYTES = 1024 * 1024
 MAX_IMPORTED_FILES = 64
 MAX_IMPORT_DEPTH = 3
 COMMAND_TIMEOUT_SECONDS = 30
-# A route file holds only a hostname and a loopback port, so it is world-readable like the installer's placeholder
-# route; the Caddyfile, which can hold a token or a password hash, keeps whatever mode it already had instead.
+# A route file holds only hostnames, a loopback port, and a redirect target, so it is world-readable like the
+# installer's placeholder route; the Caddyfile, which can hold a token or a password hash, keeps whatever mode it
+# already had instead.
 ROUTE_FILE_MODE = 0o644
 _TEMP_PREFIX = ".tmp-"
 _PRIOR_PREFIX = ".prior-"
@@ -286,12 +287,20 @@ def probe_caddy(commands: CaddyCommands) -> None:
         commands.validate(config)
 
 
-def render_route(domain: str, port: int) -> bytes:
-    """Render a route from validated values only."""
+def render_route(domain: str, port: int, hostnames: Sequence[str] = ()) -> bytes:
+    """Render a route from validated values only.
+
+    The canonical hostname proxies to the release; every additional hostname answers with a permanent
+    redirect to it that keeps the path and query string. A redirect never targets itself: the manifest
+    validator refuses an alias equal to the canonical hostname.
+    """
     domain = validate_hostname(domain, "api_domain")
+    aliases = validate_hostnames(domain, list(hostnames), "hostnames")
     if type(port) is not int or port not in PORT_RANGE:
         raise RoutingError("upstream port is outside the managed range", "precondition")
-    return f"{domain} {{\n\treverse_proxy 127.0.0.1:{port}\n}}\n".encode()
+    site = f"{domain} {{\n\treverse_proxy 127.0.0.1:{port}\n}}\n"
+    redirects = "".join(f"\n{alias} {{\n\tredir https://{domain}{{uri}} 308\n}}\n" for alias in aliases)
+    return (site + redirects).encode()
 
 
 # --- Caddyfile inspection -------------------------------------------------
@@ -411,9 +420,11 @@ class _Snippet:
 
 
 class _Inspection:
-    def __init__(self, domain: str, own_glob: str, allow_wildcard_overlap: bool,
+    def __init__(self, domains: str | Iterable[str], own_glob: str, allow_wildcard_overlap: bool,
                  environment: Mapping[str, str] | None = None):
-        self.domain, self.own_glob, self.allow_wildcard = domain, own_glob, allow_wildcard_overlap
+        # Every hostname the candidate claims: the canonical one and each alias that redirects to it.
+        self.domains = frozenset(domain for domain in ([domains] if isinstance(domains, str) else domains) if domain)
+        self.own_glob, self.allow_wildcard = own_glob, allow_wildcard_overlap
         self.environment = environment  # None means the service environment could not be read
         self.snippets: dict[str, _Snippet] = {}  # definitions seen so far, with the bodies to inspect
 
@@ -480,10 +491,11 @@ class _Inspection:
     def _compare(self, addresses: list[str]) -> None:
         for token in addresses:
             for address in _addresses(token):
-                if address == self.domain:
+                if address in self.domains:
                     raise RoutingError("hostname is already served by another configuration", "conflict")
-                if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
-                    raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
+                if address.startswith("*.") and not self.allow_wildcard:
+                    if any(domain.endswith(address[1:]) for domain in self.domains):
+                        raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
 
     def _expander(self, arguments: tuple[str, ...] = (), context: str = "") -> Callable[[str], str]:
         """Resolve an address token's import arguments and service variables before it is classified."""
@@ -668,7 +680,8 @@ class RouteManager:
             os.close(ship)
         if current is None:
             return "absent"
-        rendered = render_route(registration["api_domain"], registration["host_port"])
+        rendered = render_route(registration["api_domain"], registration["host_port"],
+                                registration.get("hostnames") or [])
         return "identical" if current.data == rendered else "different"
 
     def ensure_import(self) -> RouteResult:
@@ -834,20 +847,21 @@ class RouteManager:
         if isinstance(subject, dict):
             registration = validate_registration(subject)
             app = registration["application_id"]
-            candidate: bytes | None = render_route(registration["api_domain"], registration["host_port"])
-            domain: str | None = registration["api_domain"]
+            aliases = list(registration.get("hostnames") or [])
+            candidate: bytes | None = render_route(registration["api_domain"], registration["host_port"], aliases)
+            domains: list[str] | None = [registration["api_domain"], *aliases]
             if application_id is not None and application_id != app:
                 raise RoutingError("registration does not match the application", "precondition")
         else:
-            app, candidate, domain = validate_app_name(subject), None, None
+            app, candidate, domains = validate_app_name(subject), None, None
         root, ship = self._open()
         try:
-            return self._run(root, ship, app, domain, candidate, force)
+            return self._run(root, ship, app, domains, candidate, force)
         finally:
             os.close(root)
             os.close(ship)
 
-    def _run(self, root: int, ship: int, app: str, domain: str | None, candidate: bytes | None,
+    def _run(self, root: int, ship: int, app: str, domains: list[str] | None, candidate: bytes | None,
              force: bool) -> RouteResult:
         live, prior = f"{app}.caddy", f"{_PRIOR_PREFIX}{app}"
         names = os.listdir(ship)
@@ -862,8 +876,8 @@ class RouteManager:
         if main is None:
             raise RoutingError("the main Caddyfile is missing", "precondition")
         main_text = main.data.decode("utf-8", "replace")
-        inspection = _Inspection(domain or "", self.own_glob, self.allow_wildcard_overlap,
-                                 _runner_environment(self.commands) if domain is not None else None)
+        inspection = _Inspection(domains or (), self.own_glob, self.allow_wildcard_overlap,
+                                 _runner_environment(self.commands) if domains is not None else None)
         import_lines = inspection.own_import_lines(main_text)
         if len(import_lines) != 1:
             raise RoutingError("the main Caddyfile must import the managed routes exactly once", "precondition")
@@ -876,7 +890,7 @@ class RouteManager:
             if route is None:
                 raise RoutingError("a managed route disappeared during inspection", "uninspectable")
             other_texts[name] = route.data.decode("utf-8", "replace")
-        if domain is not None:
+        if domains is not None:
             self._scan_hostnames(inspection, main_text, other_texts)
 
         current = _read_file(ship, live, trusted=True)

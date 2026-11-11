@@ -103,6 +103,8 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
     arguments = {"runtime": manifest["runtime"], "api_domain": manifest["http"]["api_domain"],
                  "image_repository": image_repository_for(manifest, image_repository), "public_key": text,
                  "key_label": label}
+    if manifest["http"].get("hostnames"):  # a helper older than additional hostnames refuses an unknown argument
+        arguments["hostnames"] = list(manifest["http"]["hostnames"])
     if max_memory_mb is not None:
         arguments["max_memory_mb"] = max_memory_mb  # the ceiling a deploy request may ask for (default 4096)
     if update:
@@ -112,7 +114,7 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
     if update:
         if not result.get("updated"):
             next_step = "The application already matches the manifest; nothing changed."
-        elif "api_domain" not in result.get("changes", {}):
+        elif not {"api_domain", "hostnames"} & set(result.get("changes", {})):
             next_step = "The memory ceiling is registered; it applies to the next deployment."
         elif result.get("route_changed"):
             next_step = "The hostname is registered and the public route was moved; point its DNS record at the server."

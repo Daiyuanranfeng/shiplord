@@ -465,6 +465,8 @@ def render_plan_details(result: dict, say: Say | None = None) -> None:
         say(f"Route change: {result['route_change']}")
     if result.get("domain") is not None:
         say(f"Domain: {result['domain']}")
+    if result.get("hostnames"):
+        say(f"Additional hostnames: {', '.join(result['hostnames'])}")
 
     storage = result.get("storage")
     if isinstance(storage, dict):

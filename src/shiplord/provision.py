@@ -14,7 +14,7 @@ import secrets
 import shutil
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from . import registries
 from .environment import (EnvironmentError_, edit_environment, load_environment_file, load_environment_text,
@@ -196,7 +196,7 @@ def _open_directory(path: Path) -> int:
 
 
 def _preflight_update(layout: Layout, system: System, lock: HostLock, app: str, *, runtime: str, api_domain: str,
-                      image_repository: str | None, max_memory_mb: int | None,
+                      image_repository: str | None, max_memory_mb: int | None, hostnames: Sequence[str] = (),
                       apply_route: Callable[[dict], object] | None) -> tuple[dict, dict, dict | None]:
     """Validate an update before its first side effect; return (previous, planned, deployed release)."""
     account = _account(system, deployment_user(app))
@@ -227,27 +227,30 @@ def _preflight_update(layout: Layout, system: System, lock: HostLock, app: str, 
         ceiling = previous["max_memory_mb"] if max_memory_mb is None else max_memory_mb
         planned, _ = registry.update(app, deployment_uid=previous["deployment_uid"],
                                      deployment_user=previous["deployment_user"], runtime=runtime,
-                                     api_domain=api_domain, image_repository=image_repository,
+                                     api_domain=api_domain, hostnames=hostnames,
+                                     image_repository=image_repository,
                                      max_memory_mb=ceiling, dry_run=True)
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
         os.close(registry_fd)
-    if planned["api_domain"] != previous["api_domain"] and current is not None and apply_route is None:
+    route_moves = planned["api_domain"] != previous["api_domain"] \
+        or (planned.get("hostnames") or []) != (previous.get("hostnames") or [])
+    if route_moves and current is not None and apply_route is None:
         raise ProvisionError("the public route cannot be moved by this server; run `shiplord server bootstrap` first")
     return previous, planned, current
 
 
 def provision(layout: Layout, system: System, lock: HostLock, *, application_id: str, runtime: str, api_domain: str,
               image_repository: str | None, public_key: str, key_label: str,
-              max_memory_mb: int | None = None, update: bool = False,
+              hostnames: Sequence[str] = (), max_memory_mb: int | None = None, update: bool = False,
               apply_route: Callable[[dict], object] | None = None) -> dict:
     """Create or complete an application's host resources. The caller holds the host lock.
 
     With ``update`` an existing application keeps its account, port, state, environment, and keys; only its public
-    hostname and memory ceiling may change. ``max_memory_mb`` left unset keeps the current ceiling on an update and
-    uses the default at provisioning. ``apply_route`` moves the public route of a deployed application when the
-    hostname changes; it is required for that case and receives the updated registration.
+    hostname, additional hostnames, and memory ceiling may change. ``max_memory_mb`` left unset keeps the current
+    ceiling on an update and uses the default at provisioning. ``apply_route`` moves the public route of a deployed
+    application when a hostname changes; it is required for that case and receives the updated registration.
     """
     if not lock.held:
         raise ProvisionError("host lock is required")
@@ -260,7 +263,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     ceiling = DEFAULT_MAX_MEMORY_MB if max_memory_mb is None else max_memory_mb
     try:  # reject bad input before the first side effect; uid and port are placeholders here
         validate_registration(registration_request(app, deployment_uid=1, deployment_user=deployment_user(app),
-                                                   runtime=runtime, api_domain=api_domain,
+                                                   runtime=runtime, api_domain=api_domain, hostnames=hostnames,
                                                    image_repository=image_repository, max_memory_mb=ceiling))
     except StateError as error:
         raise ProvisionError(f"invalid application settings: {error}") from None
@@ -270,7 +273,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     existing = None
     if update:
         previous, planned, current = _preflight_update(layout, system, lock, app, runtime=runtime,
-                                                       api_domain=api_domain,
+                                                       api_domain=api_domain, hostnames=hostnames,
                                                        image_repository=image_repository,
                                                        max_memory_mb=max_memory_mb, apply_route=apply_route)
         max_memory_mb = planned["max_memory_mb"]
@@ -284,7 +287,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
             existing = Registry(registry_fd, lock).check(
                 app, deployment_uid=None if account is None else account["uid"],
                 deployment_user=deployment_user(app), runtime=runtime, api_domain=api_domain,
-                image_repository=image_repository, max_memory_mb=max_memory_mb)
+                hostnames=hostnames, image_repository=image_repository, max_memory_mb=max_memory_mb)
         except StateError as error:
             raise ProvisionError(f"registration failed: {error}") from None
         finally:
@@ -316,8 +319,9 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     created["sudo_policy"] = _install_sudoers(layout, system, app, account["name"])
     route_changed = False
     changed = False
-    if update and previous is not None and planned is not None \
-            and planned["api_domain"] != previous["api_domain"] and current is not None:
+    if update and previous is not None and planned is not None and current is not None \
+            and (planned["api_domain"] != previous["api_domain"]
+                 or (planned.get("hostnames") or []) != (previous.get("hostnames") or [])):
         try:
             route_changed = bool(getattr(apply_route(planned), "changed", True))
         except RoutingError as error:
@@ -327,27 +331,34 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
         registry = Registry(registry_fd, lock)
         if update:
             record, changed = registry.update(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                              runtime=runtime, api_domain=api_domain,
+                                              runtime=runtime, api_domain=api_domain, hostnames=hostnames,
                                               image_repository=image_repository, max_memory_mb=max_memory_mb)
             created["registration"] = False
         else:
             record = registry.register(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                       runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                       max_memory_mb=max_memory_mb)
+                                       runtime=runtime, api_domain=api_domain, hostnames=hostnames,
+                                       image_repository=image_repository, max_memory_mb=max_memory_mb)
             created["registration"] = existing is None
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
         os.close(registry_fd)
     result = {"application_id": app, "deployment_user": account["name"], "host_port": record["host_port"],
-              "api_domain": record["api_domain"], "runtime": record["runtime"], "max_memory_mb": record["max_memory_mb"],
+              "api_domain": record["api_domain"], "hostnames": record.get("hostnames") or [],
+              "runtime": record["runtime"], "max_memory_mb": record["max_memory_mb"],
               "key_fingerprint": key.fingerprint,
               "created": created}
     if update:
         result["updated"] = changed
         result["route_changed"] = route_changed
-        result["changes"] = {field: {"from": previous[field], "to": record[field]}
-                             for field in ("api_domain", "max_memory_mb") if previous[field] != record[field]}
+        changes = {}
+        for field in ("api_domain", "hostnames", "max_memory_mb"):
+            before, after = previous.get(field), record.get(field)
+            if field == "hostnames":
+                before, after = before or [], after or []
+            if before != after:
+                changes[field] = {"from": before, "to": after}
+        result["changes"] = changes
     return result
 
 

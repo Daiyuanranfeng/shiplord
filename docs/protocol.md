@@ -113,7 +113,7 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 | Action | `arguments` |
 | --- | --- |
-| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname or ceiling to an existing application |
+| `provision` | `runtime`, `api_domain`, optional `hostnames` (additional hostnames that redirect to it), `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname, additional hostnames, or ceiling to an existing application |
 | `keys` | `operation` (`add`, `remove`, `list`), `label`, `public_key` |
 | `environment` | `operation` (`set`, `clear`, `keys`), `text` |
 | `registry` | `operation` (`login`, `logout`, `list`), `registry` (`ghcr.io`), `username`, `token` |

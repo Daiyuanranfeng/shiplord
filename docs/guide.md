@@ -105,6 +105,36 @@ shiplord recover
 Create the DNS record for `--api-domain` at your DNS provider; Shiplord checks DNS and reports it but never
 changes it.
 
+### Additional hostnames
+
+`http.api_domain` is the canonical hostname: the one that serves the application. An application can also answer
+on additional hostnames that permanently redirect (HTTP 308) to the canonical one, keeping the path and query
+string:
+
+```sh
+shiplord configure --server production --api-domain orders.example.com --no-frontend \
+  --hostname legacy.example.com --www          # --www adds www.orders.example.com
+```
+
+`--hostname` is repeatable, and `--www` adds `www.<api-domain>`. The same settings in `ship.toml` are:
+
+```toml
+[http]
+api_domain = "orders.example.com"
+hostnames = ["legacy.example.com"]
+www_redirect = true
+```
+
+The additional hostnames are part of the application's registration: `provision` records them, and a deployment
+whose manifest lists different ones is refused before anything runs. Changing them afterwards is an administrative
+change to the registration, not something a deployment account can do. `shiplord plan` shows them, and
+`shiplord status --json` includes them. Each hostname needs its own DNS record; Shiplord checks DNS and reports it
+but never changes it.
+
+A redirect never points at itself, so an alias cannot be the canonical hostname, a duplicate, or a `www` name
+outside the canonical hostname's own name. The canonical hostname still serves the application; only the aliases
+redirect.
+
 ### Releasing a native binary
 
 For a native Linux binary, configure with `--runtime native` once, then build and deploy. Shiplord does not
@@ -572,12 +602,13 @@ not edit any manifest, so a manifest that names the old alias must be updated to
 
 ## What a deployment does
 
-1. The helper checks the request against the application's registration (hostname, runtime, image repository)
-   and refuses anything that would change them.
+1. The helper checks the request against the application's registration (hostname and any additional hostnames,
+   runtime, image repository) and refuses anything that would change them.
 2. **Prepare, without touching the running app:** pull the image by digest (platform and revision label
    verified) or verify and install the uploaded binary. A failure here changes nothing.
 3. **Journal** the transaction, replace the runtime (a brief restart window), poll the readiness path.
-4. Apply the Caddy route only if it changed, verify the active configuration routes the hostname, then commit.
+4. Apply the Caddy route only if it changed, verify the active configuration serves the hostname and redirects
+   every additional hostname to it, then commit.
 5. On any failure, restore the last committed release, verify it, and only then clear the journal. The command
    still exits nonzero. A first release that fails leaves no runtime and no route.
 6. A candidate that failed leaves nothing behind; the image or binary of a release that leaves the

@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from . import detect
@@ -98,13 +98,14 @@ def repository_from_git_remote(root: Path) -> str | None:
 
 def create_manifest(directory: Path, name: str, server: str, api_domain: str,
                     origins: list[str], runtime: str = "docker", template: str = "google-adk", *,
+                    hostnames: Sequence[str] | None = None, www_redirect: bool = False,
                     container_port: int = DEFAULT_CONTAINER_PORT, readiness_path: str = DEFAULT_READINESS_PATH,
                     memory_mb: int = DEFAULT_MEMORY_MB, image_repository: str | None = None) -> Path:
     raw = {
         "schema_version": 1, "name": name, "server": server,
         "template": template, "runtime": runtime,
-        "http": {"api_domain": api_domain, "frontend_origins": origins,
-                 "container_port": container_port, "readiness_path": readiness_path},
+        "http": {"api_domain": api_domain, "hostnames": list(hostnames or []), "www_redirect": www_redirect,
+                 "frontend_origins": origins, "container_port": container_port, "readiness_path": readiness_path},
         "resources": {"memory_mb": memory_mb},
         "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2},
     }
@@ -113,11 +114,14 @@ def create_manifest(directory: Path, name: str, server: str, api_domain: str,
     config = validate_manifest(raw)
     quote = json.dumps
     origin_list = ", ".join(quote(origin) for origin in config["http"]["frontend_origins"])
+    # `www_redirect` is expanded by validation, so the file records the aliases it produces and no second rule.
+    hostname_list = ", ".join(quote(host) for host in config["http"].get("hostnames") or [])
     content = (
         f'schema_version = 1\nname = {quote(config["name"])}\n'
         f'server = {quote(config["server"])}\ntemplate = {quote(config["template"])}\n'
         f'runtime = {quote(config["runtime"])}\n\n'
         f'[http]\napi_domain = {quote(config["http"]["api_domain"])}\n'
+        + (f'hostnames = [{hostname_list}]\n' if hostname_list else "") +
         f'frontend_origins = [{origin_list}]\ncontainer_port = {config["http"]["container_port"]}\n'
         f'readiness_path = {quote(config["http"]["readiness_path"])}\n\n'
         f'[resources]\nmemory_mb = {config["resources"]["memory_mb"]}\n\n'
@@ -149,17 +153,20 @@ Ask = Callable[[str, "str | None"], str]
 def configure_application(directory: Path, given: dict, *, interactive: bool,
                           servers: list[dict[str, str]] | None = None, ask: Ask | None = None,
                           say: Callable[[str], None] = lambda text: None,
-                          confirm: Callable[[dict], bool] | None = None) -> dict:
+                          confirm: Callable[[dict], bool] | None = None,
+                          hostnames: Sequence[str] = (), www_redirect: bool = False) -> dict:
     """Write ``ship.toml`` from the given values, asking for the missing ones only at a terminal.
 
-    ``given`` holds the ``configure`` options (None when not given). Returns the answers. Nothing is written when
-    the directory already has a manifest, an answer is invalid, or ``confirm`` declines the summary.
+    ``given`` holds the ``configure`` options (None when not given). ``hostnames`` and ``www_redirect`` come from
+    flags, so they need no question. Returns the answers. Nothing is written when the directory already has a
+    manifest, an answer is invalid, or ``confirm`` declines the summary.
     """
     destination = directory / "ship.toml"
     if destination.exists() or destination.is_symlink():
         raise ConfigurationError("ship.toml already exists; no file was replaced")
     if interactive:
         answers = collect_answers(given, root=directory, servers=servers or [], ask=ask, say=say)
+        answers["hostnames"], answers["www_redirect"] = list(hostnames), www_redirect
         if confirm is not None and not confirm(answers):
             raise ConfigurationCancelled("no file was created")
     else:
@@ -172,8 +179,10 @@ def configure_application(directory: Path, given: dict, *, interactive: bool,
                        template=given["template"] or "google-adk")
         answers["image_repository"] = resolve_image_repository(directory, answers["runtime"],
                                                                answers.get("image_repository"), ask=None, say=say)
+        answers["hostnames"], answers["www_redirect"] = list(hostnames), www_redirect
     create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
-                    answers["runtime"], answers["template"],
+                    answers["runtime"], answers["template"], hostnames=answers["hostnames"],
+                    www_redirect=answers["www_redirect"],
                     **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
                        if answers[key] is not None},
                     image_repository=answers.get("image_repository"))

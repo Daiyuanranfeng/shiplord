@@ -637,12 +637,20 @@ def _confirm_manifest(answers: dict) -> bool:
     for label, key in summary:
         value = answers[key]
         typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
+    if answers.get("hostnames"):
+        typer.echo(f"  additional hostnames: {', '.join(answers['hostnames'])}")
+    if answers.get("www_redirect"):
+        typer.echo(f"  www redirect: www.{answers['api_domain']}")
     return typer.confirm("Write ship.toml?", default=True)
 
 
 @app.command(rich_help_panel="Setup")
 def configure(server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
               api_domain: Optional[str] = typer.Option(None, "--api-domain", help="Public hostname of the application."),
+              hostname: Optional[list[str]] = typer.Option(
+                  None, "--hostname", help="Additional hostname that redirects to --api-domain (repeatable)."),
+              www: bool = typer.Option(False, "--www",
+                                       help="Also redirect www.<api-domain> to the canonical hostname."),
               frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
               no_frontend: bool = typer.Option(False, "--no-frontend"),
               name: Optional[str] = typer.Option(None, "--name"),
@@ -681,7 +689,8 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
         answers = configure_application(directory, given, interactive=interactive,
                                         servers=servers() if interactive else None,
                                         ask=_ask if interactive else None, say=typer.echo,
-                                        confirm=_confirm_manifest if interactive else None)
+                                        confirm=_confirm_manifest if interactive else None,
+                                        hostnames=hostname or (), www_redirect=www)
         written = load_manifest(directory / "ship.toml")
     except (ConfigurationCancelled, typer.Abort):
         _setup_fail("cancelled; no file was created", 1, json_output)

@@ -147,6 +147,37 @@ class ManifestTests(unittest.TestCase):
             self.load('name = "secretvalue')
         self.assertNotIn("secretvalue", str(caught.exception))
 
+    def with_http(self, extra: str) -> dict:
+        return self.load(MANIFEST.replace('api_domain = "orders-api.example.com"',
+                                          'api_domain = "orders-api.example.com"\n' + extra))
+
+    def test_additional_hostnames_and_the_www_alias_are_expanded(self):
+        aliases = self.with_http('hostnames = ["legacy.example.com", "www.orders-api.example.com"]')
+        self.assertEqual(aliases["http"]["hostnames"],
+                         ["legacy.example.com", "www.orders-api.example.com"])
+        self.assertEqual(self.with_http("www_redirect = true")["http"]["hostnames"],
+                         ["www.orders-api.example.com"])
+        # Without aliases the key is absent, so a record written before aliases existed validates unchanged.
+        self.assertNotIn("hostnames", self.load(MANIFEST)["http"])
+
+    def test_unusable_additional_hostnames_are_rejected(self):
+        cases = {
+            "duplicate": 'hostnames = ["legacy.example.com", "legacy.example.com"]',
+            "the canonical hostname": 'hostnames = ["orders-api.example.com"]',
+            "www outside the canonical hostname": 'hostnames = ["www.other.example.com"]',
+            "uppercase": 'hostnames = ["Legacy.example.com"]',
+            "ip address": 'hostnames = ["127.0.0.1"]',
+            "wildcard": 'hostnames = ["*.example.com"]',
+            "not a list": 'hostnames = "legacy.example.com"',
+            "not strings": "hostnames = [1]",
+            "www twice": 'hostnames = ["www.orders-api.example.com"]\nwww_redirect = true',
+            "www_redirect not a boolean": 'www_redirect = "yes"',
+        }
+        for label, extra in cases.items():
+            with self.subTest(label), self.assertRaises(ManifestError) as caught:
+                self.with_http(extra)
+            self.assertNotIn("other.example.com", str(caught.exception))
+
     def test_configuration_reports_unusable_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigurationError, "could not create ship.toml"):

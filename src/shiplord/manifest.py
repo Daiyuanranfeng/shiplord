@@ -107,6 +107,29 @@ def validate_hostname(value: object, name: str) -> str:
     return _hostname(value, name)
 
 
+def validate_hostnames(primary: object, value: object, name: str) -> list[str]:
+    """Validate the additional hostnames an application answers on, given its canonical hostname.
+
+    Every entry is a lowercase DNS hostname that is neither the canonical one nor a repeat. An entry whose
+    first label is ``www`` must be a subdomain of the canonical hostname: that alias is the web address of the
+    same site, so redirecting it to the canonical hostname stays inside the name the site was registered for.
+    """
+    canonical = _hostname(primary, "api_domain")
+    if not isinstance(value, list):
+        raise ManifestError(f"{name} must be an explicit list")
+    validated: list[str] = []
+    for entry in value:
+        host = _hostname(entry, f"{name} item")
+        if host == canonical:
+            raise ManifestError(f"{name} must not repeat the canonical hostname")
+        if host.split(".")[0] == "www" and not host.endswith("." + canonical):
+            raise ManifestError(f"{name} must not contain a www hostname outside the canonical hostname")
+        if host in validated:
+            raise ManifestError(f"{name} must not contain duplicates")
+        validated.append(host)
+    return validated
+
+
 def validate_origin(value: object) -> str:
     """Validate one frontend origin (scheme, host, optional port; no path or credentials)."""
     return _origin(value)
@@ -173,8 +196,17 @@ def validate_manifest(raw: dict) -> dict:
     if template == "generic" and runtime != "docker":
         raise ManifestError("the generic template requires the docker runtime")
 
-    http = _table(root.get("http"), "http", {"api_domain", "frontend_origins", "container_port", "readiness_path"})
+    http = _table(root.get("http"), "http", {"api_domain", "hostnames", "www_redirect", "frontend_origins",
+                                             "container_port", "readiness_path"})
     domain = _hostname(http.get("api_domain"), "http.api_domain")
+    additional = http.get("hostnames", [])
+    if not isinstance(additional, list):
+        raise ManifestError("http.hostnames must be an explicit list")
+    www = http.get("www_redirect", False)
+    if type(www) is not bool:
+        raise ManifestError("http.www_redirect must be true or false")
+    # The alias is expanded here so a release record and a registration hold one list and no second source of truth.
+    hostnames = validate_hostnames(domain, additional + (["www." + domain] if www else []), "http.hostnames")
     origins = http.get("frontend_origins")
     if not isinstance(origins, list):
         raise ManifestError("http.frontend_origins must be an explicit list")
@@ -206,8 +238,11 @@ def validate_manifest(raw: dict) -> dict:
                 raise ManifestError(str(error)) from None
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
-            "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness_path},
+            "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port,
+                     "readiness_path": readiness_path},
             "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}
+    if hostnames:  # a record without additional hostnames stays byte-identical to the manifest that declared none
+        result["http"]["hostnames"] = hostnames
     if cpus is not None:
         result["resources"]["cpu_limit"] = cpus
     result["deploy"].update(readiness_knobs)
