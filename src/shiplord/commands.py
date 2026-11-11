@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import build
 from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .jobs import valid_job_id
@@ -326,6 +327,29 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
             result["ok"], code = False, 1
             result["error"] = "the deployment is live on the server, but the public HTTPS check failed"
     return code, result
+
+
+def release_application(manifest: dict, client: HelperClient, *, commit: str, image_repository: str | None = None,
+                        tag: str | None = None, platform: str | None = None, builder: build.Builder | None = None,
+                        **deploy_options) -> tuple[int, dict]:
+    """Build and push this checkout's image, then deploy the pushed digest through the normal deploy path."""
+    repository = image_repository_for(manifest, image_repository)
+    if repository is None:
+        raise CommandError("`shiplord release` builds a Docker image; use `shiplord deploy --binary` for a native "
+                           "application", 2)
+    tag = tag or commit
+    # Apply deploy's own rules to the repository and commit before anything is built or pushed.
+    validate_deploy_inputs(manifest, f"{repository}@sha256:{'0' * 64}", commit)
+    builder = builder or build.Builder()
+    try:
+        prepared = builder.plan(repository=repository, tag=tag, platform=platform or build.DEFAULT_PLATFORM,
+                                commit=commit)
+        builder.require_clean_tree()
+        artifact = builder.build_and_push(prepared)
+    except build.BuildError as error:
+        raise CommandError(str(error), error.code) from None
+    code, result = deploy_application(manifest, client, image=artifact["image"], commit=commit, **deploy_options)
+    return code, {**result, "build": artifact}
 
 
 def plan_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,

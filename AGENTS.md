@@ -9,10 +9,15 @@ Release, from the application's directory (it contains `ship.toml`):
 
 ```sh
 shiplord doctor --json                                   # prerequisites, SSH access, helper, DNS
-shiplord plan --image <registry/name@sha256:digest> --commit <40-hex sha> --json   # read-only
+shiplord release --json                                  # build and push this checkout, then deploy its digest
+shiplord plan --image <registry/name@sha256:digest> --commit <40-hex sha> --json   # read-only, prebuilt image
 shiplord deploy --image <registry/name@sha256:digest> --commit <40-hex sha> --json
 shiplord status --json
 ```
+
+`shiplord release` refuses a dirty working tree, builds for the server's platform (`--platform`, default
+`linux/amd64`), labels the image with the commit, and deploys the pushed digest. Use `plan`/`deploy` when the image
+was already built elsewhere (for example CI).
 
 Native binaries: `shiplord deploy --binary <path> --commit <sha> --json` (a Linux ELF for the server's CPU).
 

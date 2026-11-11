@@ -167,6 +167,7 @@ class CLITests(unittest.TestCase):
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
                     ["restart", "--json"], ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["release", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:

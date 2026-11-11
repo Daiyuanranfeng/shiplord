@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add `shiplord release` to build and push a Docker image from a clean checkout,
+  then deploy the pushed digest without copying it by hand.
 - Add `shiplord setup`, which runs configure, provision, env, registry login,
   github setup, and check-ci in order and resumes at the first incomplete step.
 - Render every command's result as readable lines, and accept `--json` on

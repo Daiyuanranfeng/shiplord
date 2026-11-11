@@ -89,7 +89,8 @@ shiplord restart                                     # apply the environment to 
 shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
 
 # every release
-shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only
+shiplord release                                        # build, push, and deploy this checkout
+shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only, prebuilt image
 shiplord deploy --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>
 shiplord status
 shiplord logs --tail 100
@@ -431,6 +432,7 @@ reach the run page or the calling job.
 | `env set --from-file F` / `env diff --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `diff` previews the key names it would add or remove without reading values; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
+| `release [--image-repository R] [--tag T] [--platform P]` | Build and push this checkout, then deploy the pushed digest. Refuses a dirty tree. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |

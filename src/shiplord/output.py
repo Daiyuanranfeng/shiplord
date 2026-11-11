@@ -539,7 +539,7 @@ def render_operation(code: int, result: dict, target: str, operation: str, say: 
     public = result.get("public")
     if operation == "plan":
         outcome = _plan_outcome(result)
-    elif operation == "deployment" and isinstance(public, dict) and public.get("ok") is False:
+    elif operation in {"deployment", "release"} and isinstance(public, dict) and public.get("ok") is False:
         outcome = "deployed; public HTTPS check failed"
     elif status in {"recovery_required", "intervention_required", "interrupted"} or result.get("error") == "recovery_required":
         outcome = "recovery required"
@@ -557,7 +557,12 @@ def render_operation(code: int, result: dict, target: str, operation: str, say: 
             say(f"{label}: {result[name]}")
     if operation == "plan":
         render_plan_details(result, say)
-    elif operation == "deployment":
+    elif operation in {"deployment", "release"}:
+        if operation == "release":
+            image = result.get("build")
+            if isinstance(image, dict):
+                say(f"Image: {image['image']}")
+                say(f"Platform: {image['platform']}")
         if result.get("request_id") is not None:
             say(f"Request ID: {result['request_id']}")
         release = result.get("release")

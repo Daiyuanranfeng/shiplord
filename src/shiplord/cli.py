@@ -15,7 +15,7 @@ from typing import Callable, NoReturn, Optional
 import typer
 
 from . import __version__
-from . import commands, github, output, setup as setup_module, tailscale
+from . import build, commands, github, output, setup as setup_module, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
 from .configure import ConfigurationCancelled, ConfigurationError, configure_application, validate_repository
@@ -682,13 +682,13 @@ def provision(public_key: Optional[Path] = typer.Option(None, "--public-key", he
              lambda code, result: output.render_provision(result, target))
 
 
-def _head_commit() -> str:
+def _head_commit(hint: str = "pass --commit") -> str:
     try:
         result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        raise CommandError("could not run git; pass --commit", 3) from None
+        raise CommandError(f"could not run git; {hint}", 3) from None
     if result.returncode != 0:
-        raise CommandError("could not read HEAD; pass --commit", 2)
+        raise CommandError(f"could not read HEAD; {hint}", 2)
     return result.stdout.strip()
 
 
@@ -721,6 +721,40 @@ def deploy(image: Optional[str] = typer.Option(None, "--image", help="Immutable 
             verify_public=verify_public, require_public=require_public)
     _execute(action, json_output, lambda code, result: output.render_operation(
         code, result, f"{manifest['name']} on {manifest['server']}", "deployment"))
+
+
+@app.command(rich_help_panel="Quick start")
+def release(image_repository: Optional[str] = typer.Option(None, "--image-repository",
+                                                          help="Image repository to push to; default from [github]."),
+            tag: Optional[str] = typer.Option(None, "--tag", help="Image tag to push (default: the commit SHA)."),
+            platform: str = typer.Option(build.DEFAULT_PLATFORM, "--platform",
+                                         help="Server platform: linux/amd64 or linux/arm64."),
+            sequence: Optional[int] = typer.Option(None, "--sequence",
+                                                   help="Release ordering key; default: the commit time.",
+                                                   rich_help_panel="Advanced options"),
+            request_id: Optional[str] = typer.Option(None, "--request-id",
+                                                     help="Reuse to retry a deployment safely.",
+                                                     rich_help_panel="Advanced options"),
+            allow_older: bool = typer.Option(False, "--allow-older", rich_help_panel="Advanced options"),
+            timeout: Optional[int] = typer.Option(None, "--timeout", rich_help_panel="Advanced options"),
+            require_public: bool = typer.Option(False, "--require-public",
+                                                help="Fail if the public HTTPS check fails.",
+                                                rich_help_panel="Advanced options"),
+            verify_public: bool = typer.Option(True, "--verify-public/--no-verify-public",
+                                               rich_help_panel="Advanced options"),
+            json_output: bool = typer.Option(False, "--json")) -> None:
+    """Build and push this checkout's image, then deploy the pushed digest."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        commit = _head_commit("run `shiplord release` inside the application's Git repository")
+        return commands.release_application(
+            manifest, _helper(manifest), commit=commit, image_repository=image_repository, tag=tag, platform=platform,
+            sequence=commands.commit_sequence(commit, sequence), request_id=request_id, timeout=timeout,
+            allow_older=allow_older, on_progress=_progress(json_output), verify_public=verify_public,
+            require_public=require_public)
+    _execute(action, json_output, lambda code, result: output.render_operation(
+        code, result, f"{manifest['name']} on {manifest['server']}", "release"))
 
 
 @app.command(rich_help_panel="Quick start")

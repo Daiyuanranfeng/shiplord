@@ -42,6 +42,8 @@ DEPLOYED = {
     "release": {"commit": COMMIT, "artifact": IMAGE}, "url": "https://orders.example.com",
     "public": {"ok": True, "status": 200, "error": None}, "warnings": ["cleanup skipped"],
 }
+RELEASED = {**DEPLOYED, "build": {"repository": "ghcr.io/example/orders", "tag": COMMIT, "platform": "linux/amd64",
+                                "revision": COMMIT, "digest": "sha256:" + "a" * 64, "image": IMAGE}}
 PLANNED = {
     "ok": True, "scope": "server plan; nothing was changed", "action": "deploy",
     "candidate": {"commit": COMMIT, "sequence": 1001, "artifact": IMAGE},
@@ -284,6 +286,14 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli.commands.commit_sequence", {"return_value": 1001}),
                          ("shiplord.cli.commands.deploy_application", {"return_value": (0, DEPLOYED)})]),
                 DEPLOYED, ("Outcome: succeeded", "Public HTTPS: passed", "Warning: cleanup skipped")),
+            Case("release", lambda as_json: self.invoke(
+                ["release"], as_json,
+                patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._helper", {}),
+                         ("shiplord.cli._head_commit", {"return_value": COMMIT}),
+                         ("shiplord.cli.commands.commit_sequence", {"return_value": 1001}),
+                         ("shiplord.cli.commands.release_application", {"return_value": (0, RELEASED)})]),
+                RELEASED, ("Outcome: succeeded", "Image: " + IMAGE, "Platform: linux/amd64")),
             Case("status", lambda as_json: self.invoke(
                 ["status", "orders", "--server", "production"], as_json,
                 patches=[("shiplord.cli._app_context", {"return_value": ("orders", "production", object())}),
