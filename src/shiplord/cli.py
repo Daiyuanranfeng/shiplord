@@ -908,8 +908,8 @@ def env_clear(json_output: bool = typer.Option(False, "--json")) -> None:
 
 def _ask_tailscale(instructions: dict) -> tuple[str, str] | None:
     """Show the filled-in Tailscale steps and read the two identifiers (not secrets) from the terminal."""
-    typer.echo("Tailscale is not set up for CI yet. Shiplord cannot create the trust credential for you, but here is "
-               "exactly what to enter:\n")
+    typer.echo("Tailscale is not set up for CI yet. Set TAILSCALE_API_KEY and rerun to have Shiplord create the trust "
+               "credential, or enter the values below yourself:\n")
     for number, step in enumerate(instructions["steps"], 1):
         typer.echo(f"  {number}. {step}")
     if instructions.get("warning"):
@@ -1055,13 +1055,15 @@ def _github_setup(manifest: dict, repository: str, *, json_output: bool, interac
     gh = github.GitHub()
     if interactive is None:
         interactive = sys.stdin.isatty() and not json_output
+    tags = [tag for tag in given.get("SHIPLORD_TS_TAGS", "").split(",") if tag]
+    target = load_server(manifest["server"])  # fail before creating a Tailscale credential
     try:
         settings, origin = tailscale.resolve(
             given, ask=_ask_tailscale if interactive else None,
-            guide=lambda: github.tailscale_guidance(gh, repository, manifest))
+            guide=lambda: github.tailscale_guidance(gh, repository, manifest),
+            provision=lambda: github.tailscale_credential(gh, repository, manifest, tags=tags))
     except tailscale.TailscaleError as error:
         raise CommandError(str(error)) from None
-    target = load_server(manifest["server"])
     result = github.github_setup(manifest, repository, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                  admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
                                  tailscale=settings, force_workflow=force_workflow, quality_workflow=quality_workflow,
@@ -1084,7 +1086,10 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                                                                   help="Do not run a quality job before deploy."),
                          force_workflow: bool = typer.Option(False, "--force-workflow"),
                          json_output: bool = typer.Option(False, "--json")) -> None:
-    """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow."""
+    """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow.
+
+    With TAILSCALE_API_KEY set, also create the Tailscale federated trust credential; otherwise print the steps.
+    """
     manifest = _manifest(json_output)
     _execute(lambda: _github_setup(manifest, repo, json_output=json_output, ci_host=ci_host, tooling_ref=tooling_ref,
                                    platforms=platforms, tailscale_client_id=tailscale_client_id,

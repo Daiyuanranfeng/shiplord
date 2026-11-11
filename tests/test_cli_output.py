@@ -357,6 +357,7 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli.github.validate_setup_request", {"return_value": None}),
                          ("shiplord.cli.load_server", {"return_value": "admin@example.com"}),
                          ("shiplord.cli.github.GitHub", {"return_value": MagicMock()}),
+                         ("shiplord.cli.github.tailscale_credential", {"return_value": None}),
                          ("shiplord.cli.github.github_setup", {"return_value": dict(GITHUB_SETUP)})]),
                 {**GITHUB_SETUP, "tailscale": {"source": "not configured", "warnings": []}},
                 ("Outcome: CI configured", "Steps:", "secret: SHIPLORD_SSH_KEY stored", "Remaining:")),

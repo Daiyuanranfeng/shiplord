@@ -103,6 +103,7 @@ class FakeHost:
                 patch("shiplord.commands.registry_other", side_effect=self.registry_other),
                 patch("shiplord.commands.registry_login", side_effect=self.registry_login),
                 patch("shiplord.github.github_setup", side_effect=self.github_setup),
+                patch("shiplord.github.tailscale_credential", return_value=None),
                 patch("shiplord.github.setup_complete", side_effect=self.setup_complete),
                 patch("shiplord.github.check_ci", side_effect=self.check_ci)]
 

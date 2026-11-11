@@ -348,13 +348,16 @@ stdin) and sets the `SHIPLORD_*` repository variables. It then writes `.github/w
 the template's quality checks, an image build, and `shiplord deploy` by digest from a runner joined to your tailnet.
 It is resumable, keeps the private key only until GitHub has it, and never uploads your personal key.
 
-Two things stay with you because they need authority Shiplord does not have: the **Tailscale trust credential** and
-**DNS**. For Tailscale, `github setup` guides you instead: it reads the OIDC subject GitHub will actually present (repositories
-with immutable subjects use `repo:Owner@<id>/name@<id>`, not the plain names), prints the policy line and the
-credential settings with every value filled in, asks for the client ID and audience (not secrets), checks they belong
-together, and saves them so the next application's setup does not ask again. Use the owner-wide subject it suggests,
-`repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every repository. `--tailscale-client-id` and
-`--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
+Two things need authority Shiplord does not have by default: the **Tailscale trust credential** and **DNS**. For
+Tailscale, set `TAILSCALE_API_KEY` to a Tailscale API token that may create federated identities and `github setup`
+creates the credential itself, with the owner-wide subject, then stores the client ID and audience. The token is used
+for that one request and is never saved or printed. Without a token, `github setup` guides you instead: it reads the
+OIDC subject GitHub will actually present (repositories with immutable subjects use `repo:Owner@<id>/name@<id>`, not
+the plain names), prints the policy line and the credential settings with every value filled in, asks for the client
+ID and audience (not secrets), checks they belong together, and saves them so the next application's setup does not
+ask again. Use the owner-wide subject it suggests, `repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every
+repository. `--tailscale-client-id` and `--tailscale-audience` skip the prompt. `github check-ci` then proves the whole
+path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
 production deploy, and gives `id-token: write` only to the jobs that need it. `rotate-key` adds and proves a new key,
 updates GitHub, and only then revokes the old one. It finds the key to replace in the server's authorized-keys list,
 so it works from a machine that never ran `github setup`; local setup state is kept per server and application.

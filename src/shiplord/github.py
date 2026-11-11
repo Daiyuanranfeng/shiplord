@@ -34,6 +34,7 @@ from .workflow import (DEFAULT_QUALITY_WORKFLOW, DEPLOY_WORKFLOW_PATH, TOOLING_R
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
 TAILSCALE_VARIABLES = ("SHIPLORD_TS_CLIENT_ID", "SHIPLORD_TS_AUDIENCE", "SHIPLORD_TS_TAGS")
+TAILSCALE_API_TOKEN_ENV = tailscale.API_TOKEN_ENV  # the github_setup parameter shadows the module name
 WRITE_PERMISSIONS = ("ADMIN", "MAINTAIN")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}\Z")
@@ -419,8 +420,8 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         steps["tailscale"] = "not configured"
         extra["tailscale_setup"] = tailscale_guidance(gh, repository, manifest)
         remaining.append("Create the Tailscale trust credential as described in tailscale_setup, then rerun with "
-                         "--tailscale-client-id and --tailscale-audience (Shiplord cannot do this without Tailscale "
-                         "administrative credentials).")
+                         "--tailscale-client-id and --tailscale-audience. Shiplord creates it for you when "
+                         f"{TAILSCALE_API_TOKEN_ENV} holds a Tailscale API token that may create federated identities.")
     else:
         remaining.append("Make sure the Tailscale trust credential gives tag:ci and that tag:ci may reach the server's "
                          "SSH port; Shiplord cannot check the tailnet policy.")
@@ -440,6 +441,24 @@ def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
         return tailscale.guidance(prefix, branch, custom_claims=custom)
     except tailscale.TailscaleError as error:
         raise GitHubError(str(error), 3, "tailscale") from None
+
+
+def tailscale_credential(gh: GitHub, repository: str, manifest: dict, *, tags: list[str] | None = None,
+                         environ: Mapping[str, str] | None = None, transport: tailscale.Transport | None = None
+                         ) -> tuple[dict[str, str], list[str]] | None:
+    """Create the trust credential through the Tailscale API when a token is in the environment.
+
+    Returns ``(settings, warnings)`` or ``None`` when no token is set, so the caller falls back to the printed
+    instructions. The owner-wide subject is used, so a later repository of the same owner reuses this credential
+    instead of needing its own manual step. The token is never returned, stored or printed.
+    """
+    token = tailscale.api_token(environ)
+    if token is None:
+        return None
+    instructions = tailscale_guidance(gh, repository, manifest)
+    return tailscale.create_federated_identity(
+        token, subject=instructions["subject_all_repositories"], tags=tags or [instructions["tag"]],
+        description=f"shiplord: {repository}", transport=transport)
 
 
 def _resolve_quality_workflow(project: Path, requested: str | None, include: bool) -> str | None:

@@ -11,11 +11,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from typer.testing import CliRunner
 
-from shiplord import cli
+from shiplord import cli, tailscale
 from shiplord.client import AdminClient, ClientError, HelperClient
 from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
@@ -125,6 +125,8 @@ class CLITests(unittest.TestCase):
             executable = Path(__import__("sys").executable).parent / "shiplord"
         if env is None:  # configure consults the registered servers; never read the developer's own configuration
             env = dict(os.environ, XDG_CONFIG_HOME=str(Path(directory) / ".test-config"))
+        # A real Tailscale token in the developer's environment must never reach a test: it would call the API.
+        env = {name: value for name, value in env.items() if name != tailscale.API_TOKEN_ENV}
         # stdin is not a terminal, so no command may wait for an answer.
         return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
                               env=env, stdin=subprocess.DEVNULL)
@@ -259,6 +261,62 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "doctor", "--local", "--server", "production", "--json")
         self.assertEqual(result.returncode, 2)
         self.assertFalse(json.loads(result.stdout)["ok"])
+
+    def test_github_setup_creates_the_tailscale_credential_when_a_token_is_in_the_environment(self):
+        token = "tskey-api-throwaway-fixture-value"
+        manifest = load_manifest(Path(self.write_manifest()))
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=transport), \
+                patch.dict(os.environ, {tailscale.API_TOKEN_ENV: token, "XDG_CONFIG_HOME": config}):
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(token, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "created through the Tailscale API")
+        self.assertEqual(setup.call_args.kwargs["tailscale"],
+                         {"SHIPLORD_TS_CLIENT_ID": "id123456", "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        payload = json.loads(requests[0][2])
+        self.assertEqual(payload["subject"], "repo:QueryPlanner/*:ref:refs/heads/main")
+        self.assertNotIn(token, json.dumps(payload))
+
+    def test_github_setup_without_a_token_keeps_the_printed_instructions_and_makes_no_request(self):
+        manifest = load_manifest(Path(self.write_manifest()))
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=AssertionError("must not call Tailscale")), \
+                patch.dict(os.environ, {"XDG_CONFIG_HOME": config}, clear=False):
+            os.environ.pop(tailscale.API_TOKEN_ENV, None)
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "not configured")
+        self.assertEqual(setup.call_args.kwargs["tailscale"], {})
+
+    def write_manifest(self) -> str:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = Path(directory) / "ship.toml"
+        path.write_text(MANIFEST)
+        return str(path)
 
     def test_configure_creates_a_valid_manifest_without_github_settings(self):
         with tempfile.TemporaryDirectory() as parent:
