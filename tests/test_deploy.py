@@ -100,9 +100,9 @@ class DeployTestCase(unittest.TestCase):
             self.state.initialize()
         self.build()
 
-    def build(self):
+    def build(self, registration=None):
         self.routes = RouteManager(self.caddy_root, self.lock, self.caddy)
-        self.deployer = Deployer(registration=REGISTRATION, state=self.state, routes=self.routes,
+        self.deployer = Deployer(registration=registration or REGISTRATION, state=self.state, routes=self.routes,
                                  runtime=self.runtime, probes=self.probes,
                                  progress=lambda phase, info: self.progress.append(phase))
 
@@ -113,12 +113,54 @@ class DeployTestCase(unittest.TestCase):
     def deploy(self, **kwargs):
         return self.run_locked(self.deployer.deploy, request(**kwargs))
 
+    ALIASES = ["legacy.example.com", "www.orders.example.com"]
+
+    def alias_deployer(self, hostnames=None):
+        self.build(validate_registration(dict(REGISTRATION, hostnames=hostnames or self.ALIASES)))
+        return self.deployer
+
+    def alias_request(self, hostnames=None, **kwargs):
+        return request(configuration=configuration(hostnames=hostnames or self.ALIASES), **kwargs)
+
     @property
     def route_file(self):
         return self.caddy_root / "ship" / "orders.caddy"
 
 
 class DeployFlowTests(DeployTestCase):
+    def test_aliases_are_routed_on_the_first_deploy_and_reported(self):
+        self.alias_deployer()
+        outcome = self.run_locked(self.deployer.deploy, self.alias_request())
+        self.assertEqual((outcome.status, outcome.exit_code), ("succeeded", 0))
+        route = self.route_file.read_bytes()
+        for alias in self.ALIASES:
+            self.assertIn(f"\n{alias} {{\n\tredir https://orders.example.com{{uri}} 308\n}}\n".encode(), route)
+        self.assertTrue(outcome.detail["probes"]["route_changed"])
+        self.assertEqual(self.deployer.status()["hostnames"], self.ALIASES)
+
+    def test_a_deploy_whose_aliases_differ_from_the_registration_is_refused_before_any_side_effect(self):
+        self.alias_deployer()
+        before = self.state.read_state()
+        cases = {
+            "aliases dropped": request(),
+            "other alias": request(configuration=configuration(hostnames=["other.example.com"])),
+            "one alias fewer": request(configuration=configuration(hostnames=self.ALIASES[:1])),
+        }
+        for label, value in cases.items():
+            with self.subTest(label):
+                outcome = self.run_locked(self.deployer.deploy, value)
+                self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2), outcome.detail)
+                self.assertIn("additional hostnames", outcome.detail["message"])
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.state.read_state(), before)
+        self.assertFalse(self.route_file.exists())
+
+    def test_a_registered_alias_cannot_be_dropped_by_a_manifest_that_omits_it(self):
+        self.build(validate_registration(dict(REGISTRATION, hostnames=["legacy.example.com"])))
+        outcome = self.run_locked(self.deployer.deploy, request())
+        self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2))
+        self.assertFalse(self.route_file.exists())
+
     def test_first_deploy_commits_routes_and_reports_each_probe_separately(self):
         outcome = self.deploy()
         self.assertEqual((outcome.status, outcome.exit_code, outcome.ok), ("succeeded", 0, True))
@@ -222,6 +264,27 @@ class DeployFlowTests(DeployTestCase):
         self.assertEqual(self.runtime.calls, [])
         self.assertEqual(self.state.read_state(), before)
         self.assertFalse(self.route_file.exists())
+
+    def test_a_routing_probe_that_cannot_see_an_alias_redirect_rolls_back(self):
+        self.alias_deployer()
+        self.assertEqual(self.run_locked(self.deployer.deploy, self.alias_request()).status, "succeeded")
+        self.probes.routing_result = False
+        outcome = self.run_locked(self.deployer.deploy, self.alias_request(request_id="req-2", commit="c", image="d",
+                                                                          sequence=1001))
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["phase"]), ("rolled_back", 5, "routing"))
+        self.assertIn("hostnames as rendered", outcome.detail["message"])
+        self.assertEqual(self.runtime.running, {release_id(record())})
+        self.assertEqual(identity(self.state.read_state()["current"]), identity(record()))
+
+    def test_a_route_change_that_only_adds_an_alias_is_detected_as_changed(self):
+        self.deploy()
+        reloads = self.caddy.reload_calls
+        self.alias_deployer()
+        outcome = self.run_locked(self.deployer.deploy, self.alias_request(request_id="req-2", commit="c", image="d",
+                                                                          sequence=1001))
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertTrue(outcome.detail["probes"]["route_changed"])
+        self.assertEqual(self.caddy.reload_calls, reloads + 1)
 
 
 class FailureTests(DeployTestCase):
@@ -556,11 +619,12 @@ class FailedCandidateLogTests(DeployTestCase):
         self.deploy()
         restored = release_id(record())
         self.runtime.candidate_logs[restored] = "restored release line\n"
-        self.runtime.logs = lambda registration, tail: self.runtime.candidate_logs.get(
+        self.runtime.logs = lambda registration, release, tail, **options: self.runtime.candidate_logs.get(
             next(iter(self.runtime.running), ""), "")
         _, outcome = self.failed_candidate(commit="c", image="d", sequence=1001)
         self.assertIn("boom", outcome.detail["candidate_logs"]["output"])
-        self.assertEqual(self.runtime.logs(REGISTRATION, 50), "restored release line\n")
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.state.read_state()["current"], 50),
+                         "restored release line\n")
 
     def test_the_captured_tail_still_fits_in_a_job_record(self):
         self.deploy()
@@ -611,6 +675,98 @@ class RedeployRetentionTests(DeployTestCase):
         committed = self.state.read_state()
         self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("e" * 40, "c" * 40))
         self.assertEqual(self.runtime.discarded, ["ghcr.io/example/orders@sha256:" + "b" * 64])  # A left the window
+
+
+class RestartTests(DeployTestCase):
+    """A restart re-runs the committed release; it is not a redeploy and never rolls back."""
+
+    def restart(self, request_id="rs-1"):
+        return self.run_locked(self.deployer.restart, request_id)
+
+    def deploy_the_pair(self):
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+
+    def test_a_restart_starts_the_committed_release_again_and_keeps_its_record(self):
+        self.deploy_the_pair()
+        before = self.state.read_state()
+        self.runtime.calls.clear()
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code), ("succeeded", 0))
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"], committed["previous"]), (before["current"], before["previous"]))
+        self.assertEqual(committed["generation"], before["generation"] + 1)
+        self.assertEqual(committed["transaction_id"], "rs-1")
+        self.assertEqual(self.runtime.running, {release_id(record(commit="c", image="d", sequence=1001))})
+        self.assertEqual(self.runtime.names(), ["prepare", "start"])
+        self.assertEqual(self.runtime.discarded, [])
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(outcome.detail["previous"], identity(record()))  # the rollback target survives
+
+    def test_a_restart_with_nothing_deployed_is_refused_before_any_host_work(self):
+        for name, function in (("restart", self.deployer.restart), ("preflight", self.deployer.restart_preflight)):
+            with self.subTest(name):
+                outcome = self.run_locked(function, "rs-1")
+                self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]),
+                                 ("rejected", 2, "nothing_deployed"))
+        self.assertEqual(self.runtime.calls, [])
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_restart_while_a_journal_exists_requires_recovery_before_any_host_work(self):
+        self.deploy()
+        with self.lock.acquire():
+            self.state.begin("req-9", record(commit="c", image="d", sequence=1001))
+        self.assertEqual(self.deployer.restart_preflight("rs-1").detail["error"], "recovery_required")
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]), ("failed", 1, "recovery_required"))
+        self.assertEqual(self.runtime.names(), ["prepare", "start"])  # the deploy, and nothing from the restart
+
+    def test_a_repeated_request_id_is_already_applied_and_never_restarts_twice(self):
+        self.deploy()
+        self.assertEqual(self.restart("rs-1").status, "succeeded")
+        calls = len(self.runtime.calls)
+        again = self.restart("rs-1")
+        self.assertEqual((again.status, again.exit_code), ("already_applied", 0))
+        self.assertEqual(len(self.runtime.calls), calls)
+        self.assertEqual(self.deployer.restart_preflight("rs-1").status, "already_applied")
+
+    def test_a_failed_restart_reports_intervention_and_never_a_rollback(self):
+        self.deploy_the_pair()
+        target = record(commit="c", image="d", sequence=1001)
+        self.runtime.start_errors[release_id(target)] = RuntimeFailure("boom", "start")
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code), ("intervention_required", 6))
+        self.assertEqual(outcome.detail["error"], "restart_failed")
+        self.assertNotIn("restored_release", outcome.detail)
+        self.assertIn("shiplord recover", outcome.detail["recovery"])
+        self.assertIsNotNone(self.state.read_journal())  # retained: only a verified recovery may clear it
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("c" * 40, "a" * 40))
+        self.assertEqual(self.deploy(request_id="req-3", commit="e", image="f", sequence=1002).detail["error"],
+                         "recovery_required")
+        self.runtime.start_errors.clear()
+        self.assertEqual(self.run_locked(self.deployer.recover).status, "recovered")
+        self.assertEqual(self.runtime.running, {release_id(target)})
+
+    def test_a_failed_deploy_of_the_same_release_still_rolls_back(self):
+        """The failure path is chosen by the operation, not by the candidate equalling the current release."""
+        self.deploy()
+        self.runtime.running = set()  # the unchanged shortcut cannot fire
+        original, failures = self.runtime.start, iter([RuntimeFailure("boom", "start")])
+
+        def start(registration, release):
+            error = next(failures, None)
+            if error is not None:
+                self.runtime.calls.append(("start", release_id(release)))
+                self.runtime.running = set()
+                raise error
+            return original(registration, release)
+        self.runtime.start = start
+        outcome = self.deploy(request_id="req-2")
+        self.assertEqual((outcome.status, outcome.exit_code), ("rolled_back", 5))
+        self.assertEqual(outcome.detail["restored_release"], identity(record()))
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.runtime.running, {release_id(record())})
 
 
 class NativeRetentionTests(DeployTestCase):
@@ -811,6 +967,18 @@ class RollbackAndStatusTests(DeployTestCase):
         self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]),
                          ("failed", 1, "no_previous_release"))
         self.assertEqual(self.runtime.calls, calls)  # the broken release is not restarted and called a rollback
+
+    def test_rollback_renders_the_registered_aliases_again(self):
+        self.alias_deployer()
+        self.assertEqual(self.run_locked(self.deployer.deploy, self.alias_request()).status, "succeeded")
+        self.assertEqual(self.run_locked(self.deployer.deploy, self.alias_request(
+            request_id="req-2", commit="c", image="d", sequence=1001)).status, "succeeded")
+        self.route_file.write_text("orders.example.com {\n\treverse_proxy 127.0.0.1:1\n}\n")  # drifted
+        outcome = self.run_locked(self.deployer.rollback, "req-3")
+        self.assertEqual((outcome.status, outcome.exit_code), ("succeeded", 0))
+        route = self.route_file.read_bytes()
+        self.assertIn(b"\nlegacy.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n", route)
+        self.assertIn(b"\nwww.orders.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n", route)
 
     def test_status_reports_current_previous_running_and_unfinished_work(self):
         self.assertEqual(self.run_locked(self.deployer.status)["current"], None)

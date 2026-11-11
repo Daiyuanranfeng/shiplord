@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import http.server
+import json
 import os
 import ssl
 import shutil
@@ -16,6 +17,7 @@ import time
 import unittest
 from pathlib import Path
 
+from shiplord.probes import config_redirects_to, config_routes_to, http_get
 from shiplord.registry import PORT_RANGE, port_is_free
 from shiplord.release_state import HostLock
 from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_caddy, service_environment
@@ -137,6 +139,10 @@ class RealCaddyTests(unittest.TestCase):
 
     def fetch(self, host: str) -> bytes:
         """HTTPS request to the local Caddy, verifying its certificate against Caddy's own local CA."""
+        return self.fetch_response(host)[2]
+
+    def fetch_response(self, host: str, path: str = "/") -> tuple[int, dict, bytes]:
+        """Status, headers, and body for one HTTPS request; redirects are returned, never followed."""
         root = self.data_home / "caddy" / "pki" / "authorities" / "local" / "root.crt"
         context = ssl.create_default_context(cafile=str(root))  # raises until Caddy has issued its CA
 
@@ -147,8 +153,9 @@ class RealCaddyTests(unittest.TestCase):
 
         connection = Connection(host, context=context, timeout=5)
         try:
-            connection.request("GET", "/")
-            return connection.getresponse().read()
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
 
@@ -181,7 +188,25 @@ class RealCaddyTests(unittest.TestCase):
             self.assertTrue(self.manager.remove("orders").changed)
             self.wait_for(self.assert_route_gone)
 
-    def test_invalid_existing_route_is_reported_as_preexisting_and_nothing_changes(self):
+    def test_an_alias_redirects_permanently_to_the_canonical_host_keeping_the_uri(self):
+        port = self.start_upstream(b"canonical")
+        registration = dict(self.registration(port), hostnames=["www.orders.example.com", "legacy.example.com"])
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"canonical")
+        for alias in registration["hostnames"]:
+            status, headers, body = self.wait_for(lambda: self.fetch_response(alias, "/deep/path?q=1"))
+            self.assertEqual((status, headers.get("Location"), body),
+                             (308, "https://orders.example.com/deep/path?q=1", b""))
+        # The probe reads the live configuration Caddy actually runs, not the file that was rendered.
+        admin_status, admin_body = http_get("127.0.0.1", self.admin_port, "/config/apps/http/servers", timeout=3.0)
+        self.assertEqual(admin_status, 200)
+        config = json.loads(admin_body.decode("utf-8"))
+        self.assertTrue(config_routes_to(config, "orders.example.com", f"127.0.0.1:{port}"))
+        for alias in registration["hostnames"]:
+            self.assertTrue(config_redirects_to(config, alias, "orders.example.com"))
+
+
         (self.root / "ship" / "broken.caddy").write_text("broken.example.com {\n\tnot_a_directive\n}\n")
         (self.root / "ship" / "broken.caddy").chmod(0o644)  # independent of the umask; group-writable files are refused
         before = {p.name: p.read_bytes() for p in (self.root / "ship").iterdir()}
@@ -266,6 +291,70 @@ class RealCaddyTests(unittest.TestCase):
             self.assertTrue(self.manager.apply(self.registration(port)).changed)
         self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"still served")
         self.assertEqual([p.name for p in self.root.rglob(".*")], [])
+
+    def test_a_symlinked_sites_enabled_file_is_inspected(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "orders.conf"
+        target.write_text("orders.example.com {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "orders.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(self.registration(managed_port(set())))
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(list((self.root / "ship").iterdir()), [])
+
+    def test_a_symlinked_sites_enabled_file_for_another_site_still_applies(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "legacy.conf"
+        target.write_text("legacy.example.net {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "legacy.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
+    def test_a_directive_only_snippet_imported_with_an_argument_applies(self):
+        # Caddy accepts a directive-only snippet imported with an argument, so a route change must still work.
+        # A top-level directive snippet must be the last thing in the file, so the import closes the file.
+        with open(self.caddyfile, "a") as file:
+            file.write("(site_headers) {\n\tencode gzip\n}\n"
+                       "legacy.example.net {\n\timport site_headers 5s\n\trespond \"legacy\"\n}\n"
+                       "(global_debug) {\n\tdebug\n}\n"
+                       "import global_debug 5s\n")
+        self.assertEqual(run_command([shutil.which("caddy"), "validate", "--config", str(self.caddyfile),
+                                      "--adapter", "caddyfile"],
+                                     env=dict(os.environ, HOME=str(self.data_home))).code, 0)
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
+    def test_a_snippet_that_declares_the_managed_hostname_from_an_argument_is_a_conflict(self):
+        with open(self.caddyfile, "a") as file:
+            file.write("(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                       "import sites orders.example.com\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(self.registration(managed_port(set())))
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(list((self.root / "ship").iterdir()), [])
+
+    def test_a_snippet_argument_for_another_site_still_applies(self):
+        with open(self.caddyfile, "a") as file:
+            file.write("(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                       "import sites legacy.example.net\n")
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
 
     def test_a_caddyfile_that_reads_a_service_variable_validates(self):
         # A container without systemd cannot report the unit, so this exercises the packaged-defaults path: the

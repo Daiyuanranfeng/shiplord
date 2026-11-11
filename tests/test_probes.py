@@ -11,7 +11,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from shiplord.probes import ProbeFailure, Probes, config_routes_to, http_get
+from shiplord.probes import ProbeFailure, Probes, config_redirects_to, config_routes_to, http_get
 
 RELEASE = {"configuration": {"http": {"readiness_path": "/ready"}, "deploy": {"readiness_timeout_seconds": 5}}}
 REGISTRATION = {"application_id": "orders", "api_domain": "orders.example.com", "host_port": 20007}
@@ -107,6 +107,15 @@ def caddy_config(domain="orders.example.com", dial="127.0.0.1:20007"):
         "terminal": True}]}}
 
 
+def caddy_redirect_config(host="legacy.example.com", target="https://orders.example.com{http.request.uri}",
+                          status=308, domain="orders.example.com", dial="127.0.0.1:20007"):
+    """The JSON Caddy adapts from ``<host> { redir <target> <status> }`` in front of the canonical site."""
+    redirect = {"match": [{"host": [host]}], "handle": [{"handler": "subroute", "routes": [{"handle": [
+        {"handler": "static_response", "headers": {"Location": [target]}, "status_code": status}]}]}],
+        "terminal": True}
+    return {"srv0": {"listen": [":443"], "routes": [redirect, *caddy_config(domain, dial)["srv0"]["routes"]]}}
+
+
 class RoutingTests(unittest.TestCase):
     def test_config_matching_requires_both_host_and_upstream_in_the_same_route(self):
         self.assertTrue(config_routes_to(caddy_config(), "orders.example.com", "127.0.0.1:20007"))
@@ -118,6 +127,26 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(config_routes_to({}, "orders.example.com", "127.0.0.1:20007"))
         self.assertFalse(config_routes_to("junk", "orders.example.com", "127.0.0.1:20007"))
 
+    def test_a_permanent_redirect_that_keeps_the_uri_is_recognized(self):
+        config = caddy_redirect_config()
+        self.assertTrue(config_redirects_to(config, "legacy.example.com", "orders.example.com"))
+        self.assertFalse(config_redirects_to(config, "orders.example.com", "orders.example.com"))  # serves, not redirects
+        self.assertFalse(config_redirects_to(config, "other.example.com", "orders.example.com"))
+
+    def test_a_redirect_that_drops_the_path_query_or_tls_is_not_the_rendered_one(self):
+        cases = {
+            "path dropped": caddy_redirect_config(target="https://orders.example.com"),
+            "query only": caddy_redirect_config(target="https://orders.example.com{http.request.uri.query}"),
+            "plain http": caddy_redirect_config(target="http://orders.example.com{http.request.uri}"),
+            "other target": caddy_redirect_config(target="https://other.example.com{http.request.uri}"),
+            "temporary": caddy_redirect_config(status=302),
+            "no status": caddy_redirect_config(status=None),
+        }
+        for label, config in cases.items():
+            with self.subTest(label):
+                self.assertFalse(config_redirects_to(config, "legacy.example.com", "orders.example.com"))
+        self.assertFalse(config_redirects_to("junk", "legacy.example.com", "orders.example.com"))
+
     def admin(self, status, body):
         server = serve(handler([(status, body)]))
         self.addCleanup(stop, server)
@@ -126,6 +155,22 @@ class RoutingTests(unittest.TestCase):
     def test_reads_the_active_configuration_through_the_admin_api(self):
         self.assertTrue(self.admin(200, json.dumps(caddy_config()).encode()).routing(REGISTRATION))
         self.assertFalse(self.admin(200, json.dumps(caddy_config(dial="127.0.0.1:1")).encode()).routing(REGISTRATION))
+
+    def test_every_alias_must_be_a_permanent_redirect_to_the_canonical_hostname(self):
+        registration = dict(REGISTRATION, hostnames=["legacy.example.com", "www.orders.example.com"])
+        both = {"srv0": {"listen": [":443"], "routes": [
+            *caddy_redirect_config()["srv0"]["routes"][:1],
+            *caddy_redirect_config(host="www.orders.example.com")["srv0"]["routes"][:1],
+            *caddy_config()["srv0"]["routes"]]}}
+        self.assertTrue(self.admin(200, json.dumps(both).encode()).routing(registration))
+        missing = self.admin(200, json.dumps(caddy_redirect_config()).encode())
+        self.assertFalse(missing.routing(registration))  # the second alias is not served at all
+        wrong = self.admin(200, json.dumps({"srv0": {"routes": [
+            *caddy_redirect_config(target="https://orders.example.com")["srv0"]["routes"][:1],
+            *caddy_redirect_config(host="www.orders.example.com")["srv0"]["routes"][:1],
+            *caddy_config()["srv0"]["routes"]]}}).encode())
+        self.assertFalse(wrong.routing(registration))  # the alias drops the path
+        self.assertFalse(self.admin(200, json.dumps(caddy_config()).encode()).routing(registration))
 
     def test_an_unreadable_admin_api_is_unknown_not_false(self):
         self.assertIsNone(self.admin(500, b"").routing(REGISTRATION))
@@ -187,6 +232,14 @@ class HttpsTests(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         self.assertEqual(Probes(https_port=port).https(REGISTRATION, RELEASE)["error"], "connection_failed")
+
+    def test_the_configured_readiness_status_is_the_one_that_verifies(self):
+        trusted = ssl.create_default_context(cafile=str(self.cert))
+        probes = Probes(https_port=self.tls_server(b"HTTP/1.1 204 No Content\r\n\r\n"), https_context=trusted)
+        self.assertFalse(probes.https(REGISTRATION, RELEASE)["verified"])
+        configured = {"configuration": {"http": {"readiness_path": "/ready"},
+                                        "deploy": {"readiness_timeout_seconds": 5, "readiness_status": 204}}}
+        self.assertTrue(probes.https(REGISTRATION, configured)["verified"])
 
 
 class DnsTests(unittest.TestCase):

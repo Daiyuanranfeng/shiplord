@@ -221,6 +221,24 @@ class CreateManifestTests(unittest.TestCase):
                                 image_repository="orders")
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_additional_hostnames_and_the_www_alias_are_written_and_read_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = create_manifest(Path(directory), "orders", "production", "example.com", [],
+                                   hostnames=["legacy.example.com"], www_redirect=True)
+            self.assertEqual(load_manifest(path)["http"]["hostnames"],
+                             ["legacy.example.com", "www.example.com"])
+            self.assertIn('hostnames = ["legacy.example.com", "www.example.com"]\n', path.read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            path = create_manifest(Path(directory), "orders", "production", "example.com", [])
+            self.assertNotIn("hostnames", path.read_text())  # a manifest without aliases is unchanged
+
+    def test_an_unusable_additional_hostname_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ManifestError):
+                create_manifest(Path(directory), "orders", "production", "example.com", [],
+                                hostnames=["example.com"])  # the alias would redirect to itself
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
 
 class InteractiveConfigureTests(unittest.TestCase):
     """The terminal path, run in-process with scripted keyboard input."""
@@ -287,6 +305,22 @@ class InteractiveConfigureTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertNotIn("Image repository", result.output)
         self.assertEqual(load_manifest(self.project / "ship.toml")["github"]["repository"], "owner/orders")
+
+    def test_hostname_flags_add_aliases_without_another_question(self):
+        result = self.run_configure("owner/orders\napi.example.com\n\n\n\ny\n", "--server", "production",
+                                    "--name", "orders", "--template", "generic", "--hostname", "legacy.example.com",
+                                    "--www")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("additional hostnames: legacy.example.com", result.output)
+        self.assertIn("www redirect: www.api.example.com", result.output)
+        self.assertEqual(load_manifest(self.project / "ship.toml")["http"]["hostnames"],
+                         ["legacy.example.com", "www.api.example.com"])
+
+    def test_an_unusable_hostname_flag_writes_nothing(self):
+        result = self.run_configure("owner/orders\napi.example.com\n\n\n\ny\n", "--server", "production",
+                                    "--name", "orders", "--template", "generic", "--hostname", "www.other.test")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertEqual(sorted(path.name for path in self.project.iterdir()), ["Dockerfile"])
 
     @unittest.skipUnless(shutil.which("git"), "git is needed to read a remote")
     def test_a_github_remote_skips_the_repository_question(self):
