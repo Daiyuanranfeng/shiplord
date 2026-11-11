@@ -40,7 +40,11 @@ class ServerRegistrationTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         ssh = self.bin / "ssh"
-        ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SSH_TEST_ARGS"\nexit "${SSH_TEST_EXIT:-0}"\n')
+        ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SSH_TEST_ARGS"\n'
+                       'if [ -n "$SSH_TEST_STDERR" ]; then '
+                       'if [ -n "$SSH_TEST_VERBATIM" ]; then printf "%s" "$SSH_TEST_STDERR"; '
+                       'else printf "%s\\n" "$SSH_TEST_STDERR"; fi >&2; fi\n'
+                       'exit "${SSH_TEST_EXIT:-0}"\n')
         ssh.chmod(0o700)
         self.env = {"XDG_CONFIG_HOME": str(self.root / "config"), "PATH": str(self.bin),
                     "SSH_TEST_ARGS": str(self.root / "arguments")}
@@ -49,10 +53,17 @@ class ServerRegistrationTests(unittest.TestCase):
         with patch.dict(os.environ, self.env):
             return CliRunner().invoke(app, ["server", "add", *args])
 
+    def invoke_failing(self, alias, target, stderr, *, exit_code=255, verbatim=False):
+        env = dict(self.env, SSH_TEST_EXIT=str(exit_code), SSH_TEST_STDERR=stderr,
+                   SSH_TEST_VERBATIM="1" if verbatim else "")
+        with patch.dict(os.environ, env):
+            return CliRunner().invoke(app, ["server", "add", alias, "--ssh", target])
+
     def test_registration_uses_strict_fresh_ssh_and_private_storage(self):
         result = self.invoke("production", "--ssh", "appuser@ubuntu-4gb-hel1-1")
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Run `shiplord server bootstrap` next", result.output)
+        self.assertNotIn("not implemented", result.output)
         options = (self.root / "arguments").read_text().splitlines()
         for option in ("BatchMode=yes", "StrictHostKeyChecking=yes", "VerifyHostKeyDNS=no",
                        "UpdateHostKeys=no", "ControlMaster=no", "ControlPath=none",
@@ -86,6 +97,52 @@ class ServerRegistrationTests(unittest.TestCase):
             result = CliRunner().invoke(app, ["server", "add", "production", "--ssh", "appuser@example.com"])
         self.assertEqual(result.exit_code, 3)
         self.assertFalse((self.root / "config/shiplord/servers/production.json").exists())
+
+    def test_unknown_host_key_prints_the_ssh_command_for_the_real_target(self):
+        stderr = ("No ED25519 host key is known for ubuntu-4gb-hel1-1 and you have requested strict checking.\n"
+                  "Host key verification failed.")
+        result = self.invoke_failing("production", "appuser@ubuntu-4gb-hel1-1", stderr)
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertEqual(result.output.count("appuser@ubuntu-4gb-hel1-1"), 1, result.output)
+        self.assertIn("`ssh appuser@ubuntu-4gb-hel1-1`", result.output)
+        self.assertIn("No ED25519 host key is known for ubuntu-4gb-hel1-1", result.output)
+        self.assertIn("Host key verification failed.", result.output)
+        self.assertIn("then retry", result.output)
+        self.assertFalse((self.root / "config/shiplord/servers/production.json").exists())
+
+    def test_a_crlf_host_trust_failure_is_still_recognised(self):
+        # OpenSSH writes CRLF when its stderr is not a terminal, as it is under the CLI and in CI.
+        stderr = ("No ED25519 host key is known for ubuntu-4gb-hel1-1 and you have requested strict checking.\r\n"
+                  "Host key verification failed.\r\n")
+        result = self.invoke_failing("production", "appuser@ubuntu-4gb-hel1-1", stderr, verbatim=True)
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("`ssh appuser@ubuntu-4gb-hel1-1`", result.output)
+        self.assertIn("Host key verification failed.", result.output)
+        self.assertNotIn("?", result.output)
+        self.assertFalse((self.root / "config/shiplord/servers/production.json").exists())
+
+    def test_changed_host_key_is_not_presented_as_a_first_time_key(self):
+        stderr = ("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                  "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+                  "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                  "Offending ED25519 key in /home/appuser/.ssh/known_hosts:12\n"
+                  "Host key verification failed.")
+        result = self.invoke_failing("production", "appuser@ubuntu-4gb-hel1-1", stderr)
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("host key", result.output)
+        self.assertIn("changed", result.output)
+        self.assertNotIn("`ssh ", result.output)
+        self.assertNotIn("/home/appuser", result.output)
+        self.assertNotIn("known_hosts", result.output)
+
+    def test_unrecognised_ssh_failure_keeps_the_generic_message(self):
+        stderr = "Permission denied (publickey).\nIdentity file /home/appuser/.ssh/id_ed25519 not accessible"
+        result = self.invoke_failing("production", "appuser@ubuntu-4gb-hel1-1", stderr)
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("verify host trust, login, and any locked SSH key", result.output)
+        self.assertNotIn("Permission denied", result.output)
+        self.assertNotIn("/home/appuser", result.output)
+        self.assertNotIn("`ssh ", result.output)
 
     def test_duplicate_alias_preserves_original(self):
         first = self.invoke("production", "--ssh", "appuser@example.com")

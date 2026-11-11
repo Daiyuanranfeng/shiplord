@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -11,11 +12,60 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import REGISTRATION, FakeCaddy, FakeProbes, FakeRuntime, configuration, record, request  # noqa: E402
-from shiplord.deploy import Deployer, identity  # noqa: E402
+from shiplord.deploy import CANDIDATE_LOG_BYTES, CANDIDATE_LOG_LINES, Deployer, identity  # noqa: E402
+from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import ProbeFailure  # noqa: E402
-from shiplord.release_state import HostLock, ReleaseState, StateError  # noqa: E402
+from shiplord.registry import validate_registration  # noqa: E402
+from shiplord.release_state import MAX_RECORD_BYTES, HostLock, ReleaseState, StateError  # noqa: E402
 from shiplord.routing import RouteManager, RoutingError  # noqa: E402
-from shiplord.runtime import RuntimeFailure, release_id  # noqa: E402
+from shiplord.runtime import DockerRuntime, RuntimeFailure, release_id  # noqa: E402
+from shiplord.system import CommandResult  # noqa: E402
+
+
+class FakeDockerCLI:
+    """The Docker CLI calls a prepare makes: pull, one image inspect, and the discard of a refused image."""
+
+    def __init__(self, stop_signal):
+        self.stop_signal = stop_signal
+        self.calls: list[list[str]] = []
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        self.calls.append(argv)
+        command = " ".join(argv[1:3]) if argv[1] == "image" else argv[1]
+        if command == "pull":
+            return CommandResult(0, "")
+        if command == "image inspect":
+            return CommandResult(0, f"linux/amd64|{'c' * 40}|{self.stop_signal}\n")
+        if command == "image rm":
+            return CommandResult(0, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+NATIVE_REGISTRATION = validate_registration({
+    "schema_version": 1, "application_id": "orders", "deployment_uid": 1001, "deployment_user": "ship-orders",
+    "runtime": "native", "api_domain": "orders.example.com", "host_port": 20007, "image_repository": None,
+    "max_memory_mb": 4096})
+
+
+def native_request(request_id="req-1", commit="a", sequence=1000, sha256="b"):
+    return {"request_id": request_id, "commit": commit * 40, "sequence": sequence,
+            "artifact": {"kind": "native", "sha256": sha256 * 64, "size": 10, "architecture": "linux-amd64"},
+            "configuration": dict(configuration(), runtime="native")}
+
+
+def native_record(**kwargs):
+    value = native_request(**kwargs)
+    return {k: value[k] for k in ("commit", "sequence", "artifact", "configuration")}
+
+
+class FakeNativeRuntime(FakeRuntime):
+    """A native release is discarded by release ID: its directory is named for the release, not for the binary."""
+
+    def discard(self, registration, release):
+        self.discarded.append(release_id(release))
+        return []
+
 
 class DeployTestCase(unittest.TestCase):
     def setUp(self):
@@ -188,6 +238,23 @@ class FailureTests(DeployTestCase):
         self.assertEqual(self.state.read_state(), before)
         self.assertIsNone(self.state.read_journal())
 
+    def test_an_image_that_cannot_be_stopped_gracefully_is_refused_before_the_journal_opens(self):
+        self.deploy()
+        before = self.state.read_state()
+        route = self.route_file.read_bytes()
+        docker = FakeDockerCLI("SIGKILL")
+        self.deployer.runtime = DockerRuntime(docker, Layout(Path(self.temp.name).resolve()),
+                                              platform_name="linux/amd64")
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]), ("failed", 1, "prepare_failed"))
+        self.assertIn("STOPSIGNAL SIGKILL", outcome.detail["message"])
+        self.assertIn("ghcr.io/example/orders@sha256:" + "d" * 64, outcome.detail["message"])
+        self.assertEqual(self.state.read_state(), before)
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.route_file.read_bytes(), route)
+        self.assertEqual([call[1:3] for call in docker.calls if call[1] == "image"],
+                         [["image", "inspect"], ["image", "rm"]])  # the refused image is discarded
+
     def test_candidate_failing_to_start_restores_the_previous_release(self):
         self.deploy()
         bad = record(commit="c", image="d", sequence=1001)
@@ -271,6 +338,62 @@ class FailureTests(DeployTestCase):
         self.assertEqual(self.runtime.running, {release_id(record())})
         self.assertIsNone(self.state.read_journal())
         self.assertEqual(self.deploy(request_id="req-3", commit="e", image="f", sequence=1002).status, "succeeded")
+
+    def test_a_forced_recovery_stops_the_process_removes_the_route_and_clears_the_journal(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.runtime.stop_in_progress = lambda registration: True  # a plain recover would still refuse
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("recovered", 0))
+        self.assertIn("force_stop", self.runtime.names())
+        self.assertEqual(self.runtime.running, set())
+        self.assertFalse(self.route_file.exists())
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(outcome.detail["target"], identity(record()))
+        self.assertFalse(outcome.detail["running"])
+        self.assertEqual(outcome.detail["forced_stop"]["signal"], "SIGKILL")
+        self.assertEqual(outcome.detail["forced_stop"]["policy"], {"timeout_seconds": 10, "action": "fail"})
+        self.assertIn("forced", outcome.detail["forced_stop"]["stages"])
+
+    def test_a_forced_recovery_without_a_journal_still_stops_a_running_process(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.assertTrue(self.runtime.running)
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("recovered", 0))
+        self.assertIn("force_stop", self.runtime.names())
+        self.assertEqual(self.runtime.running, set())
+        self.assertFalse(self.route_file.exists())
+        self.assertEqual(outcome.detail["target"], identity(record()))
+        self.assertFalse(outcome.detail["running"])
+
+    def test_a_forced_recovery_is_refused_for_a_native_runtime(self):
+        native = Deployer(registration=NATIVE_REGISTRATION, state=self.state, routes=self.routes,
+                          runtime=FakeNativeRuntime(), probes=self.probes)
+        outcome = self.run_locked(lambda: native.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2))
+        self.assertEqual(outcome.detail["error"], "invalid_request")
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_failed_forced_stop_keeps_the_journal_and_requires_intervention(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.runtime.force_stop_error = RuntimeFailure(
+            "the container did not exit after being killed", "stop", intervention_required=True, kind="kill_unconfirmed")
+        outcome = self.run_locked(lambda: self.deployer.recover(force_stop=True))
+        self.assertEqual((outcome.status, outcome.exit_code), ("intervention_required", 6))
+        self.assertEqual(outcome.detail["kind"], "kill_unconfirmed")
+        self.assertIsNotNone(self.state.read_journal())
+
+    def test_a_stop_deadline_names_the_forced_recovery_escape_hatch(self):
+        self.assertEqual(self.deploy().status, "succeeded")
+        self.runtime.start_errors[release_id(record(commit="b", image="b", sequence=1001))] = RuntimeFailure(
+            "did not stop", "stop", intervention_required=True, kind="shutdown_timeout")
+        outcome = self.deploy(request_id="req-2", image="b", commit="b", sequence=1001)
+        self.assertIn("shiplord recover --force-stop", outcome.detail["recovery"])
 
     def test_a_commit_whose_journal_cleanup_fails_is_flagged_and_recoverable(self):
         with patch.object(ReleaseState, "clear_after_reconciliation", side_effect=StateError("sync failed")):
@@ -363,6 +486,287 @@ class AbandonedCandidateTests(DeployTestCase):
         self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
         self.assertEqual(self.run_locked(self.deployer.rollback, "req-3").status, "succeeded")
         self.assertEqual(self.runtime.discarded, [])
+
+
+class FailedCandidateLogTests(DeployTestCase):
+    """A failed candidate's crash output must be captured before the restore removes its container."""
+
+    def failed_candidate(self, **kwargs):
+        bad = record(**kwargs)
+        self.runtime.candidate_logs[release_id(bad)] = "Traceback (most recent call last):\nboom\n"
+        self.probes.not_ready[release_id(bad)] = ProbeFailure("timeout", "timeout")
+        return bad, self.deploy(request_id="req-2", **kwargs)
+
+    def test_a_candidate_that_fails_readiness_reports_its_last_log_lines(self):
+        self.deploy()
+        self.runtime.calls.clear()
+        bad, outcome = self.failed_candidate(commit="c", image="d", sequence=1001)
+        self.assertEqual((outcome.status, outcome.exit_code), ("rolled_back", 5))
+        captured = outcome.detail["candidate_logs"]
+        self.assertEqual(captured["output"], "Traceback (most recent call last):\nboom\n")
+        self.assertEqual((captured["tail"], captured["max_bytes"]), (CANDIDATE_LOG_LINES, CANDIDATE_LOG_BYTES))
+        self.assertEqual(self.runtime.release_log_calls, [(release_id(bad), CANDIDATE_LOG_LINES, CANDIDATE_LOG_BYTES)])
+        # The candidate is read after it starts and before the restore starts the previous release.
+        self.assertEqual(self.runtime.names()[:3], ["prepare", "start", "release_logs"])
+
+    def test_a_candidate_that_fails_after_readiness_is_captured_too(self):
+        self.deploy()
+        self.probes.routing_result = False
+        bad = record(commit="c", image="d", sequence=1001)
+        self.runtime.candidate_logs[release_id(bad)] = "ready, then the route failed\n"
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual((outcome.status, outcome.detail["phase"]), ("rolled_back", "routing"))
+        self.assertIn("the route failed", outcome.detail["candidate_logs"]["output"])
+
+    def test_a_failure_before_the_candidate_container_exists_reports_no_logs(self):
+        self.deploy()
+        bad = record(commit="c", image="d", sequence=1001)
+        self.runtime.start_errors[release_id(bad)] = RuntimeFailure("boom", "start")
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual(outcome.status, "rolled_back")
+        self.assertNotIn("candidate_logs", outcome.detail)
+
+    def test_a_native_candidate_never_reports_container_logs(self):
+        runtime = FakeNativeRuntime()
+        self.deployer = Deployer(registration=NATIVE_REGISTRATION, state=self.state, routes=self.routes,
+                                 runtime=runtime, probes=FakeProbes(runtime))
+        self.assertEqual(self.run_locked(self.deployer.deploy, native_request()).status, "succeeded")
+        bad = native_record(commit="c", sequence=1001)
+        runtime.candidate_logs[release_id(bad)] = "native candidate\n"
+        self.deployer.probes.not_ready[release_id(bad)] = ProbeFailure("timeout", "timeout")
+        outcome = self.run_locked(self.deployer.deploy, native_request(request_id="req-2", commit="c", sequence=1001))
+        self.assertEqual(outcome.status, "rolled_back")
+        self.assertNotIn("candidate_logs", outcome.detail)
+        self.assertEqual(runtime.release_log_calls, [])
+
+    def test_a_capture_failure_is_a_note_and_the_rollback_still_stands(self):
+        self.deploy()
+        bad = record(commit="c", image="d", sequence=1001)
+        self.probes.not_ready[release_id(bad)] = ProbeFailure("timeout", "timeout")
+        self.runtime.log_errors[release_id(bad)] = RuntimeFailure("docker is down", "logs")
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual((outcome.status, outcome.exit_code), ("rolled_back", 5))
+        self.assertEqual(outcome.detail["restored_release"], identity(record()))
+        self.assertEqual(outcome.detail["candidate_logs"]["error"], "docker is down")
+        self.assertNotIn("output", outcome.detail["candidate_logs"])
+        self.assertEqual(self.runtime.running, {release_id(record())})
+        self.assertIsNone(self.state.read_journal())
+
+    def test_the_capture_is_the_candidates_and_logs_after_report_the_restored_release(self):
+        self.deploy()
+        restored = release_id(record())
+        self.runtime.candidate_logs[restored] = "restored release line\n"
+        self.runtime.logs = lambda registration, tail: self.runtime.candidate_logs.get(
+            next(iter(self.runtime.running), ""), "")
+        _, outcome = self.failed_candidate(commit="c", image="d", sequence=1001)
+        self.assertIn("boom", outcome.detail["candidate_logs"]["output"])
+        self.assertEqual(self.runtime.logs(REGISTRATION, 50), "restored release line\n")
+
+    def test_the_captured_tail_still_fits_in_a_job_record(self):
+        self.deploy()
+        bad = record(commit="c", image="d", sequence=1001)
+        self.runtime.candidate_logs[release_id(bad)] = "x" * CANDIDATE_LOG_BYTES
+        self.probes.not_ready[release_id(bad)] = ProbeFailure("timeout", "timeout")
+        outcome = self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual(len(outcome.detail["candidate_logs"]["output"]), CANDIDATE_LOG_BYTES)
+        self.assertLess(len(json.dumps(outcome.detail)), MAX_RECORD_BYTES)
+
+
+class RedeployRetentionTests(DeployTestCase):
+    """Redeploying the release that is already committed must never replace the real rollback target."""
+
+    def deploy_the_pair(self):
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        self.assertEqual(self.state.read_state()["previous"], record())
+
+    def test_a_redeploy_of_the_current_release_that_is_down_keeps_the_rollback_target(self):
+        self.deploy_the_pair()
+        self.runtime.running = set()  # the release is down, so the unchanged shortcut cannot fire
+        outcome = self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.assertEqual(outcome.status, "succeeded")
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("c" * 40, "a" * 40))
+        self.assertEqual(outcome.detail["previous"], identity(record()))  # reported as it was committed
+        self.assertEqual(self.runtime.discarded, [])  # the previous release's image is still there
+        rolled_back = self.run_locked(self.deployer.rollback, "req-4")
+        self.assertEqual(rolled_back.status, "succeeded")
+        self.assertEqual(self.runtime.running, {release_id(record())})  # back on A, not the redeployed B
+        self.assertEqual(self.state.read_state()["current"], record())
+
+    def test_a_redeploy_of_a_current_release_that_is_not_ready_keeps_the_rollback_target(self):
+        self.deploy_the_pair()
+        answers = iter([False])  # running, but not ready when the shortcut is considered
+        self.probes.ready_once = lambda registration, release: next(answers, True)
+        outcome = self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual(self.state.read_state()["previous"], record())
+        self.assertEqual(self.runtime.discarded, [])
+
+    def test_a_new_release_after_a_redeploy_still_rotates_the_rollback_target(self):
+        self.deploy_the_pair()
+        self.runtime.running = set()
+        self.deploy(request_id="req-3", commit="c", image="d", sequence=1001)
+        self.deploy(request_id="req-4", commit="e", image="f", sequence=1002)
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("e" * 40, "c" * 40))
+        self.assertEqual(self.runtime.discarded, ["ghcr.io/example/orders@sha256:" + "b" * 64])  # A left the window
+
+
+class RestartTests(DeployTestCase):
+    """A restart re-runs the committed release; it is not a redeploy and never rolls back."""
+
+    def restart(self, request_id="rs-1"):
+        return self.run_locked(self.deployer.restart, request_id)
+
+    def deploy_the_pair(self):
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+
+    def test_a_restart_starts_the_committed_release_again_and_keeps_its_record(self):
+        self.deploy_the_pair()
+        before = self.state.read_state()
+        self.runtime.calls.clear()
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code), ("succeeded", 0))
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"], committed["previous"]), (before["current"], before["previous"]))
+        self.assertEqual(committed["generation"], before["generation"] + 1)
+        self.assertEqual(committed["transaction_id"], "rs-1")
+        self.assertEqual(self.runtime.running, {release_id(record(commit="c", image="d", sequence=1001))})
+        self.assertEqual(self.runtime.names(), ["prepare", "start"])
+        self.assertEqual(self.runtime.discarded, [])
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(outcome.detail["previous"], identity(record()))  # the rollback target survives
+
+    def test_a_restart_with_nothing_deployed_is_refused_before_any_host_work(self):
+        for name, function in (("restart", self.deployer.restart), ("preflight", self.deployer.restart_preflight)):
+            with self.subTest(name):
+                outcome = self.run_locked(function, "rs-1")
+                self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]),
+                                 ("rejected", 2, "nothing_deployed"))
+        self.assertEqual(self.runtime.calls, [])
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_restart_while_a_journal_exists_requires_recovery_before_any_host_work(self):
+        self.deploy()
+        with self.lock.acquire():
+            self.state.begin("req-9", record(commit="c", image="d", sequence=1001))
+        self.assertEqual(self.deployer.restart_preflight("rs-1").detail["error"], "recovery_required")
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]), ("failed", 1, "recovery_required"))
+        self.assertEqual(self.runtime.names(), ["prepare", "start"])  # the deploy, and nothing from the restart
+
+    def test_a_repeated_request_id_is_already_applied_and_never_restarts_twice(self):
+        self.deploy()
+        self.assertEqual(self.restart("rs-1").status, "succeeded")
+        calls = len(self.runtime.calls)
+        again = self.restart("rs-1")
+        self.assertEqual((again.status, again.exit_code), ("already_applied", 0))
+        self.assertEqual(len(self.runtime.calls), calls)
+        self.assertEqual(self.deployer.restart_preflight("rs-1").status, "already_applied")
+
+    def test_a_failed_restart_reports_intervention_and_never_a_rollback(self):
+        self.deploy_the_pair()
+        target = record(commit="c", image="d", sequence=1001)
+        self.runtime.start_errors[release_id(target)] = RuntimeFailure("boom", "start")
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code), ("intervention_required", 6))
+        self.assertEqual(outcome.detail["error"], "restart_failed")
+        self.assertNotIn("restored_release", outcome.detail)
+        self.assertIn("shiplord recover", outcome.detail["recovery"])
+        self.assertIsNotNone(self.state.read_journal())  # retained: only a verified recovery may clear it
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"]["commit"], committed["previous"]["commit"]), ("c" * 40, "a" * 40))
+        self.assertEqual(self.deploy(request_id="req-3", commit="e", image="f", sequence=1002).detail["error"],
+                         "recovery_required")
+        self.runtime.start_errors.clear()
+        self.assertEqual(self.run_locked(self.deployer.recover).status, "recovered")
+        self.assertEqual(self.runtime.running, {release_id(target)})
+
+    def test_a_failed_deploy_of_the_same_release_still_rolls_back(self):
+        """The failure path is chosen by the operation, not by the candidate equalling the current release."""
+        self.deploy()
+        self.runtime.running = set()  # the unchanged shortcut cannot fire
+        original, failures = self.runtime.start, iter([RuntimeFailure("boom", "start")])
+
+        def start(registration, release):
+            error = next(failures, None)
+            if error is not None:
+                self.runtime.calls.append(("start", release_id(release)))
+                self.runtime.running = set()
+                raise error
+            return original(registration, release)
+        self.runtime.start = start
+        outcome = self.deploy(request_id="req-2")
+        self.assertEqual((outcome.status, outcome.exit_code), ("rolled_back", 5))
+        self.assertEqual(outcome.detail["restored_release"], identity(record()))
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.runtime.running, {release_id(record())})
+
+
+class NativeRetentionTests(DeployTestCase):
+    """A native release owns a directory named for its release ID, even when the binary is unchanged."""
+
+    def build(self):
+        self.routes = RouteManager(self.caddy_root, self.lock, self.caddy)
+        self.deployer = Deployer(registration=NATIVE_REGISTRATION, state=self.state, routes=self.routes,
+                                 runtime=self.runtime, probes=self.probes,
+                                 progress=lambda phase, info: self.progress.append(phase))
+
+    def setUp(self):
+        super().setUp()
+        self.runtime = FakeNativeRuntime()
+        self.probes = FakeProbes(self.runtime)
+        self.build()
+
+    def deploy_native(self, **kwargs):
+        return self.run_locked(self.deployer.deploy, native_request(**kwargs))
+
+    def test_one_binary_under_several_commits_does_not_accumulate_release_directories(self):
+        self.assertEqual(self.deploy_native().status, "succeeded")
+        self.assertEqual(self.deploy_native(request_id="req-2", commit="c", sequence=1001).status, "succeeded")
+        self.assertEqual(self.deploy_native(request_id="req-3", commit="e", sequence=1002).status, "succeeded")
+        self.assertEqual(self.runtime.discarded, [release_id(native_record())])
+
+    def test_a_rolled_back_native_release_is_never_discarded(self):
+        self.deploy_native()
+        self.deploy_native(request_id="req-2", commit="c", sequence=1001)
+        self.assertEqual(self.run_locked(self.deployer.rollback, "req-3").status, "succeeded")
+        self.assertEqual(self.runtime.discarded, [])
+
+    def test_redeploying_the_committed_native_release_keeps_the_previous_directory(self):
+        self.deploy_native()
+        self.deploy_native(request_id="req-2", commit="c", sequence=1001)
+        self.runtime.running = set()  # the release is down: the unchanged shortcut cannot fire
+        self.assertEqual(self.deploy_native(request_id="req-3", commit="c", sequence=1001).status, "succeeded")
+        self.assertEqual(self.state.read_state()["previous"], native_record())
+        self.assertEqual(self.runtime.discarded, [])  # A's release directory is still there for a rollback
+
+
+class JournalOpenFailureTests(DeployTestCase):
+    """A prepared artifact must not outlive a transaction whose journal could not be opened."""
+
+    def test_a_prepared_artifact_is_removed_when_the_journal_cannot_be_opened(self):
+        with patch.object(self.state, "begin", side_effect=StateError("journal is unavailable")):
+            outcome = self.deploy()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "journal_unavailable"))
+        self.assertEqual(self.runtime.discarded, ["ghcr.io/example/orders@sha256:" + "b" * 64])
+        self.assertEqual(outcome.detail["warnings"], [])
+        self.assertIsNone(self.state.read_journal())
+
+    def test_a_prepared_artifact_is_kept_when_a_journal_references_it(self):
+        begin = self.state.begin
+
+        def begin_then_fail(request_id, candidate, **kwargs):
+            begin(request_id, candidate, **kwargs)
+            raise StateError("journal is unavailable")
+
+        with patch.object(self.state, "begin", side_effect=begin_then_fail):
+            outcome = self.deploy()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "journal_unavailable"))
+        self.assertEqual(self.runtime.discarded, [])  # recovery may still need the candidate
+        self.assertEqual(self.state.read_journal()["request_id"], "req-1")
 
 
 class CrashRecoveryTests(DeployTestCase):
@@ -485,6 +889,20 @@ class RollbackAndStatusTests(DeployTestCase):
         self.assertEqual(outcome.status, "rolled_back")  # nonzero: the rollback itself failed
         self.assertEqual(outcome.exit_code, 5)
         self.assertEqual(self.state.read_state()["current"]["commit"], "c" * 40)
+
+    def test_rollback_refuses_a_previous_release_that_is_the_current_one(self):
+        # A host that ran the older helper can hold `previous == current`: the real rollback target is already gone.
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        committed = self.state.read_state()
+        state = Path(self.temp.name) / "state" / "state.json"
+        state.write_text(json.dumps(dict(committed, previous=committed["current"])) + "\n")
+        state.chmod(0o600)
+        calls = list(self.runtime.calls)
+        outcome = self.run_locked(self.deployer.rollback, "req-3")
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]),
+                         ("failed", 1, "no_previous_release"))
+        self.assertEqual(self.runtime.calls, calls)  # the broken release is not restarted and called a rollback
 
     def test_status_reports_current_previous_running_and_unfinished_work(self):
         self.assertEqual(self.run_locked(self.deployer.status)["current"], None)

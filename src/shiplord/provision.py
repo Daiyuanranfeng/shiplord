@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Callable
 
 from .environment import EnvironmentError_, load_environment_file, parse_environment
+from .installer import DEPLOY_GROUP, DEPLOY_MARKER
 from .keys import KeyError_, KeyStore, PublicKey, parse_public_key, validate_label
 from .layout import Layout, deployment_user, runtime_user
 from .manifest import validate_app_name
 from .registry import DEFAULT_MAX_MEMORY_MB, PORT_RANGE, Registry, validate_registration
-from .release_state import HostLock, ReleaseState, StateError
+from .release_state import HostLock, ReleaseState, StateError, _directory
 from .system import CommandError, System
 
 USERADD, USERMOD, USERDEL = "/usr/sbin/useradd", "/usr/sbin/usermod", "/usr/sbin/userdel"
@@ -39,7 +40,7 @@ class ProvisionError(Exception):
 
 def _marker(application_id: str) -> str:
     """The account comment that marks an account as ours; passwd comments cannot contain a colon."""
-    return f"shiplord-deploy-{application_id}"
+    return f"{DEPLOY_MARKER}-{application_id}"
 
 
 def _run(system: System, argv: list[str], step: str):
@@ -59,6 +60,20 @@ def _account(system: System, name: str) -> dict | None:
     return {"name": fields[0], "uid": int(fields[2]), "comment": fields[4], "home": fields[5], "shell": fields[6]}
 
 
+def _is_ours(account: dict, marker: str, home: str, shell: str) -> bool:
+    """Whether an existing account is the one provisioning would have created for this application."""
+    return (account["comment"] == marker and account["home"] == home and account["shell"] == shell
+            and account["uid"] >= 1)
+
+
+def _existing_user(system: System, name: str, marker: str, home: str, shell: str) -> dict | None:
+    """Read an account without changing it, refusing one that is not ours; None when it does not exist."""
+    account = _account(system, name)
+    if account is not None and not _is_ours(account, marker, home, shell):
+        raise ProvisionError("an account with that name exists but is not a Shiplord account")
+    return account
+
+
 def _ensure_user(system: System, name: str, marker: str, home: str, shell: str) -> tuple[dict, bool]:
     """Create a system account, or verify that an existing one is ours; never adopt a foreign account."""
     account = _account(system, name)
@@ -70,19 +85,50 @@ def _ensure_user(system: System, name: str, marker: str, home: str, shell: str) 
             if _run(system, argv, step).code != 0:
                 raise ProvisionError(f"{step} failed for the account {name}")
         account, created = _account(system, name), True
-    if (account is None or account["comment"] != marker or account["home"] != home
-            or account["shell"] != shell or account["uid"] < 1):
+    if account is None or not _is_ours(account, marker, home, shell):
         raise ProvisionError("an account with that name exists but is not a Shiplord account")
     return account, created
+
+
+def _existing_account(system: System, application_id: str) -> dict | None:
+    return _existing_user(system, deployment_user(application_id), _marker(application_id), "/", "/bin/sh")
 
 
 def _ensure_account(system: System, application_id: str) -> tuple[dict, bool]:
     return _ensure_user(system, deployment_user(application_id), _marker(application_id), "/", "/bin/sh")
 
 
+def _ensure_group_membership(system: System, name: str) -> bool:
+    """Put a deployment account in the group the sshd drop-in matches; idempotent.
+
+    This runs before the account's first key is installed, so a failure here leaves an account that cannot log in
+    rather than one that can log in without the forced command.
+    """
+    result = _run(system, [GETENT, "group", DEPLOY_GROUP], "getent")
+    if result.code == 2:
+        raise ProvisionError("the deployment group is missing; bootstrap the server again")
+    fields = result.output.strip().split(":")
+    if result.code != 0 or len(fields) < 4 or fields[0] != DEPLOY_GROUP:
+        raise ProvisionError("could not read the deployment group")
+    if name in fields[3].split(","):
+        return False
+    if _run(system, [USERMOD, "--append", "--groups", DEPLOY_GROUP, name], "usermod").code != 0:
+        raise ProvisionError("could not add the deployment account to the deployment group")
+    return True
+
+
+def _runtime_marker(application_id: str) -> str:
+    return f"shiplord-runtime-{application_id}"
+
+
+def _existing_runtime_account(system: System, application_id: str) -> dict | None:
+    return _existing_user(system, runtime_user(application_id), _runtime_marker(application_id), "/nonexistent",
+                          "/usr/sbin/nologin")
+
+
 def _ensure_runtime(layout: Layout, system: System, application_id: str) -> dict[str, bool]:
     """A native application runs as its own unprivileged account, with writable data outside releases."""
-    account, created = _ensure_user(system, runtime_user(application_id), f"shiplord-runtime-{application_id}",
+    account, created = _ensure_user(system, runtime_user(application_id), _runtime_marker(application_id),
                                     "/nonexistent", "/usr/sbin/nologin")
     data = layout.data / application_id
     made = not data.exists()
@@ -166,8 +212,23 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
                                "image_repository": image_repository, "max_memory_mb": max_memory_mb})
     except StateError as error:
         raise ProvisionError(f"invalid application settings: {error}") from None
+    # Everything that can refuse this provisioning is checked before the first side effect, so a refused
+    # re-provision leaves no account, key, sudoers rule, directory, or registration behind.
+    account = _existing_account(system, app)
+    if runtime == "native":
+        _existing_runtime_account(system, app)
+    registry_fd = _open_directory(layout.registrations)
+    try:
+        existing = Registry(registry_fd, lock).check(
+            app, deployment_uid=None if account is None else account["uid"], deployment_user=deployment_user(app),
+            runtime=runtime, api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+    except StateError as error:
+        raise ProvisionError(f"registration failed: {error}") from None
+    finally:
+        os.close(registry_fd)
     created: dict[str, bool] = {}
     account, created["account"] = _ensure_account(system, app)
+    created["deployment_group"] = _ensure_group_membership(system, account["name"])
     if runtime == "native":
         created.update(_ensure_runtime(layout, system, app))
     created["state_directory"] = _private_directory(layout.app_state / app)
@@ -192,12 +253,10 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     created["sudo_policy"] = _install_sudoers(layout, system, app, account["name"])
     registry_fd = _open_directory(layout.registrations)
     try:
-        registry = Registry(registry_fd, lock)
-        before = registry.read(app)
-        record = registry.register(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                   runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                   max_memory_mb=max_memory_mb)
-        created["registration"] = before is None
+        record = Registry(registry_fd, lock).register(
+            app, deployment_uid=account["uid"], deployment_user=account["name"], runtime=runtime,
+            api_domain=api_domain, image_repository=image_repository, max_memory_mb=max_memory_mb)
+        created["registration"] = existing is None
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
@@ -208,10 +267,18 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
             "created": created}
 
 
+def _require_provisioned(layout: Layout, application_id: str) -> None:
+    """Refuse an application that provision has not created; its environment directory marks it as provisioned."""
+    directory = layout.environments / application_id
+    if not directory.is_dir() or directory.is_symlink():
+        raise ProvisionError("the application is not provisioned")
+
+
 def manage_key(layout: Layout, application_id: str, operation: str, *, label: str | None = None,
                public_key: str | None = None) -> dict:
     """Add, remove, or list keys for a provisioned application."""
     app = validate_app_name(application_id)
+    _require_provisioned(layout, app)
     store = KeyStore(layout.authorized_keys, app, deployment_user(app))
     try:
         if operation == "list":
@@ -235,10 +302,8 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
     be read is still replaced or removed, so a corrupt file never needs a manual root shell to repair.
     """
     app = validate_app_name(application_id)
-    directory = layout.environments / app
-    if not directory.is_dir() or directory.is_symlink():
-        raise ProvisionError("the application is not provisioned")
-    path = directory / "app.env"
+    _require_provisioned(layout, app)
+    path = layout.environments / app / "app.env"
     if operation == "clear":
         try:
             load_environment_file(path)  # only to report that the file it removes could not be read
@@ -292,8 +357,103 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
 
 
 REGISTRY_HOSTS = ("ghcr.io",)
+REGISTRY_CONFIG = "config.json"
 _LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 _LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
+
+
+def _registry_username(entry: object) -> str:
+    """Decode one ``auth`` value; the error names the problem, never the value or a host path."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("auth"), str):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth entry has no auth value")
+    try:
+        decoded = base64.b64decode(entry["auth"], validate=True).decode("utf-8")
+    except ValueError:
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not valid "
+                             "base64") from None
+    username, separator, _ = decoded.partition(":")
+    if not separator or not _LOGIN_USER.fullmatch(username):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
+                             "username:token")
+    return username
+
+
+def _registry_auths(path: Path) -> dict:
+    """Read the login file's raw ``auths`` mapping; a hand-edited file is an error, not a traceback."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is unreadable") from None
+    try:
+        document = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is unreadable: it is not valid JSON") from None
+    auths = document.get("auths") if isinstance(document, dict) else None
+    if not isinstance(auths, dict):
+        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: auths is not an object")
+    for entry in auths.values():
+        _registry_username(entry)
+    return auths
+
+
+def _remove_registry_config(directory: Path) -> None:
+    """Remove the login file and sync its directory; a missing file or directory is not an error."""
+    if directory.is_symlink():
+        raise ProvisionError(f"{directory} is a symbolic link")
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ProvisionError("could not remove the registry login") from None
+    try:
+        try:
+            os.unlink(REGISTRY_CONFIG, dir_fd=descriptor)
+            os.fsync(descriptor)
+        except FileNotFoundError:
+            pass
+    except OSError:
+        raise ProvisionError("could not remove the registry login") from None
+    finally:
+        os.close(descriptor)
+
+
+def _write_registry_config(directory: Path, auths: dict) -> None:
+    """Publish the login file atomically and sync its directory; a failure leaves no temporary file."""
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink():
+            raise ProvisionError(f"{directory} is a symbolic link")
+        os.chmod(directory, 0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ProvisionError("could not write the registry login") from None
+    temporary = f".config.tmp-{secrets.token_hex(6)}"
+    created = False
+    try:
+        file_descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                                  dir_fd=descriptor)
+        created = True
+        with os.fdopen(file_descriptor, "w") as file:
+            json.dump({"auths": auths}, file)
+            file.flush()
+            if os.geteuid() == 0:
+                os.fchown(file.fileno(), 0, 0)
+            os.fsync(file.fileno())
+        os.replace(temporary, REGISTRY_CONFIG, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        created = False
+        os.fsync(descriptor)
+    except OSError:
+        raise ProvisionError("could not write the registry login") from None
+    finally:
+        try:
+            if created:
+                os.unlink(temporary, dir_fd=descriptor)
+        except OSError:
+            pass
+        os.close(descriptor)
 
 
 def manage_registry(layout: Layout, application_id: str, operation: str, *, registry: str | None = None,
@@ -307,13 +467,10 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
     if not (layout.registrations / f"{app}.json").is_file():
         raise ProvisionError("the application is not provisioned")
     directory = layout.registry_logins / app
-    path = directory / "config.json"
-    try:
-        current = json.loads(path.read_text()).get("auths", {}) if path.exists() else {}
-    except (OSError, ValueError, AttributeError):
-        raise ProvisionError("the registry login file is unreadable; remove and recreate it") from None
+    current = _registry_auths(directory / REGISTRY_CONFIG)
+
     def summary() -> dict:  # registries and usernames only; never a token
-        return {"registries": [{"registry": name, "username": base64.b64decode(entry["auth"]).split(b":", 1)[0].decode()}
+        return {"registries": [{"registry": name, "username": _registry_username(entry)}
                                for name, entry in sorted(current.items())]}
 
     if operation == "list":
@@ -330,23 +487,10 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
         current[registry] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
     else:
         raise ProvisionError("unknown registry operation")
-    try:
-        if not current:
-            path.unlink(missing_ok=True)
-            return summary()
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-        temporary = directory / f".config.tmp-{secrets.token_hex(6)}"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w") as file:
-            json.dump({"auths": current}, file)
-            file.flush()
-            if os.geteuid() == 0:
-                os.fchown(file.fileno(), 0, 0)
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        raise ProvisionError("could not write the registry login") from None
+    if not current:
+        _remove_registry_config(directory)
+        return summary()
+    _write_registry_config(directory, current)
     return summary()
 
 
@@ -369,6 +513,35 @@ def _remove_account(system: System, name: str, sleep: Callable[[float], None]) -
                 pass  # no logind: the processes may still exit by themselves
         sleep(1.0)
     raise ProvisionError("could not remove the deployment account; end its sessions and retry")
+
+
+def _remove_route(layout: Layout, application_id: str) -> bool:
+    """Remove the application's managed route and any interrupted-change backup; a missing route directory is fine."""
+    try:
+        ship = os.open(layout.caddy_root / "ship", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False  # a host without Caddy has nothing routed
+    except OSError:
+        raise ProvisionError("could not open the managed route directory") from None
+    removed = False
+    try:
+        try:
+            _directory(ship)
+        except StateError:
+            raise ProvisionError("the managed route directory is not trusted") from None
+        for name in (f"{application_id}.caddy", f".prior-{application_id}"):
+            try:
+                os.unlink(name, dir_fd=ship)
+                removed = True
+            except FileNotFoundError:
+                pass
+        if removed:
+            os.fsync(ship)
+    except OSError:
+        raise ProvisionError("could not remove the application's route") from None
+    finally:
+        os.close(ship)
+    return removed
 
 
 def deprovision(layout: Layout, system: System, lock: HostLock, application_id: str, *,
@@ -429,13 +602,13 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
         _remove_account(system, name, sleep)
     removed["account"] = account is not None
     for directory, key in ((layout.app_state / app, "state_directory"), (layout.environments / app, "environment_directory"),
-                           (layout.registry_logins / app, "registry_login")):
+                           (layout.registry_logins / app, "registry_login"), (layout.jobs / app, "jobs_directory")):
         if directory.is_symlink():
             raise ProvisionError(f"{directory} is a symbolic link")
         if directory.exists():
             shutil.rmtree(directory)
             removed[key] = True
-        elif key != "registry_login":  # an optional item is reported only when it existed
+        elif key not in ("registry_login", "jobs_directory"):  # an optional item is reported only when it existed
             removed[key] = False
     retained = []
     if isinstance(retired, dict):  # what retirement kept is part of what this command kept
@@ -447,6 +620,8 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
     if (layout.releases / app).exists():
         shutil.rmtree(layout.releases / app)
         removed["release_binaries"] = True
+    if _remove_route(layout, app):
+        removed["route"] = True
     unit = layout.systemd_units / f"shiplord-{app}.service"
     if unit.exists():
         _run(system, ["/usr/bin/systemctl", "disable", "--now", unit.name], "systemctl")
