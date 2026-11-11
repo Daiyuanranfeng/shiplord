@@ -70,7 +70,7 @@ shiplord deploy \
 
 `plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
 
-If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data.
+If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data. For app data, the supported path is one SQLite database on the app's volume (or data directory); see [Application data](docs/guide.md#application-data).
 
 ## Check or undo a deployment
 
