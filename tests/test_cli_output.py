@@ -87,6 +87,16 @@ GITHUB_ROTATED = {"ok": True, "repository": "QueryPlanner/orders", "old_label": 
                   "key_label": "ci-new", "key_fingerprint": "SHA256:new", "steps": {"register": "ci-new"}}
 RESTARTED = {"ok": True, "request_id": "restart-1", "status": "succeeded", "exit_code": 0}
 KEYS = {"keys": [{"label": "ci", "fingerprint": "SHA256:abc"}]}
+SETUP = {"ok": True, "resumed_at": "configure", "steps": [
+    {"step": "configure", "status": "ran", "result": {"answers": {}}},
+    {"step": "provision", "status": "already complete"},
+    {"step": "environment", "status": "not requested",
+     "detail": "no --env-file given; runtime environment was not changed"},
+    {"step": "registry", "status": "not requested",
+     "detail": "no registry token given; registry login was not changed"},
+    {"step": "github", "status": "not requested", "detail": "--skip-ci given; CI was not configured"},
+    {"step": "check-ci", "status": "not requested", "detail": "--skip-ci given; CI was not checked"},
+]}
 
 # A dumped dict or list: a line, or the value after its first label, starts with a structure.
 STRUCTURE_DUMP = ("OrderedDict(", "dict_keys(", "dict_values(")
@@ -249,6 +259,15 @@ class CommandOutputTests(unittest.TestCase):
                  "frontend_origins": [], "runtime": "docker", "template": "google-adk",
                  "container_port": 8080, "readiness_path": "/ready", "memory_mb": 512, "registered": False},
                 ("Outcome: ship.toml created", "The server alias has not been checked.")),
+            Case("setup", lambda as_json: self.invoke(
+                ["setup", "--server", "production", "--api-domain", "api.example.com", "--no-frontend",
+                 "--repo", "QueryPlanner/orders", "--skip-ci"], as_json,
+                patches=[("shiplord.cli.setup_module.run_setup", {"return_value": (0, SETUP)}),
+                         ("shiplord.cli.load_manifest", {"return_value": dict(MANIFEST)})]),
+                {"application": "orders", "server": "production", **SETUP},
+                ("Target: orders on production", "configure: done", "provision: already complete",
+                 "environment: not requested (no --env-file given; runtime environment was not changed)",
+                 "Outcome: ready")),
             Case("provision", lambda as_json: self.invoke(
                 ["provision"], as_json,
                 patches=[("shiplord.cli._manifest", {"return_value": manifest}),

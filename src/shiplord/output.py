@@ -694,3 +694,25 @@ def render_keys(result: dict, target: str, operation: str, say: Say | None = Non
                 say(f"  {item.get('label', 'unknown')}: {item.get('fingerprint', 'unknown')}")
     if result.get("note"):
         say(f"Note: {result['note']}")
+
+
+def render_setup(result: dict, say: Say | None = None) -> None:
+    """The first-run sequence: each step's status, and where a stopped run will resume."""
+    say = _say(say)
+    if result.get("application"):
+        say(f"Target: {result['application']} on {result['server']}")
+    labels = {"ran": "done"}
+    for item in result.get("steps", []):
+        line = f"{item['step']}: {labels.get(item['status'], item['status'])}"
+        if item.get("detail"):
+            line += f" ({item['detail']})"
+        say(line)
+        check = item.get("result")
+        if item["step"] == "check-ci" and isinstance(check, dict) and check.get("run"):
+            say(f"  CI run: {check['run']}")
+    if result.get("ok"):
+        say("Outcome: ready")
+    else:
+        say(f"Outcome: stopped at {result.get('failed_step')}")
+        if result.get("error"):
+            say(f"Error: {result['error']}")

@@ -160,6 +160,15 @@ def ci_directory(application_id: str, server: str, home: Path | None = None) -> 
     return directory
 
 
+def _ci_base(home: Path | None = None) -> Path:
+    return (home / "shiplord") if home else (_config_home() / "shiplord")
+
+
+def ci_state(application_id: str, server: str, home: Path | None = None) -> dict:
+    """The recorded CI setup state for an application, without creating anything."""
+    return _load_state(_ci_base(home) / "ci" / server / application_id)
+
+
 def _migrate_legacy_state(legacy: Path, directory: Path) -> None:
     """Move state written at ``ci/<app>`` into the server-scoped directory; never overwrite newer state.
 
@@ -298,6 +307,27 @@ def validate_setup_request(manifest: dict, repository: str) -> None:
         raise GitHubError("--repo must be owner/repository", 2)
     if "github" in manifest and manifest["github"]["repository"] != repository:
         raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
+
+
+def validate_repository(repository: str) -> str:
+    """Reject a repository that is not an ``owner/repository`` pair before anything is changed."""
+    if not _REPOSITORY.fullmatch(repository):
+        raise GitHubError("--repo must be owner/repository", 2)
+    return repository
+
+
+def setup_complete(manifest: dict, *, project: Path, repository: str, home: Path | None = None) -> bool:
+    """Local evidence that ``github setup`` finished for this repository.
+
+    It reads the manifest, the generated workflow, and the local CI state; it does not query GitHub, so a secret
+    deleted in the repository is not noticed here (``shiplord github status`` and the final check do notice it).
+    """
+    if manifest.get("github", {}).get("repository") != repository:
+        return False
+    if manifest["runtime"] == "docker" and not (project / WORKFLOW_PATH).is_file():
+        return False
+    state = ci_state(manifest["name"], manifest["server"], home)
+    return bool(state.get("secret_set")) and state.get("repository") == repository
 
 
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,

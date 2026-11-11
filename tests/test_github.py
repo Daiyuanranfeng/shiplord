@@ -631,6 +631,41 @@ class StatusTests(GitHubTestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+@unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
+class SetupCompleteTests(GitHubTestCase):
+    """The local evidence `shiplord setup` uses to skip a finished github setup; it never queries GitHub."""
+
+    def complete(self, repository="Example/orders", project=None):
+        return github.setup_complete(manifest(with_github=True), project=project or self.project,
+                                     repository=repository, home=self.home)
+
+    def test_it_needs_the_manifest_workflow_and_a_stored_secret(self):
+        self.assertFalse(self.complete())  # nothing has run yet
+        self.setup_call()
+        self.assertTrue(self.complete())
+
+    def test_a_missing_workflow_or_a_different_repository_is_not_complete(self):
+        self.setup_call()
+        self.assertFalse(self.complete(repository="Other/repo"))
+        self.assertFalse(self.complete(project=self.project / "elsewhere"))
+        (self.project / WORKFLOW_PATH).unlink()
+        self.assertFalse(self.complete())
+
+    def test_a_secret_that_was_never_stored_is_not_complete(self):
+        self.setup_call()
+        state_path = github.ci_directory("orders", "production", self.home) / "state.json"
+        state = json.loads(state_path.read_text())
+        state["secret_set"] = False
+        state_path.write_text(json.dumps(state))
+        self.assertFalse(self.complete())
+
+    def test_native_applications_do_not_need_a_generated_workflow(self):
+        native = manifest(runtime="native", with_github=True)
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        self.setup_call(manifest=native)
+        self.assertTrue(github.setup_complete(native, project=self.project, repository="Example/orders", home=self.home))
+
+
 class HostKeyTests(unittest.TestCase):
     def test_host_keys_are_validated_and_formatted_for_known_hosts(self):
         key_type, blob = host_key(3)

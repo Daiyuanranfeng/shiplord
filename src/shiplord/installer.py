@@ -27,8 +27,9 @@ from .release_state import HostLock
 from .routing import CaddyCommands, RouteManager, RoutingError, caddy_binary, probe_caddy
 from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
-CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "output.py",
-                            "servers.py", "tailscale.py", "template.py", "transport.py", "workflow.py"})
+CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py",
+                            "output.py", "servers.py", "setup.py", "tailscale.py", "template.py", "transport.py",
+                            "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",

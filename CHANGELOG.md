@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add `shiplord setup`, which runs configure, provision, env, registry login,
+  github setup, and check-ci in order and resumes at the first incomplete step.
 - Render every command's result as readable lines, and accept `--json` on
   `init`, `configure`, and `server add` as the other commands already did.
 - Add a `QueryPlanner/shiplord/deploy` composite action and make the generated
