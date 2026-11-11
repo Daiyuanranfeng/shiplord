@@ -10,6 +10,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -213,6 +214,40 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "deprovision", "--retire", "--json", env=env)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("--yes", json.loads(result.stdout)["error"])
+
+    def test_restore_requires_confirmation_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)  # no server aliases exist here
+            result = self.invoke(directory, "restore", "--latest", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
+            # With --yes the confirmation passes and the missing server alias is the next failure (exit 3).
+            self.assertEqual(self.invoke(directory, "restore", "--latest", "--yes", "--json", env=env).returncode, 3)
+            self.assertEqual(self.invoke(directory, "backup", "--json", env=env).returncode, 3)
+
+    def test_backup_and_restore_need_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (["backup", "--json"], ["restore", "--latest", "--yes", "--json"]):
+                with self.subTest(command=command):
+                    result = self.invoke(directory, *command)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("ship.toml", json.loads(result.stdout)["error"])
+
+    def test_backup_output_reports_the_verified_archive(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            cli.output.render_operation(
+                0, {"status": "succeeded", "archive": "shiplord-backup-orders-20240101T000000Z.tar.gz",
+                    "sha256": "b" * 64, "size": 10, "entries": 2, "bytes": 4, "verified": True,
+                    "application": {"restarted": True, "running": True}},
+                "orders on production", "backup")
+        text = buffer.getvalue()
+        self.assertIn("Outcome: succeeded", text)
+        self.assertIn("Archive: shiplord-backup-orders-20240101T000000Z.tar.gz", text)
+        self.assertIn("Sha256: " + "b" * 64, text)
+        self.assertIn("Verified: yes", text)
+        self.assertIn("Application: running", text)
 
     def test_deploy_validates_its_input_before_reading_any_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:

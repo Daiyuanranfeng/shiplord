@@ -77,6 +77,8 @@ class Layout:
     @property
     def data(self) -> Path: return self.path(VAR + "/data")
     @property
+    def backups(self) -> Path: return self.path(VAR + "/backups")
+    @property
     def releases(self) -> Path: return self.path(RELEASES)
     @property
     def systemd_units(self) -> Path: return self.path(SYSTEMD_UNITS)

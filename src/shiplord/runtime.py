@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import platform
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Callable, Protocol
@@ -167,6 +169,7 @@ class Runtime(Protocol):
                     timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
                     emit: Callable[[str], None] = lambda chunk: None) -> str: ...
     def discard(self, registration: dict, release: dict) -> list[str]: ...
+    def data_root(self, registration: dict) -> Path: ...
 
 
 def validate_since(value: str) -> str:
@@ -346,6 +349,35 @@ class DockerRuntime:
         if retained is None:
             raise RuntimeFailure("the unlabelled application volume has no retained Shiplord container evidence", "storage")
         return {"volume_name": name, "fingerprint": fingerprint, "container_id": retained}
+
+    def data_root(self, registration: dict) -> Path:
+        """The host directory that holds this application's persistent data, for a backup or a restore.
+
+        Only a volume Shiplord manages is ever read, and only through the mountpoint the daemon reports. The
+        caller needs local access to that directory: it is ``root``-owned, so a helper running as root has it.
+        """
+        self.check_volume(registration, create=False)  # refuse an absent or foreign volume before reading anything
+        inspect = self._docker(["volume", "inspect", "--format", "{{.Mountpoint}}", self.volume_name(registration)],
+                               "storage")
+        if inspect.code != 0:
+            if "no such volume" in inspect.output.lower():
+                raise RuntimeFailure("this application has no data volume to back up; nothing was changed", "storage",
+                                     kind="no_data")
+            raise RuntimeFailure("the application volume could not be inspected", "storage", inspect.output)
+        mountpoint = inspect.output.strip()
+        if not mountpoint.startswith("/") or mountpoint.rstrip("/") == "":
+            raise RuntimeFailure("the application volume reports no usable mountpoint; nothing was changed", "storage",
+                                 kind="no_data")
+        path = Path(mountpoint)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise RuntimeFailure("the application volume is not reachable from this host; nothing was changed",
+                                 "storage", kind="no_data") from None
+        if not stat.S_ISDIR(info.st_mode):  # lstat: a link is not a directory, so it is refused too
+            raise RuntimeFailure("the application volume mountpoint is not a directory; nothing was changed", "storage",
+                                 kind="no_data")
+        return path
 
     def _legacy_volume_container(self, registration: dict, volume_name: str) -> str | None:
         """Return a retained Shiplord container ID only when its labels and exact volume mount agree."""

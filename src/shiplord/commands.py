@@ -467,6 +467,50 @@ def run_job_command(manifest: dict | None, client: HelperClient, action: str, *,
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 
 
+def require_helper_action(client: HelperClient, action: str) -> None:
+    """Refuse an action an older helper would ignore, before submitting a job."""
+    if action not in client.call("capabilities")["actions"]:
+        raise CommandError(f"the server helper does not support {action}; re-run `shiplord server bootstrap` to "
+                           "upgrade it, then retry", 4)
+
+
+def backup_application(manifest: dict, client: HelperClient, *, request_id: str | None = None,
+                       on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Ask the server to archive and verify this application's data; nothing local is uploaded."""
+    require_helper_action(client, "backup")
+    request_id = request_id or new_request_id("backup")
+    outcome = submit_and_wait(client, "backup", request_id=request_id, timeout=job_timeout(manifest),
+                              on_progress=on_progress)
+    return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id,
+                                  "status": outcome["status"], "exit_code": outcome["exit_code"], **outcome["detail"]}
+
+
+def restore_arguments(archive: str | None, latest: bool) -> dict:
+    """Exactly one source, validated before any connection is made."""
+    if archive is None and not latest:
+        raise CommandError("specify --archive or --latest")
+    if archive is not None and latest:
+        raise CommandError("specify only one of --archive and --latest")
+    if archive is None:
+        return {"latest": True}
+    from .backup import validate_archive_name  # lazy: the CLI should not import the server's archive machinery
+    try:
+        return {"archive": validate_archive_name(archive)}
+    except ValueError as error:
+        raise CommandError(str(error)) from None
+
+
+def restore_application(manifest: dict, client: HelperClient, arguments: dict, *, request_id: str | None = None,
+                        on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Replace this application's data with a verified backup, chosen on the server."""
+    require_helper_action(client, "restore")
+    request_id = request_id or new_request_id("restore")
+    outcome = submit_and_wait(client, "restore", request_id=request_id, arguments=arguments,
+                              timeout=job_timeout(manifest), on_progress=on_progress)
+    return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id,
+                                  "status": outcome["status"], "exit_code": outcome["exit_code"], **outcome["detail"]}
+
+
 def application_doctor(manifest: dict, client: HelperClient, *, which=None, resolve=None) -> tuple[int, dict]:
     """Check local tools, the deployment login, the helper, the registration, and DNS."""
     import shutil

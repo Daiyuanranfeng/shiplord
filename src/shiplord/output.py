@@ -557,6 +557,15 @@ def render_operation(code: int, result: dict, target: str, operation: str, say: 
         if result.get(name) is not None:
             label = "URL" if name == "url" else name.capitalize()
             say(f"{label}: {result[name]}")
+    if operation in {"backup", "restore"}:
+        for name in ("archive", "sha256", "size", "entries", "bytes"):
+            if result.get(name) is not None:
+                say(f"{name.capitalize()}: {result[name]}")
+        if result.get("verified") is True:
+            say("Verified: yes")
+        application = result.get("application")
+        if isinstance(application, dict) and application.get("restarted"):
+            say(f"Application: {'running' if application.get('running') else 'did not start again'}")
     if operation == "plan":
         render_plan_details(result, say)
     elif operation in {"deployment", "release"}:

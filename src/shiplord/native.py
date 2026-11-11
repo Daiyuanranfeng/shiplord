@@ -143,6 +143,19 @@ class NativeRuntime:
     def staged_path(self, registration: dict, release: dict) -> Path:
         return self.layout.app_state / registration["application_id"] / "staging" / (release["artifact"]["sha256"] + ".bin")
 
+    def data_root(self, registration: dict) -> Path:
+        """The directory the service writes to; it exists once the application has been deployed."""
+        path = self.layout.data / registration["application_id"]
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise RuntimeFailure("this application has no data directory to back up; nothing was changed", "storage",
+                                 kind="no_data") from None
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeFailure("the application data directory is not a directory; nothing was changed", "storage",
+                                 kind="no_data")
+        return path
+
     def _systemctl(self, argv: list[str], phase: str, *, max_output: int = 4096):
         try:
             return self.system.run([SYSTEMCTL, *argv], timeout=60, max_output=max_output)

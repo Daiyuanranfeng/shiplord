@@ -405,6 +405,42 @@ shutdown_timeout_action = "fail" # "force" (default) or "fail"
 - The shutdown journal persists the original deadline. Recovery uses the time remaining rather than starting a new
   timeout period.
 
+## Backup and restore
+
+`shiplord backup` archives the application's persistent data on the server; `shiplord restore` puts a verified
+archive back. Both run as a normal job, with the same authorization, audit record, host lock, and exit codes as a
+deploy.
+
+```sh
+shiplord backup --json                      # writes and verifies an archive; nothing is uploaded
+shiplord restore --latest --yes --json      # replace the live data with the newest archive
+shiplord restore --archive shiplord-backup-orders-20260101T120000Z.tar.gz --yes
+```
+
+- An archive is only reported once it has been **read back**: it is written to a private temporary file, synced,
+  renamed into place, reopened, and compared with the data it was made from (entry count and byte total).
+- A restore is only reported once it has been **verified**: the record and checksum are checked, every entry is
+  validated, the contents are extracted beside the live data and counted, and only then is the live directory
+  replaced. The previous data is kept until the replacement has been verified and put back if it cannot be.
+- The application is **stopped** while its data is copied or replaced, so a live database is not archived
+  half-written, and started again afterwards. If it does not come back the job exits 6 (`intervention_required`).
+- Archives live under `/var/lib/shiplord/backups/<application>/` as `shiplord-backup-<app>-<timestamp>.tar.gz` with
+  a `.json` sidecar record. Both are root-owned and `0600`; the directory is `0700`. There is no download command
+  yet: copy an archive off the server by hand if you need an off-host copy.
+- Archives are refused when they are corrupt, truncated, belong to another application or runtime, or contain an
+  absolute path, `..`, a link, a device file, too many entries, or too many bytes. Symbolic links and special files
+  in the live data are refused at backup time for the same reason.
+- Free disk space is checked before an archive is written or extracted; a nearly full disk fails the job before the
+  application is touched.
+- `app.env` and the rest of `/etc/shiplord` are **not** in the archive. It contains only the data directory or the
+  contents of the application's Docker volume. Deprovisioning keeps backups, like it keeps data.
+- A backup or restore is refused while an unfinished deployment transaction exists (`recovery_required`); run
+  `shiplord recover` first.
+- Both are ordinary jobs and share the deploy job's one-hour bound. A job killed at that bound cannot restart the
+  application it stopped, so check `shiplord status` and deploy again if a very large backup is interrupted.
+- Reading a Docker volume's contents needs the daemon's mountpoint to be reachable by the helper, which runs as
+  root on the server. A rootless or remote Docker daemon is not supported by this version.
+
 ## Deploying from GitHub Actions
 
 ```sh
@@ -510,6 +546,7 @@ reach the run page or the calling job.
 | `status`, `logs --tail N [--since D] [--timestamps] [--follow --timeout S]` | Release state, running state, unfinished work; the current release's bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
+| `backup` / `restore --archive N \| --latest --yes` | Write and verify an archive of the application's data; replace live data with a verified archive. |
 | `registry login --username U --token-file F \| --token-stdin [--registry ghcr.io\|docker.io]` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, ports once deployed, Docker when needed, disk, each application's state and consistency); every registered server read-only; access, helper, DNS. |

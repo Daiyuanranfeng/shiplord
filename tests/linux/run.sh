@@ -44,7 +44,10 @@ run_host() {
     'env SHIPLORD_TEST_UNSUPPORTED_OS=1 python -m unittest tests.test_host_integration.UnsupportedOsTests -v 2>&1 | tail -20'
 }
 run_docker() {
-  oneshot -v /var/run/docker.sock:/var/run/docker.sock --network host -- \
+  # The backup test reads and wipes the volume through its mountpoint, so the daemon's root must be reachable.
+  local docker_root
+  docker_root=$(docker info --format '{{.DockerRootDir}}')
+  oneshot -v /var/run/docker.sock:/var/run/docker.sock -v "$docker_root":"$docker_root":rw --network host -- \
     'env SHIPLORD_TEST_DOCKER=1 python -m unittest tests.test_deploy_integration -v 2>&1 | tail -40'
 }
 run_e2e() {

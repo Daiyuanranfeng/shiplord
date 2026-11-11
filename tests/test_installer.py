@@ -154,7 +154,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertTrue(all(result["changed"].values()), result)
         layout = self.layout
         for path, mode in ((layout.registrations, 0o700), (layout.environments, 0o700), (layout.app_state, 0o700),
-                           (layout.jobs, 0o700), (layout.authorized_keys, 0o755), (layout.var, 0o755)):
+                           (layout.jobs, 0o700), (layout.backups, 0o700), (layout.authorized_keys, 0o755),
+                           (layout.var, 0o755)):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
         current = layout.lib / "current"
         self.assertEqual(os.readlink(current), result["version"])

@@ -89,6 +89,9 @@ GITHUB_ROTATED = {"ok": True, "repository": "QueryPlanner/orders", "old_label": 
                   "key_label": "ci-new", "key_fingerprint": "SHA256:new", "steps": {"register": "ci-new"}}
 RESTARTED = {"ok": True, "request_id": "restart-1", "status": "succeeded", "exit_code": 0}
 KEYS = {"keys": [{"label": "ci", "fingerprint": "SHA256:abc"}]}
+BACKED_UP = {"ok": True, "status": "succeeded", "archive": "shiplord-backup-orders-20240101T000000Z.tar.gz",
+             "sha256": "b" * 64, "size": 10, "entries": 2, "bytes": 4, "verified": True,
+             "application": {"restarted": True, "running": True}}
 UNINSTALLED = {
     "status": "uninstalled",
     "removed": {"caddy": {"import": True, "placeholder": False}, "sshd": True,
@@ -410,6 +413,16 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli._helper", {}),
                          ("shiplord.cli.commands.run_job_command", {"return_value": (0, RESTARTED)})]),
                 RESTARTED, ("Outcome: succeeded", "Request ID: restart-1")),
+            Case("backup", lambda as_json: self.invoke(
+                ["backup"], as_json,
+                patches=self.admin_patches("shiplord.cli.commands.backup_application", (0, BACKED_UP))),
+                BACKED_UP, ("Outcome: succeeded", "Archive: shiplord-backup-orders", "Verified: yes",
+                            "Application: running")),
+            Case("restore", lambda as_json: self.invoke(
+                ["restore", "--latest", "--yes"], as_json,
+                patches=self.admin_patches("shiplord.cli.commands.restore_application", (0, BACKED_UP))),
+                BACKED_UP, ("Outcome: succeeded", "Archive: shiplord-backup-orders", "Verified: yes",
+                            "Application: running")),
             Case("server uninstall", lambda as_json: self.invoke(
                 ["server", "uninstall", "production"], as_json,
                 patches=[("shiplord.cli.load_server", {"return_value": "admin@example.com"}),

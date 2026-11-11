@@ -605,6 +605,52 @@ class QueryCommandTests(ClientTestCase):
         self.assertFalse(result["running"])
 
 
+class BackupCommandTests(ClientTestCase):
+    def setUp(self):
+        super().setUp()
+        self.data = self.layout.data / "orders"
+        self.data.mkdir(parents=True)
+        (self.data / "state.db").write_bytes(b"sqlite")
+        self.runtime.data_root_path = self.data
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+        self.waited = []
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            self.waited.append(job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda seconds: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+
+    def test_backup_and_restore_report_the_verified_archive(self):
+        code, backup = commands.backup_application(manifest(), self.client, request_id="bk-1")
+        self.assertEqual((code, backup["ok"], backup["verified"]), (0, True, True))
+        name = backup["archive"]
+        (self.data / "state.db").write_bytes(b"changed")
+        arguments = commands.restore_arguments(name, False)
+        code, restore = commands.restore_application(manifest(), self.client, arguments, request_id="rs-1")
+        self.assertEqual((code, restore["ok"], restore["archive"]), (0, True, name))
+        self.assertEqual((self.data / "state.db").read_bytes(), b"sqlite")
+        self.assertEqual(self.waited, ["bk-1", "rs-1"])
+
+    def test_restore_needs_exactly_one_source_and_a_safe_name(self):
+        for archive, latest in ((None, False), ("shiplord-backup-orders-20240101T000000Z.tar.gz", True)):
+            with self.subTest(archive=archive, latest=latest), self.assertRaises(CommandError):
+                commands.restore_arguments(archive, latest)
+        self.assertEqual(commands.restore_arguments(None, True), {"latest": True})
+        for name in ("../escape.tar.gz", "/etc/passwd.tar.gz", "a/b.tar.gz", "not-a-backup.tar"):
+            with self.subTest(name=name), self.assertRaises(CommandError):
+                commands.restore_arguments(name, False)
+
+    def test_an_old_helper_is_refused_with_the_protocol_exit_code(self):
+        self.client.call = lambda action, **options: {"actions": ["capabilities", "deploy"]}
+        with self.assertRaises(CommandError) as caught:
+            commands.backup_application(manifest(), self.client)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("server bootstrap", str(caught.exception))
+
+
 class DoctorTests(ClientTestCase):
     def doctor(self, **kwargs):
         options = dict(which=lambda name: "/usr/bin/" + name, resolve=lambda domain: [(0, 0, 0, "", ("192.0.2.1", 443))])
