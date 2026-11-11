@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import os
 import re
@@ -17,9 +18,11 @@ import stat
 import struct
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from .layout import DISPATCH_PATH
 from .manifest import validate_app_name
+from .release_state import StateError, _directory
 
 MAX_KEY_LINE = 8192
 MAX_KEYS = 16
@@ -100,12 +103,34 @@ class KeyStore:
     def __init__(self, directory: Path, application_id: str, account: str):
         self.application_id = validate_app_name(application_id)
         self.account = account
-        self.path = Path(directory) / account
+        self.directory = Path(directory)
+        self.path = self.directory / account
         self.command = f"{DISPATCH_PATH} {self.application_id}"
 
-    def _read(self) -> list[tuple[str, PublicKey]]:
+    @contextlib.contextmanager
+    def _open(self, *, missing_ok: bool = False) -> Iterator[int | None]:
+        """Open the key directory once; a link, a foreign owner, or a writable mode is refused."""
         try:
-            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            descriptor = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if missing_ok:
+                yield None
+                return
+            raise KeyError_("could not open the key directory safely") from None
+        except OSError:
+            raise KeyError_("could not open the key directory safely") from None
+        try:
+            try:
+                _directory(descriptor)
+            except (StateError, OSError):
+                raise KeyError_("the key directory is not safe to use") from None
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _read(self, directory: int) -> list[tuple[str, PublicKey]]:
+        try:
+            descriptor = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         except FileNotFoundError:
             return []
         except OSError:
@@ -125,59 +150,79 @@ class KeyStore:
         return entries
 
     def list(self) -> list[tuple[str, str]]:
-        return [(label, key.fingerprint) for label, key in self._read()]
+        with self._open(missing_ok=True) as directory:
+            if directory is None:
+                return []
+            return [(label, key.fingerprint) for label, key in self._read(directory)]
 
     def add(self, label: str, key: PublicKey) -> bool:
         """Add a key; return False if the identical entry exists. Conflicts are refused."""
         label = validate_label(label)
-        entries = self._read()
-        for existing_label, existing in entries:
-            if existing_label == label:
+        with self._open() as directory:
+            entries = self._read(directory)
+            for existing_label, existing in entries:
+                if existing_label == label:
+                    if existing == key:
+                        return False
+                    raise KeyError_("the label is already used by a different key")
                 if existing == key:
-                    return False
-                raise KeyError_("the label is already used by a different key")
-            if existing == key:
-                raise KeyError_("the key is already registered under another label")
-        if len(entries) >= MAX_KEYS:
-            raise KeyError_("too many keys are registered for this application")
-        self._write([*entries, (label, key)])
+                    raise KeyError_("the key is already registered under another label")
+            if len(entries) >= MAX_KEYS:
+                raise KeyError_("too many keys are registered for this application")
+            self._write(directory, [*entries, (label, key)])
         return True
 
     def remove(self, label: str) -> bool:
         label = validate_label(label)
-        entries = self._read()
-        remaining = [entry for entry in entries if entry[0] != label]
-        if len(remaining) == len(entries):
-            return False
-        self._write(remaining)
+        with self._open(missing_ok=True) as directory:
+            if directory is None:
+                return False
+            entries = self._read(directory)
+            remaining = [entry for entry in entries if entry[0] != label]
+            if len(remaining) == len(entries):
+                return False
+            self._write(directory, remaining)
         return True
 
     def delete(self) -> None:
-        try:
-            os.unlink(self.path)
-        except FileNotFoundError:
-            pass
+        with self._open(missing_ok=True) as directory:
+            if directory is None:
+                return
+            try:
+                os.unlink(self.path.name, dir_fd=directory)
+            except FileNotFoundError:
+                return
+            except OSError:
+                raise KeyError_("could not remove the key file") from None
+            try:
+                os.fsync(directory)
+            except OSError:
+                raise KeyError_("could not sync the key directory") from None
 
-    def _write(self, entries: list[tuple[str, PublicKey]]) -> None:
+    def _write(self, directory: int, entries: list[tuple[str, PublicKey]]) -> None:
         text = "".join(f'command="{self.command}",restrict,no-pty {key.type} {key.blob} shiplord:{label}\n'
                        for label, key in entries)
-        temporary = self.path.with_name(f".{self.path.name}.tmp-{secrets.token_hex(8)}")
+        temporary = f".{self.path.name}.tmp-{secrets.token_hex(8)}"
+        created = False
         try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                with os.fdopen(descriptor, "w") as file:
-                    file.write(text)
-                    file.flush()
-                    os.fchmod(file.fileno(), 0o644)  # sshd reads it as the deployment user
-                    if os.geteuid() == 0:
-                        os.fchown(file.fileno(), 0, 0)
-                    os.fsync(file.fileno())
-                os.replace(temporary, self.path)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
-                raise
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                                 dir_fd=directory)
+            created = True
+            with os.fdopen(descriptor, "w") as file:
+                file.write(text)
+                file.flush()
+                os.fchmod(file.fileno(), 0o644)  # sshd reads it as the deployment user
+                if os.geteuid() == 0:
+                    os.fchown(file.fileno(), 0, 0)
+                os.fsync(file.fileno())
+            os.replace(temporary, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            created = False
+            os.fsync(directory)
         except OSError:
             raise KeyError_("could not write the key file") from None
+        finally:
+            if created:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except OSError:
+                    raise KeyError_("temporary key file cleanup failed; inspect the key directory") from None

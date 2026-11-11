@@ -123,29 +123,64 @@ class Registry:
         """Create a registration, or return the identical existing one."""
         if not self.lock.held:
             raise RegistryError("host lock is required")
+        requested = self._requested(application_id, deployment_uid=deployment_uid, deployment_user=deployment_user,
+                                    runtime=runtime, api_domain=api_domain, image_repository=image_repository,
+                                    max_memory_mb=max_memory_mb)
+        existing, others = self._compared(requested)
+        if existing is not None:
+            return existing
+        used = {record["host_port"] for record in others}
+        for port in PORT_RANGE:
+            if port not in used and probe(port):
+                record = validate_registration(dict(requested, host_port=port), requested["application_id"])
+                _write(self.directory, requested["application_id"] + ".json", record, create=True)
+                return record
+        raise RegistryError("no loopback port is available")
+
+    def check(self, application_id: str, *, deployment_uid: int | None, deployment_user: str, runtime: str,
+              api_domain: str, image_repository: str | None,
+              max_memory_mb: int = DEFAULT_MAX_MEMORY_MB) -> dict | None:
+        """Validate a prospective registration without writing; return the identical existing one, if any.
+
+        This is the read half of ``register``, for a caller that must refuse before its first side effect. A
+        ``None`` UID means the deployment account does not exist yet: a new account cannot be identical to an
+        existing registration, so an unknown UID never matches one.
+        """
+        if not self.lock.held:
+            raise RegistryError("host lock is required")
+        requested = self._requested(application_id, deployment_uid=deployment_uid, deployment_user=deployment_user,
+                                    runtime=runtime, api_domain=api_domain, image_repository=image_repository,
+                                    max_memory_mb=max_memory_mb)
+        return self._compared(requested)[0]
+
+    def _requested(self, application_id: str, *, deployment_uid: int | None, deployment_user: str, runtime: str,
+                   api_domain: str, image_repository: str | None, max_memory_mb: int) -> dict:
+        """The prospective record, validated; an unknown UID is validated as a placeholder and then cleared."""
         app = validate_app_name(application_id)
         requested = {"schema_version": 1, "application_id": app, "deployment_uid": deployment_uid,
                      "deployment_user": deployment_user, "runtime": runtime, "api_domain": api_domain,
-                     "host_port": PORT_RANGE.start, "image_repository": image_repository, "max_memory_mb": max_memory_mb}
-        validate_registration(requested)
+                     "host_port": PORT_RANGE.start, "image_repository": image_repository,
+                     "max_memory_mb": max_memory_mb}
+        validate_registration(dict(requested, deployment_uid=1 if deployment_uid is None else deployment_uid))
+        requested["deployment_uid"] = deployment_uid
+        return requested
+
+    def _compared(self, requested: dict) -> tuple[dict | None, list[dict]]:
+        """Refuse a conflicting record; return the identical existing one (or None) and the other records."""
+        app = requested["application_id"]
         others = [record for record in self.list() if record["application_id"] != app]
         existing = self.read(app)
         if existing is not None:
             if any(existing[field] != requested[field] for field in _IDENTITY_FIELDS):
                 raise RegistryError("registration differs; changing it needs an explicit update")
-            return existing
-        for record in others:
-            if record["api_domain"] == requested["api_domain"]:
-                raise RegistryError("hostname is already registered to another application")
-            if record["deployment_uid"] == deployment_uid or record["deployment_user"] == deployment_user:
-                raise RegistryError("deployment account is already registered to another application")
-        used = {record["host_port"] for record in others}
-        for port in PORT_RANGE:
-            if port not in used and probe(port):
-                record = validate_registration(dict(requested, host_port=port), app)
-                _write(self.directory, app + ".json", record, create=True)
-                return record
-        raise RegistryError("no loopback port is available")
+        else:
+            for record in others:
+                if record["api_domain"] == requested["api_domain"]:
+                    raise RegistryError("hostname is already registered to another application")
+                if (record["deployment_uid"] == requested["deployment_uid"]
+                        or record["deployment_user"] == requested["deployment_user"]):
+                    raise RegistryError("deployment account is already registered to another application")
+        return existing, others
 
     def unregister(self, application_id: str) -> bool:
         """Remove a registration, which disables the application's access; idempotent."""

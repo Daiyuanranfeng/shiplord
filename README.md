@@ -7,7 +7,10 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## What you need
 
 - A computer with Python 3.11 or newer, Git, and OpenSSH.
-- A Linux server with systemd, SSH, administrator access, and Caddy.
+- A Linux server running **Ubuntu 24.04 or later, or Debian 12 or later**, with systemd, SSH, administrator
+  access, and Caddy from its package repository (`/usr/bin/caddy`). The helper needs **Python 3.11 or later at
+  `/usr/bin/python3`**; `shiplord server bootstrap` reads `/etc/os-release` and refuses any other distribution or
+  an older version with a message naming what is supported.
 - Docker on the server if you deploy Docker images.
 - A DNS record that points your app's domain to the server. Shiplord checks DNS but does not change it.
 
@@ -35,15 +38,24 @@ shiplord init orders --template google-adk
 cd orders
 shiplord configure --server production \
   --api-domain orders-api.example.com \
-  --frontend https://orders.example.com
+  --frontend https://orders.example.com \
+  --image-repository owner/orders
 
 # Create this app's deployment access
 shiplord provision
 ```
 
-For an existing Docker app, run `shiplord configure` in its directory and choose the `generic` template. Shiplord will check that the app answers its readiness URL before it sends visitors to it.
+`--image-repository owner/orders` is the GitHub repository that publishes the app's image. `provision` reads
+`ghcr.io/owner/orders` from `ship.toml`, so it needs no extra flags. In a git checkout you can leave the option
+out: `configure` reads the repository from the `origin` remote when it is a GitHub URL, and asks for it when it is
+not.
 
-For a native Linux program, use the `google-adk` template above. Add `--runtime native` to `shiplord configure` before running `shiplord provision`. Shiplord assumes Docker otherwise.
+For an existing Docker app, run `shiplord configure` in its directory and choose the `generic` template. It records
+the image repository the same way - from the git remote, from `--image-repository owner/repository`, or by asking -
+so `shiplord provision` needs no extra flags. Shiplord will check that the app answers its readiness URL before it
+sends visitors to it.
+
+For a native Linux program, use the `google-adk` template above without `--image-repository` (a native app has no image) and add `--runtime native` to `shiplord configure` before running `shiplord provision`. Shiplord assumes Docker otherwise.
 
 ## Deploy an update
 
@@ -61,7 +73,7 @@ shiplord deploy \
 
 `plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
 
-If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data.
+If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data. For app data, the supported path is one SQLite database on the app's volume (or data directory); see [Application data](docs/guide.md#application-data).
 
 ## Check or undo a deployment
 
@@ -76,6 +88,7 @@ From any directory, `shiplord recover <app> --server <alias>` reconciles a named
 `shiplord status` prints that exact command when it finds unfinished work.
 
 Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
+Run `shiplord restart` to apply the current environment to the running release without a new commit.
 
 ## Learn more
 

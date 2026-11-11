@@ -44,6 +44,7 @@ application is denied (`{"status": "error", "error": "access_denied"}`, exit 3).
 | `plan` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `result`: what a deploy would do; read-only |
 | `deploy` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `accepted` with a job, or `finished` with an outcome |
 | `rollback` | null | none | `accepted` with a job |
+| `restart` | null | none | `accepted` with a job |
 | `recover` | null | none | `accepted` with a job |
 
 `capabilities` lists optional features after the actions in the same `actions` array (an older client rejects unknown
@@ -66,8 +67,8 @@ one. `sequence` is the release ordering key (the commit's committer timestamp).
 
 ### Jobs
 
-`deploy`, `rollback`, and `recover` create a job record keyed by `request_id` and start a worker as a transient
-systemd unit, so the operation survives the SSH session. A repeated `request_id` returns the recorded job whatever
+`deploy`, `rollback`, `restart`, and `recover` create a job record keyed by `request_id` and start a worker as a
+transient systemd unit, so the operation survives the SSH session. A repeated `request_id` returns the recorded job whatever
 its outcome was; changed content under the same ID is refused. The response is:
 
 ```json
@@ -86,6 +87,13 @@ vanished; run `recover`). A `deploy` refused by the immediate checks returns `{"
 | `rejected` | 2 |
 | `rolled_back` | 5 |
 | `intervention_required` | 6 |
+
+`restart` has the same `commit: null`, no-arguments shape as `rollback` and starts the committed release again so it
+reads the current environment file; it never changes the recorded release or its sequence. With no deployed release it
+is refused as `finished` with `rejected` (exit 2) before a job exists; while a journal exists it is refused with
+`recovery_required` (exit 1). A restart that fails after its journal opens reports `intervention_required` with
+`detail.error = restart_failed`, keeps the journal, and never reports `rolled_back` or a restored release: the
+previous release record would run the same environment file. `detail.recovery` names `shiplord recover`.
 
 ### Native upload
 

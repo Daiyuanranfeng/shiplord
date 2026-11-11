@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from shiplord.admin import parse_request, run, serve
 from shiplord.framing import read_frame, write_frame
+from shiplord.installer import DEPLOY_GROUP
 from shiplord.layout import Layout
 from shiplord.protocol import ProtocolError
 from shiplord.registry import Registry
@@ -42,19 +43,29 @@ class FakeSystem:
 
     def __init__(self):
         self.users: dict[str, dict] = {}
+        self.groups: dict[str, set[str]] = {DEPLOY_GROUP: set()}  # bootstrap creates the group
         self.calls: list[list[str]] = []
         self.visudo_code = 0
         self.next_uid = 900
         self.fail = set()
+        self.fail_membership = False
         self.busy_userdel = 0
 
-    def run(self, argv, *, input=None, timeout=60):
+    def run(self, argv, *, input=None, timeout=60, max_output=None):
         argv = list(argv)
         self.calls.append(argv)
         tool = argv[0].rsplit("/", 1)[-1]
         if tool in self.fail:
             return CommandResult(1, "failed")
+        if tool == "getent" and argv[1] == "group":
+            members = self.groups.get(argv[2])
+            return CommandResult(2, "") if members is None else CommandResult(
+                0, f"{argv[2]}:x:990:{','.join(sorted(members))}\n")
         if tool == "getent":
+            if len(argv) == 2:  # the whole passwd database, as bootstrap reads it
+                return CommandResult(0, "".join(f"{name}:x:{user['uid']}:{user['uid']}:{user['comment']}:"
+                                                f"{user['home']}:{user['shell']}\n"
+                                                for name, user in sorted(self.users.items())))
             user = self.users.get(argv[2])
             if user is None:
                 return CommandResult(2, "")
@@ -66,7 +77,12 @@ class FakeSystem:
             self.next_uid += 1
             return CommandResult(0, "")
         if tool == "usermod":
-            self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
+            if "--groups" in argv:
+                if self.fail_membership:
+                    return CommandResult(1, "failed")
+                self.groups.setdefault(argv[argv.index("--groups") + 1], set()).add(argv[-1])
+            else:
+                self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
             return CommandResult(0, "")
         if tool == "userdel":
             if self.busy_userdel:  # a lingering session: userdel reports "currently logged in" until it ends
@@ -116,6 +132,11 @@ class ProvisionTestCase(unittest.TestCase):
         return {str(p.relative_to(self.layout.prefix)): p.read_bytes()
                 for p in self.layout.prefix.rglob("*") if p.is_file() and p.name != "host.lock"}
 
+    def host_state(self):
+        """Every file, account, and group membership: what a provisioning can create and a refusal must not."""
+        return {"files": self.snapshot(), "users": json.dumps(self.system.users, sort_keys=True),
+                "groups": json.dumps({name: sorted(members) for name, members in self.system.groups.items()})}
+
 
 class ProvisionTests(ProvisionTestCase):
     def test_first_provision_creates_every_resource(self):
@@ -151,7 +172,23 @@ class ProvisionTests(ProvisionTestCase):
         self.assertFalse(any(second["created"].values()), second["created"])
         self.assertEqual((second["host_port"], second["deployment_user"]), (first["host_port"], first["deployment_user"]))
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent"])
+        # Two reads in the pre-check (the account and the registry) and the account lookup that verifies it.
+        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent", "getent", "getent"])
+
+    def test_a_new_deployment_account_joins_the_group_the_sshd_policy_matches(self):
+        """An account created after bootstrap must be covered by the drop-in bootstrap already wrote."""
+        result = self.provision()
+        self.assertTrue(result["created"]["deployment_group"])
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
+        self.assertIn(["/usr/sbin/usermod", "--append", "--groups", DEPLOY_GROUP, "ship-orders"], self.system.calls)
+
+    def test_membership_is_set_before_the_account_can_authenticate(self):
+        self.system.fail_membership = True
+        with self.assertRaisesRegex(ProvisionError, "deployment group"):
+            self.provision()
+        self.assertFalse((self.layout.authorized_keys / "ship-orders").exists())
+        self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], set())
 
     def test_second_application_is_isolated(self):
         self.provision("orders")
@@ -192,6 +229,34 @@ class ProvisionTests(ProvisionTestCase):
                        {"image_repository": "ghcr.io/example/other"}):
             with self.subTest(change=change), self.assertRaisesRegex(ProvisionError, "differs"):
                 self.provision(**change)
+
+    def test_a_refused_re_provision_changes_nothing_on_the_host(self):
+        """The key, the account, and the sudoers rule must not exist for a registration that was refused."""
+        self.provision()
+        before = self.host_state()
+        keys = self.layout.authorized_keys / "ship-orders"
+        for change in ({"api_domain": "other.example.com"}, {"runtime": "native", "image_repository": None},
+                       {"image_repository": "ghcr.io/example/other"}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ProvisionError, "differs"):
+                    self.provision(public_key=ed25519(2), key_label="ci", **change)
+                self.assertEqual(self.host_state(), before)
+                self.assertNotIn(ed25519(2).split()[1], keys.read_text())  # the new key was never added
+                self.assertEqual(list(self.layout.sudoers_dir.iterdir()), [self.layout.sudoers_dir / "shiplord-orders"])
+
+    def test_a_hostname_owned_by_another_application_leaves_nothing_behind(self):
+        self.provision("orders")
+        before = self.host_state()
+        with self.assertRaisesRegex(ProvisionError, "hostname is already registered"):
+            self.provision("billing", api_domain="orders.example.com", public_key=ed25519(2))
+        self.assertEqual(self.host_state(), before)
+        self.assertNotIn("ship-billing", self.system.users)
+        self.assertFalse((self.layout.authorized_keys / "ship-billing").exists())
+        self.assertFalse((self.layout.sudoers_dir / "shiplord-billing").exists())
+        self.assertFalse((self.layout.environments / "billing").exists())
+        self.assertFalse((self.layout.app_state / "billing").exists())
+        self.assertFalse((self.layout.registrations / "billing.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
 
     def test_invalid_inputs_are_rejected_before_creating_accounts(self):
         before_calls = len(self.system.calls)
@@ -252,9 +317,12 @@ class NativeProvisionTests(ProvisionTestCase):
 
     def test_a_foreign_runtime_account_is_never_adopted(self):
         self.system.users["app-orders"] = {"uid": 800, "comment": "other", "home": "/home/x", "shell": "/bin/bash"}
+        before = self.host_state()
         with self.assertRaisesRegex(ProvisionError, "not a Shiplord"):
             self.provision_native()
         self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.host_state(), before)  # no deployment account, key, or sudoers rule was created
+        self.assertNotIn("ship-orders", self.system.users)
 
     def test_deprovision_removes_binaries_and_the_unit_but_retains_data_and_says_so(self):
         self.provision_native()
@@ -297,6 +365,10 @@ class AccountRemovalTests(ProvisionTestCase):
 
 
 class KeyManagementTests(ProvisionTestCase):
+    def tree(self):
+        """Every path under the layout, so a refused call can be shown to have created nothing."""
+        return sorted(str(path.relative_to(self.layout.prefix)) for path in self.layout.prefix.rglob("*"))
+
     def test_add_list_and_remove_keys(self):
         self.provision()
         self.assertEqual(manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2)), {"changed": True})
@@ -318,6 +390,35 @@ class KeyManagementTests(ProvisionTestCase):
                                   ("add", {"label": "Bad Label", "public_key": ed25519(3)})):
             with self.subTest(operation=operation), self.assertRaises(ProvisionError):
                 manage_key(self.layout, "orders", operation, **kwargs)
+
+    def test_key_operations_on_an_unprovisioned_application_are_refused(self):
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError) as caught:
+                manage_key(self.layout, "orders", operation, **kwargs)
+            self.assertEqual(str(caught.exception), "the application is not provisioned")
+            self.assertNotIn(str(self.layout.authorized_keys), str(caught.exception))
+            self.assertNotIn(str(self.layout.prefix), str(caught.exception))
+            self.assertNotIn(ed25519(2).split()[1], str(caught.exception))
+
+    def test_a_refused_key_operation_creates_no_file_and_no_directory(self):
+        before = self.tree()
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError):
+                manage_key(self.layout, "orders", operation, **kwargs)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(list(self.layout.authorized_keys.iterdir()), [])
+        self.assertFalse((self.layout.environments / "orders").exists())
+
+    def test_a_stray_key_file_does_not_make_an_application_provisioned(self):
+        stray = self.layout.authorized_keys / "ship-orders"
+        stray.write_text("")
+        before = self.tree()
+        with self.assertRaisesRegex(ProvisionError, "not provisioned"):
+            manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2))
+        self.assertEqual(stray.read_text(), "")
+        self.assertEqual(self.tree(), before)
 
 
 class EnvironmentTests(ProvisionTestCase):
@@ -532,6 +633,81 @@ class RegistryLoginTests(ProvisionTestCase):
         with self.assertRaisesRegex(ProvisionError, "unreadable"):
             self.login()
 
+    def test_a_hand_edited_login_file_is_reported_clearly_without_a_traceback(self):
+        self.provision()
+        self.login()
+        cases = {
+            "top level is not an object": "[]",
+            "auths is not an object": '{"auths": []}',
+            "entry is not an object": '{"auths": {"ghcr.io": "text"}}',
+            "auth is missing": '{"auths": {"ghcr.io": {}}}',
+            "auth is not text": '{"auths": {"ghcr.io": {"auth": 5}}}',
+            "auth is not base64": '{"auths": {"ghcr.io": {"auth": "!!!"}}}',
+            "auth is not username and token": '{"auths": {"ghcr.io": {"auth": "'
+                                              + base64.b64encode(b"nocolon").decode() + '"}}}',
+            "auth is not UTF-8": '{"auths": {"ghcr.io": {"auth": "'
+                                 + base64.b64encode(b"\xff").decode() + '"}}}',
+            "auth has an invalid username": '{"auths": {"ghcr.io": {"auth": "'
+                                            + base64.b64encode(b"a b:secret").decode() + '"}}}',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.config().write_text(text)
+                for operation in ("list", "login"):
+                    with self.assertRaisesRegex(ProvisionError, "config.json") as caught:
+                        if operation == "list":
+                            manage_registry(self.layout, "orders", "list")
+                        else:
+                            self.login()
+                    self.assertNotIn(self.TOKEN, str(caught.exception))
+                self.assertEqual(self.config().read_text(), text)
+
+    def test_a_failed_write_leaves_no_temporary_file_holding_the_token(self):
+        self.provision()
+        for target in ("os.replace", "json.dump"):
+            with self.subTest(target), patch(f"shiplord.provision.{target}", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(ProvisionError, "could not write the registry login") as caught:
+                    self.login()
+                self.assertNotIn(self.TOKEN, str(caught.exception))
+            self.assertEqual(list(self.config().parent.iterdir()), [])
+
+    def test_a_login_file_that_is_not_utf8_or_too_deep_is_reported(self):
+        self.provision()
+        self.config().parent.mkdir(mode=0o700)
+        cases = {"not UTF-8": b'{"auths": {}}\xff', "too deeply nested": ("[" * 100000 + "]" * 100000).encode()}
+        for label, data in cases.items():
+            with self.subTest(label):
+                self.config().write_bytes(data)
+                with self.assertRaisesRegex(ProvisionError, "config.json"):
+                    manage_registry(self.layout, "orders", "list")
+
+    def test_a_login_and_logout_sync_the_login_directory(self):
+        self.provision()
+        modes = []
+        real_fsync = os.fsync
+
+        def record(descriptor):
+            modes.append(os.fstat(descriptor).st_mode)
+            real_fsync(descriptor)
+
+        with patch("shiplord.provision.os.fsync", record):
+            self.login()
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "login must sync the directory")
+        modes.clear()
+        with patch("shiplord.provision.os.fsync", record):
+            manage_registry(self.layout, "orders", "logout", registry="ghcr.io")
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "logout must sync the directory")
+
+    def test_a_login_preserves_entries_for_other_registries(self):
+        self.provision()
+        other = base64.b64encode(b"someone:other-token").decode()
+        self.config().parent.mkdir(mode=0o700)
+        self.config().write_text(json.dumps({"auths": {"docker.io": {"auth": other}}}))
+        self.login()
+        document = json.loads(self.config().read_text())
+        self.assertEqual(document["auths"]["docker.io"], {"auth": other})
+        self.assertEqual(base64.b64decode(document["auths"]["ghcr.io"]["auth"]).decode(), f"deploy-bot:{self.TOKEN}")
+
     def test_through_the_admin_entry_point_and_removed_with_the_application(self):
         self.provision()
         request = envelope("registry", arguments={"operation": "login", "registry": "ghcr.io", "username": "u", "token": self.TOKEN})
@@ -558,6 +734,39 @@ class DeprovisionTests(ProvisionTestCase):
         with self.lock.acquire():
             again = deprovision(self.layout, self.system, self.lock, "orders")
         self.assertFalse(any(again["removed"].values()), again)
+
+    def make_route(self, application_id="orders"):
+        ship = self.layout.caddy_root / "ship"
+        ship.mkdir(parents=True, exist_ok=True)
+        for directory in (self.layout.caddy_root, ship):
+            directory.chmod(0o755)
+        route = ship / f"{application_id}.caddy"
+        route.write_text(f"{application_id}.example.com {{\n\trespond 200\n}}\n")
+        route.chmod(0o644)
+        return route
+
+    def test_removes_the_job_directory_and_a_stale_route_file(self):
+        self.provision()
+        jobs = self.layout.jobs / "orders"
+        jobs.mkdir(mode=0o700, parents=True)
+        jobs.chmod(0o700)
+        (jobs / "req-1.json").write_text("{}\n")
+        route = self.make_route()
+        (route.parent / ".prior-orders").write_text(route.read_text())
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertTrue(result["removed"]["jobs_directory"])
+        self.assertTrue(result["removed"]["route"])
+        self.assertFalse(jobs.exists())
+        self.assertFalse(route.exists())
+        self.assertFalse((route.parent / ".prior-orders").exists())
+
+    def test_an_application_with_no_jobs_or_route_reports_no_removal_for_them(self):
+        self.provision()
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertNotIn("jobs_directory", result["removed"])
+        self.assertNotIn("route", result["removed"])
 
     def test_other_applications_are_untouched(self):
         self.provision("orders")

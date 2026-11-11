@@ -28,7 +28,8 @@ from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
 from .manifest import ManifestError, validate_manifest
 from .servers import SshOptions, _config_home, ssh_command
-from .workflow import TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError, render_workflow
+from .workflow import (DEFAULT_QUALITY_WORKFLOW, DEPLOY_WORKFLOW_PATH, TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError,
+                       render_deploy_workflow, render_workflow, validate_quality_workflow)
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
@@ -147,13 +148,40 @@ class GitHub:
 
 # --- local state -----------------------------------------------------------------
 
-def ci_directory(application_id: str, home: Path | None = None) -> Path:
+def ci_directory(application_id: str, server: str, home: Path | None = None) -> Path:
+    """The private per-server, per-application directory; state from the earlier layout is moved into it."""
     base = (home / "shiplord") if home else (_config_home() / "shiplord")
-    directory = base / "ci" / application_id
+    root = base / "ci"
+    directory = root / server / application_id
     directory.mkdir(parents=True, exist_ok=True)
-    for path in (base, base / "ci", directory):
+    for path in (base, root, root / server, directory):
         os.chmod(path, 0o700)
+    _migrate_legacy_state(root / application_id, directory)
     return directory
+
+
+def _migrate_legacy_state(legacy: Path, directory: Path) -> None:
+    """Move state written at ``ci/<app>`` into the server-scoped directory; never overwrite newer state.
+
+    A private key retained by an interrupted setup moves with the state, so its recorded path is rewritten.
+    Migration is best effort: an unmovable directory costs at most one extra key, never a failed command.
+    """
+    if legacy == directory or legacy.is_symlink() or not legacy.is_dir() or (directory / "state.json").exists():
+        return
+    try:
+        for entry in sorted(legacy.iterdir()):
+            if entry.is_file() and not entry.is_symlink():
+                os.replace(entry, directory / entry.name)
+        legacy.rmdir()
+        state = _load_state(directory)
+        private = state.get("private_key")
+        if isinstance(private, str) and Path(private).parent == legacy:
+            moved = directory / Path(private).name
+            if moved.is_file():
+                state["private_key"] = str(moved)
+                _save_state(directory, state)
+    except OSError:
+        pass
 
 
 def _load_state(directory: Path) -> dict:
@@ -187,6 +215,17 @@ def generate_ci_key(directory: Path, application_id: str, name: str) -> tuple[Pa
 
 def label_for(fingerprint: str) -> str:
     return "ci-" + re.sub(r"[^a-z0-9]", "", fingerprint.split(":", 1)[1].lower())[:8]
+
+
+def ci_key_labels(listed: list[dict]) -> list[str]:
+    """The labels Shiplord derives from a key's own fingerprint; a key whose label does not match is not ours."""
+    labels = []
+    for item in listed:
+        label, fingerprint = item.get("label"), item.get("fingerprint")
+        if isinstance(label, str) and isinstance(fingerprint, str) and fingerprint.startswith("SHA256:"):
+            if label == label_for(fingerprint):
+                labels.append(label)
+    return sorted(labels)
 
 
 # --- host keys ------------------------------------------------------------------------
@@ -249,11 +288,16 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
-def validate_setup_profile(manifest: dict) -> None:
-    """Reject unsupported workflow generation before callers collect settings or credentials."""
-    if manifest["template"] == "generic":
-        raise GitHubError("github setup generates an ADK workflow; generic Docker applications need a custom "
-                          "workflow invoking `shiplord deploy`", 2, "configuration")
+def validate_setup_request(manifest: dict, repository: str) -> None:
+    """Reject an unusable setup request before callers collect settings, credentials, or change anything.
+
+    Nothing here is template-specific: every supported template gets the same CI key, secret, variables and
+    generated pipeline. Only the runtime decides whether a workflow is generated.
+    """
+    if not _REPOSITORY.fullmatch(repository):
+        raise GitHubError("--repo must be owner/repository", 2)
+    if "github" in manifest and manifest["github"]["repository"] != repository:
+        raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
 
 
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
@@ -277,12 +321,9 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
                  ci_host: str | None = None, tooling_ref: str | None = None, platforms: str = "linux/amd64",
                  tailscale: Mapping[str, str] | None = None, force_workflow: bool = False, home: Path | None = None,
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
-                 resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
-    validate_setup_profile(manifest)
-    if not _REPOSITORY.fullmatch(repository):
-        raise GitHubError("--repo must be owner/repository", 2)
-    if "github" in manifest and manifest["github"]["repository"] != repository:
-        raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
+                 resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host, quality_workflow: str | None = None,
+                 include_quality: bool = True) -> dict:
+    validate_setup_request(manifest, repository)
     app = manifest["name"]
     steps: dict[str, str] = {}
     account = gh.account()
@@ -295,7 +336,7 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
     host, port = resolve(admin_target.partition("@")[2])
     server_host = ci_host or host
     keys = (host_keys or (lambda target: fetch_host_keys(target, runner)))(admin_target)
-    directory = ci_directory(app, home)
+    directory = ci_directory(app, manifest["server"], home)
     state = _load_state(directory)
     reuse = bool(state.get("fingerprint")) and state.get("repository") == repository and state.get("secret_set")
     private: Path | None = None
@@ -338,7 +379,8 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         gh.set_variable(repository, name, value)
     steps["variables"] = ", ".join(sorted(variables))
 
-    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms, force_workflow)
+    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms,
+                                        force_workflow, quality_workflow, include_quality)
     _ensure_manifest_github(project, manifest, repository)
     steps["manifest"] = f"ship.toml names {repository}"
     remaining = []
@@ -370,35 +412,65 @@ def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
         raise GitHubError(str(error), 3, "tailscale") from None
 
 
+def _resolve_quality_workflow(project: Path, requested: str | None, include: bool) -> str | None:
+    """The reusable quality workflow to run before deploy, or ``None``.
+
+    Never guessed by the renderer: an explicit request wins, otherwise the conventional file is used only
+    when the project really contains it, so a generated workflow never references a file the user lacks.
+    """
+    if not include:
+        return None
+    if requested is not None:
+        try:
+            return validate_quality_workflow(requested)
+        except WorkflowError as error:
+            raise GitHubError(str(error), 2, "workflow") from None
+    return DEFAULT_QUALITY_WORKFLOW if (project / DEFAULT_QUALITY_WORKFLOW).is_file() else None
+
+
 def _write_workflow(manifest: dict, repository: str, project: Path, state: dict, directory: Path,
-                    tooling_ref: str | None, platforms: str, force: bool) -> str:
+                    tooling_ref: str | None, platforms: str, force: bool, quality_workflow: str | None = None,
+                    include_quality: bool = True) -> str:
     if manifest["runtime"] != "docker":
         return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
     ref = tooling_ref or detect_tooling_ref()
     if ref is None:
         raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
                           "pushed to GitHub)", 2, "workflow")
+    quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
+    merged = dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})})
     try:
-        text = render_workflow(dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})}),
-                               tooling_ref=ref, platforms=platforms)
+        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, platforms=platforms),
+                 WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, platforms=platforms, quality_workflow=quality)}
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
-    path = project / WORKFLOW_PATH
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    if path.exists():
-        existing = hashlib.sha256(path.read_bytes()).hexdigest()
-        if existing == digest:
-            return f"unchanged ({WORKFLOW_PATH})"
-        if existing != state.get("workflow_sha256") and not force:
-            raise GitHubError(f"{WORKFLOW_PATH} was edited since Shiplord generated it; review it, or pass "
-                              "--force-workflow to replace it", 2, "workflow")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(text)
-    os.replace(temporary, path)
-    state["workflow_sha256"] = digest
+    digests = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()}
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    # Check every file before writing any, so a refusal never leaves half a pipeline behind.
+    changed = []
+    for path in texts:
+        target = project / path
+        if target.exists():
+            existing = hashlib.sha256(target.read_bytes()).hexdigest()
+            if existing == digests[path]:
+                continue
+            previous = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+            if existing != previous and not force:
+                raise GitHubError(f"{path} was edited since Shiplord generated it; review it, or pass "
+                                  "--force-workflow to replace it", 2, "workflow")
+        changed.append(path)
+    for path in changed:
+        target = project / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        temporary.write_text(texts[path])
+        os.replace(temporary, target)
+    state["workflows"] = {**recorded, **digests}
+    state["workflow_sha256"] = digests[WORKFLOW_PATH]  # kept so an older installation's record still matches
     _save_state(directory, state)
-    return f"written ({WORKFLOW_PATH}, Shiplord pinned at {ref[:12]})"
+    if not changed:
+        return f"unchanged ({', '.join(texts)})"
+    return f"written ({', '.join(changed)}, Shiplord pinned at {ref[:12]})"
 
 
 def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:
@@ -427,13 +499,21 @@ def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> N
 def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: str, home: Path | None = None,
                runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
-    """Replace the CI key: add, prove, store in GitHub, and only then remove the old key."""
+    """Replace the CI key: add, prove, store in GitHub, and only then remove the old key.
+
+    The key to replace is found in the server's authorized-keys list, so rotation works from a machine that never
+    ran setup. Only labels Shiplord derives from a key's own fingerprint are ever removed.
+    """
     app = manifest["name"]
-    directory = ci_directory(app, home)
+    if "github" not in manifest:
+        raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
+    repository = manifest["github"]["repository"]
+    old_labels = ci_key_labels(admin.call("keys", app, {"operation": "list"})["keys"])
+    if not old_labels:
+        raise GitHubError("no CI key is registered on the server for this application; run "
+                          "`shiplord github setup` first", 2)
+    directory = ci_directory(app, manifest["server"], home)
     state = _load_state(directory)
-    if not state.get("secret_set") or not state.get("label") or "github" not in manifest:
-        raise GitHubError("no completed CI setup was found for this application; run `shiplord github setup` first", 2)
-    repository, old_label = manifest["github"]["repository"], state["label"]
     host, port = resolve(admin_target.partition("@")[2])
     keys = (host_keys or (lambda target: fetch_host_keys(target, runner)))(admin_target)
     private, public = generate_ci_key(directory, app, f"rotate-{os.getpid()}")
@@ -456,16 +536,34 @@ def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: 
     finally:
         for leftover in (private, Path(str(private) + ".pub")):
             leftover.unlink(missing_ok=True)
-    state.update(label=new_label, fingerprint=fingerprint)
-    _save_state(directory, state)
-    try:
-        admin.call("keys", app, {"operation": "remove", "label": old_label})
-    except ClientError as error:
-        raise GitHubError(f"the new key is live, but the old key {old_label} could not be removed: {error}", error.code,
-                          "revoke") from None
-    return {"ok": True, "repository": repository, "old_label": old_label, "key_label": new_label, "key_fingerprint": fingerprint,
+    state.update(repository=repository, label=new_label, fingerprint=fingerprint, secret_set=True)
+    try:  # a failed cache write must not stop the revocation that keeps one CI key registered
+        _save_state(directory, state)
+    except OSError:
+        pass
+    _revoke_keys(admin, app, old_labels)
+    return {"ok": True, "repository": repository, "old_label": old_labels[0] if len(old_labels) == 1 else None,
+            "old_labels": old_labels, "key_label": new_label, "key_fingerprint": fingerprint,
             "steps": {"register": new_label, "ssh_check": "the new key authenticated", "secret": f"{SECRET_NAME} updated",
-                      "revoke": f"{old_label} removed"}}
+                      "revoke": f"{', '.join(old_labels)} removed"}}
+
+
+def _revoke_keys(admin: AdminClient, application_id: str, labels: list[str]) -> None:
+    """Remove every stale CI key; a failure is reported with the new key already live and stored."""
+    failures: list[tuple[str, ClientError]] = []
+    for label in labels:
+        try:
+            admin.call("keys", application_id, {"operation": "remove", "label": label})
+        except ClientError as error:
+            failures.append((label, error))
+    if not failures:
+        return
+    if len(failures) == 1:
+        label, error = failures[0]
+        raise GitHubError(f"the new key is live, but the old key {label} could not be removed: {error}", error.code,
+                          "revoke") from None
+    raise GitHubError(f"the new key is live, but these old keys could not be removed: "
+                      f"{', '.join(label for label, _ in failures)}", failures[0][1].code, "revoke") from None
 
 
 def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClient | None = None,
@@ -473,7 +571,7 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
     if "github" not in manifest:
         raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
     app, repository = manifest["name"], manifest["github"]["repository"]
-    state = _load_state(ci_directory(app, home))
+    state = _load_state(ci_directory(app, manifest["server"], home))
     checks: dict[str, dict] = {}
     permission = gh.permission(repository)
     checks["access"] = {"ok": permission in WRITE_PERMISSIONS, "account": gh.account(), "permission": permission}
@@ -486,9 +584,17 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
     checks["tailscale"] = {"ok": all(variables.get(name) for name in TAILSCALE_VARIABLES[:2]),
                            "hint": "rerun `shiplord github setup` for step-by-step Tailscale instructions with this "
                                    "repository's exact OIDC subject"}
-    workflow = project / WORKFLOW_PATH
-    unmodified = workflow.exists() and hashlib.sha256(workflow.read_bytes()).hexdigest() == state.get("workflow_sha256")
-    checks["workflow"] = {"ok": workflow.exists(), "unmodified_since_generation": unmodified}
+    workflow_paths = (WORKFLOW_PATH, DEPLOY_WORKFLOW_PATH)
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    present = [path for path in workflow_paths if (project / path).is_file()]
+    missing = [path for path in workflow_paths if path not in present]
+
+    def unmodified(path: str) -> bool:
+        previous = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+        return bool(previous) and hashlib.sha256((project / path).read_bytes()).hexdigest() == previous
+
+    checks["workflow"] = {"ok": not missing, "missing": missing,
+                          "unmodified_since_generation": bool(present) and all(unmodified(path) for path in present)}
     checks["ci_key"] = {"ok": bool(state.get("secret_set")), "label": state.get("label"), "fingerprint": state.get("fingerprint")}
     if admin is not None:
         listed = {item["label"]: item["fingerprint"] for item in admin.call("keys", app, {"operation": "list"})["keys"]}
@@ -507,6 +613,11 @@ CHECK_HINTS = {
     "Prepare the SSH identity and pinned host keys": "the CI secret or variables are missing; run `shiplord github setup`",
     "Check access only": "the CI key, host keys or helper were refused; run `shiplord github status --check-server`",
 }
+
+
+def _job(jobs: list[dict], name: str) -> dict:
+    """A job by name. A reusable workflow reports its jobs as ``caller / called``."""
+    return next((job for job in jobs if str(job.get("name", "")).split(" / ")[-1] == name), {})
 
 
 def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callable[[], float] = time.monotonic,
@@ -535,7 +646,7 @@ def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callab
             return 1, {"ok": False, "run": run.get("url"), "status": run.get("status"),
                        "error": "the check run did not finish in time; it is still running on GitHub"}
         sleep(10)
-    deploy = next((job for job in run.get("jobs") or [] if job.get("name") == "deploy"), {})
+    deploy = _job(run.get("jobs") or [], "deploy")
     steps = {step["name"]: step.get("conclusion") for step in deploy.get("steps") or []}
     failed = next((name for name, conclusion in steps.items() if conclusion == "failure"), None)
     ok = run.get("conclusion") == "success" and steps.get("Check access only") == "success"

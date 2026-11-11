@@ -174,6 +174,11 @@ class FakeSsh:
         return self.responses.pop(0)
 
 
+def server_ssh(*responses, python=b"3 12\n"):
+    """A server that answers the interpreter probe first, then ``responses`` in order."""
+    return FakeSsh((python, b"", 0), *responses)
+
+
 def ok(result=None):
     return frame({"status": "ok", "request_id": "x", "result": result or {}})
 
@@ -250,10 +255,13 @@ class BootstrapTests(unittest.TestCase):
 
     def test_bootstrap_uploads_runs_the_installer_under_sudo_and_always_cleans_up(self):
         result = {"version": "0.1.0-abc", "changed": {"code": True}}
-        ssh = FakeSsh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0), (frame({"status": "ok", "result": result}), b"", 0),
-                      (b"", b"", 0))
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "ok", "result": result}), b"", 0), (b"", b"", 0))
         self.assertEqual(bootstrap_server("appuser@server", self.SOURCE, runner=ssh), result)
-        upload, install, cleanup = ssh.calls
+        probe, upload, install, cleanup = ssh.calls
+        self.assertIn("/usr/bin/python3", probe[0][-1])
+        self.assertIn("sys.version_info", probe[0][-1])
+        self.assertEqual(probe[1], b"")  # the probe sends nothing but the command
         self.assertIn("mktemp -d /tmp/shiplord-install.XXXXXXXX", upload[0][-1])
         self.assertTrue(tarfile.is_tarfile(io.BytesIO(upload[1])))
         self.assertTrue(install[0][-1].startswith("sudo -n /usr/bin/python3 -I -S -B -c "))
@@ -261,8 +269,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(cleanup[0][-1], "rm -rf -- /tmp/shiplord-install.Ab12Cd34")
 
     def test_a_failed_install_still_removes_the_upload_and_reports_the_step(self):
-        ssh = FakeSsh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
-                      (frame({"status": "error", "message": "Caddy is not installed"}), b"", 1), (b"", b"", 0))
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "error", "message": "Caddy is not installed"}), b"", 1), (b"", b"", 0))
         with self.assertRaisesRegex(ClientError, "Caddy is not installed"):
             bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
         self.assertTrue(ssh.calls[-1][0][-1].startswith("rm -rf -- "))
@@ -270,7 +278,39 @@ class BootstrapTests(unittest.TestCase):
     def test_an_unexpected_upload_directory_is_never_used(self):
         for output in (b"/etc\n", b"/tmp/shiplord-install.$(id)\n", b"", b"/tmp/shiplord-install.Ab12Cd34/../x\n"):
             with self.subTest(output=output), self.assertRaises(ClientError):
-                bootstrap_server("appuser@server", self.SOURCE, runner=FakeSsh((output, b"", 0)))
+                bootstrap_server("appuser@server", self.SOURCE, runner=server_ssh((output, b"", 0)))
+
+    def test_a_server_with_an_old_interpreter_is_refused_before_the_helper_is_uploaded(self):
+        ssh = FakeSsh((b"3 10\n", b"", 0))
+        with self.assertRaises(ClientError) as caught:
+            bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
+        message = str(caught.exception)
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("/usr/bin/python3", message)
+        self.assertIn("Python 3.11 or later", message)
+        self.assertIn("3.10", message)
+        self.assertEqual(len(ssh.calls), 1)  # nothing was uploaded or installed
+        self.assertEqual(ssh.calls[0][1], b"")
+        self.assertNotIn("shiplord-install", message)
+        self.assertNotIn("\n", message)
+
+    def test_a_server_without_a_usable_interpreter_is_refused(self):
+        for answer, status in ((b"", 127), (b"", 0), (b"3\n", 0), (b"Traceback (most recent call last):\n", 0)):
+            with self.subTest(answer=answer, status=status):
+                ssh = FakeSsh((answer, b"", status))
+                with self.assertRaises(ClientError) as caught:
+                    bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
+                self.assertEqual(caught.exception.code, 3)
+                self.assertIn("/usr/bin/python3", str(caught.exception))
+                self.assertIn("Python 3.11 or later", str(caught.exception))
+                self.assertEqual(len(ssh.calls), 1)
+
+    def test_python_311_is_the_oldest_interpreter_accepted(self):
+        result = {"version": "0.1.0-abc", "changed": {}}
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "ok", "result": result}), b"", 0), (b"", b"", 0), python=b"3 11\n")
+        self.assertEqual(bootstrap_server("appuser@server", self.SOURCE, runner=ssh), result)
+        self.assertEqual(len(ssh.calls), 4)
 
 
 if __name__ == "__main__":
