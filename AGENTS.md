@@ -30,6 +30,12 @@ Read the exit code and the JSON `status`/`error`:
 | 5 | `rolled_back` | The release failed and the previous one is serving. This is a failure: report it, show `logs`. |
 | 6 | `intervention_required`, `interrupted` | Run `shiplord recover`. If it also exits 6, stop and report. |
 
+Every command follows this table, not only `deploy`. `2` is always bad input or configuration, `3` a missing
+prerequisite, and `4` a protocol mismatch; `5` and `6` describe a release transition that failed after it began.
+Every command that reports a result prints readable lines by default and the same result as one stable JSON
+document with `--json`. `--json` never asks for configuration values; a sudo password may still be requested at a
+terminal.
+
 To retry the same deployment safely, repeat the command with the same `--request-id`. To go back deliberately, use
 `shiplord rollback`. To report what is deployed: `shiplord status --json` gives the commit, artifact, running state,
 and any unfinished transaction. Never claim a release is live unless `deploy` exited 0.

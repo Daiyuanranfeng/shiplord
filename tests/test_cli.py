@@ -1364,9 +1364,9 @@ class CLIRecoveryTests(unittest.TestCase):
         client = run.call_args.args[1]
         self.assertEqual((client.application_id, client.target), ("orders", "ship-orders@host.example.com"))
         self.assertEqual(run.call_args.args[2], "recover")
-        self.assertIn("Target: orders on hetzner-vm", result.stderr)
-        self.assertIn("Outcome: recovered", result.stderr)
-        self.assertIn("status: recovered", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Target: orders on hetzner-vm", result.stdout)
+        self.assertIn("Outcome: recovered", result.stdout)
 
     def test_explicit_recovery_json_is_the_existing_result_shape(self):
         outcome = {"ok": True, "request_id": "rc-1", "status": "nothing_to_recover", "exit_code": 0}
@@ -1407,10 +1407,10 @@ class CLIRecoveryTests(unittest.TestCase):
                     patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)):
                 result = self.invoke("recover", "orders", "--server", "hetzner-vm")
             self.assertEqual(result.exit_code, code, result.output)
-            self.assertIn(f"status: {outcome['status']}", result.stdout)
-            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
             if outcome.get("error"):
-                self.assertIn(f"error: {outcome['error']}", result.stdout)
+                self.assertIn(f"Reason: {outcome['error'].replace('_', ' ')}", result.stdout)
 
     def test_recovery_outcomes_keep_their_exit_codes_in_manifest_mode(self):
         (self.project / "ship.toml").write_text(MANIFEST)
@@ -1422,7 +1422,7 @@ class CLIRecoveryTests(unittest.TestCase):
             self.assertEqual(result.exit_code, code, result.output)
             self.assertEqual(run.call_args.args[0]["name"], "orders")
             self.assertEqual(run.call_args.args[1], helper.return_value)
-            self.assertIn(f"status: {outcome['status']}", result.stdout)
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
             self.assertEqual(result.stderr, "")
 class RecordingAdminClient:
     """A stand-in for the sudo client that records the resolved target and each request."""

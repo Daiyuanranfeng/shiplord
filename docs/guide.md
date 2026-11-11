@@ -390,7 +390,7 @@ reach the run page or the calling job.
 | `server remove <alias>` | Delete an alias. Refuses while the current directory's `ship.toml` names it. |
 | `server rename <old> <new>` | Rename an alias. Refuses when the new alias already exists. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
-| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
+| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal; `--json` never prompts). |
 | `provision [--update]` | Create the application's account, state, port, and key access on the server. `--update` applies a changed hostname or memory ceiling without removing state or keys. |
 | `env set --from-file F` / `env diff --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `diff` previews the key names it would add or remove without reading values; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
