@@ -480,6 +480,8 @@ git add .github/workflows/shiplord-release.yml ship.toml && git commit   # merge
 shiplord github check-ci            # joins Tailscale and logs in with the CI key; builds and deploys nothing
 shiplord github status --check-server
 shiplord github rotate-key
+shiplord github setup --upgrade-workflow   # refresh the action pins in the generated workflows
+shiplord github check-pins                 # confirm every pinned action commit still resolves
 ```
 
 `github setup` uses your authenticated `gh`. It creates a dedicated Ed25519 CI key, registers it on the server,
@@ -506,6 +508,14 @@ so it works from a machine that never ran `github setup`; local setup state is k
 
 CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY`, `SHIPLORD_SSH_KNOWN_HOSTS_FILE`
 (and optionally `SHIPLORD_SSH_PORT`) replace the server alias, and SSH ignores `~/.ssh/config` entirely.
+
+The pins themselves age. `github setup --upgrade-workflow` rewrites the `uses:` lines of the workflows Shiplord
+generated with the pins the installed Shiplord carries, and changes nothing else: the deployment branch, the
+pinned Shiplord commit, the quality job, and your own edits stay as they are. It refuses a file that does not
+carry Shiplord's generated header, so a hand-written workflow is never touched, and it writes nothing unless
+every file in the pipeline is accepted. `github check-pins` asks the GitHub API whether each pinned commit still
+exists **in that action's own repository**; it reads `GITHUB_TOKEN` or `GH_TOKEN` from the environment (there is
+no `--token` option) and reports a pin it could not ask about as unverified, never as resolving.
 
 ### The Shiplord deploy action
 
@@ -579,6 +589,7 @@ reach the run page or the calling job.
 | `backup` / `restore --archive N \| --latest --yes` | Write and verify an archive of the application's data; replace live data with a verified archive. |
 | `registry login --username U --token-file F \| --token-stdin [--registry ghcr.io\|docker.io]` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
+| `github setup --upgrade-workflow` / `check-pins` | Refresh the action pins in the generated workflows; confirm each pinned commit still resolves in its repository. |
 | `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, ports once deployed, Docker when needed, disk, each application's state and consistency); every registered server read-only; access, helper, DNS. |
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete

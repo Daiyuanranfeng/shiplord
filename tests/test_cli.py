@@ -23,6 +23,7 @@ from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
 from shiplord.transport import TransportError
+from shiplord.workflow import DEPLOY_WORKFLOW_PATH, PINS, WORKFLOW_PATH, render_deploy_workflow, render_workflow
 
 MANIFEST = '''schema_version = 1
 name = "orders"
@@ -391,6 +392,87 @@ class CLITests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("tag:ci", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
+
+    def test_github_setup_upgrade_workflow_refreshes_the_pins_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project = Path(directory)
+            (project / "ship.toml").write_text(MANIFEST)
+            manifest = load_manifest(project / "ship.toml")
+            texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(manifest, tooling_ref="ab" * 20),
+                     WORKFLOW_PATH: render_workflow(manifest, tooling_ref="ab" * 20)}
+            texts[DEPLOY_WORKFLOW_PATH] = texts[DEPLOY_WORKFLOW_PATH].replace(PINS["checkout"].commit, "9" * 40)
+            for path, content in texts.items():
+                (project / path).parent.mkdir(parents=True, exist_ok=True)
+                (project / path).write_text(content + "# a local note\n")
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["changed"], [DEPLOY_WORKFLOW_PATH])
+            self.assertEqual(output["pins"], [{"action": "actions/checkout", "from": "9" * 40,
+                                               "path": DEPLOY_WORKFLOW_PATH, "to": PINS["checkout"].commit,
+                                               "version": "v4"}])
+            refreshed = (project / DEPLOY_WORKFLOW_PATH).read_text()
+            self.assertNotIn("9" * 40, refreshed)
+            self.assertIn(str(PINS["checkout"]), refreshed)
+            self.assertIn("# a local note", refreshed)
+            self.assertEqual((project / WORKFLOW_PATH).read_text(), texts[WORKFLOW_PATH] + "# a local note\n")
+
+    def test_github_setup_upgrade_workflow_refuses_a_workflow_shiplord_did_not_write(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project = Path(directory)
+            (project / "ship.toml").write_text(MANIFEST)
+            hand_written = "name: Mine\non: push\njobs: {}\n"
+            (project / DEPLOY_WORKFLOW_PATH).parent.mkdir(parents=True)
+            (project / DEPLOY_WORKFLOW_PATH).write_text(hand_written)
+            (project / WORKFLOW_PATH).write_text(hand_written)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn(DEPLOY_WORKFLOW_PATH, json.loads(result.stdout)["error"])
+            self.assertEqual((project / DEPLOY_WORKFLOW_PATH).read_text(), hand_written)
+            self.assertEqual((project / WORKFLOW_PATH).read_text(), hand_written)
+            mismatch = self.invoke(directory, "github", "setup", "--repo", "Other/repo", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(mismatch.returncode, 2, mismatch.stdout)
+            self.assertIn("already names", json.loads(mismatch.stdout)["error"])
+
+    def test_github_setup_needs_a_repository_unless_it_only_upgrades_the_pins(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--repo", json.loads(result.stdout)["error"])
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 2)  # there is no generated pipeline to upgrade yet
+            self.assertIn("github setup", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
+
+    def test_github_check_pins_reports_every_pin_and_keeps_the_token_out_of_the_output(self):
+        token = "ghs_exampleTOKEN1234567890"
+        seen = []
+
+        def fetch(url, sent):
+            seen.append((url, sent))
+            return 200, "{}"
+        with patch("shiplord.workflow.github_fetch", side_effect=fetch):
+            result = CliRunner().invoke(cli.app, ["github", "check-pins", "--json"], env={"GITHUB_TOKEN": token})
+        self.assertEqual(result.exit_code, 0, result.output)
+        output = json.loads(result.stdout)
+        self.assertEqual((output["ok"], output["checked"], output["missing"]), (True, len(PINS), []))
+        self.assertEqual(len(seen), len(PINS))
+        self.assertEqual({sent for _, sent in seen}, {token})
+        self.assertNotIn(token, result.stdout + result.stderr)
+
+    def test_github_check_pins_without_the_api_fails_instead_of_reporting_success(self):
+        with patch("shiplord.workflow.github_fetch", side_effect=OSError("no route to host")):
+            result = CliRunner().invoke(cli.app, ["github", "check-pins", "--json"],
+                                        env={"GITHUB_TOKEN": "", "GH_TOKEN": ""})
+        self.assertEqual(result.exit_code, 1, result.output)
+        output = json.loads(result.stdout)
+        self.assertEqual((output["ok"], output["missing"]), (False, []))
+        self.assertEqual(len(output["unverified"]), len(PINS))
+        self.assertIn("nothing here says they resolve", output["error"])
 
     def test_github_setup_rejects_an_invalid_deployment_branch_before_using_github_or_a_server(self):
         with tempfile.TemporaryDirectory() as directory:

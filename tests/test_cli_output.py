@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 from typer.testing import CliRunner
 
 from shiplord import cli, output
+from shiplord.workflow import PINS
 
 IMAGE = "ghcr.io/example/orders@sha256:" + "a" * 64
 COMMIT = "b" * 40
@@ -88,6 +89,9 @@ GITHUB_CHECK = {"ok": True, "run": "https://github.com/QueryPlanner/orders/actio
 GITHUB_ROTATED = {"ok": True, "repository": "QueryPlanner/orders", "old_label": "ci-old",
                   "key_label": "ci-new", "key_fingerprint": "SHA256:new", "steps": {"register": "ci-new"}}
 RESTARTED = {"ok": True, "request_id": "restart-1", "status": "succeeded", "exit_code": 0}
+PIN_CHECK = {"ok": True, "checked": len(PINS), "missing": [], "unverified": [],
+             "pins": [{"action": pin.repository, "commit": pin.commit, "version": pin.version, "state": "resolves"}
+                      for pin in PINS.values()]}
 KEYS = {"keys": [{"label": "ci", "fingerprint": "SHA256:abc"}]}
 BACKED_UP = {"ok": True, "status": "succeeded", "archive": "shiplord-backup-orders-20240101T000000Z.tar.gz",
              "sha256": "b" * 64, "size": 10, "entries": 2, "bytes": 4, "verified": True,
@@ -407,6 +411,10 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli.github.GitHub", {"return_value": MagicMock()}),
                          ("shiplord.cli.github.rotate_key", {"return_value": dict(GITHUB_ROTATED)})]),
                 GITHUB_ROTATED, ("Outcome: CI key replaced", "New key: ci-new", "register: ci-new")),
+            Case("github check-pins", lambda as_json: self.invoke(
+                ["github", "check-pins"], as_json,
+                patches=[("shiplord.workflow.github_fetch", {"return_value": (200, "{}")})]),
+                PIN_CHECK, ("Outcome: succeeded", f"Checked: {len(PINS)}", "Pins:", "- see --json")),
             Case("restart", lambda as_json: self.invoke(
                 ["restart"], as_json,
                 patches=[("shiplord.cli._manifest", {"return_value": manifest}),

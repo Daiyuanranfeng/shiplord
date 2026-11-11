@@ -29,7 +29,7 @@ from .layout import deployment_user
 from .manifest import ManifestError, configured_branch, validate_deployment_branch, validate_manifest
 from .servers import SshOptions, _config_home, ssh_command
 from .workflow import (DEFAULT_QUALITY_WORKFLOW, DEPLOY_WORKFLOW_PATH, TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError,
-                       render_deploy_workflow, render_workflow, validate_quality_workflow)
+                       render_deploy_workflow, render_workflow, upgrade_action_pins, validate_quality_workflow)
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
@@ -584,6 +584,71 @@ def _ensure_manifest_github(project: Path, repository: str, branch: str) -> None
     temporary = path.with_name(f".ship.toml.tmp-{os.getpid()}")
     temporary.write_text(text)
     os.replace(temporary, path)
+
+
+def upgrade_workflow(manifest: dict, *, project: Path, home: Path | None = None) -> dict:
+    """Refresh the action pins in the workflows Shiplord generated, and change nothing else.
+
+    Every file is read and accepted before any is written, so a refusal leaves the pipeline exactly as it was.
+    Only ``uses:`` lines for actions Shiplord pins are rewritten: the deployment branch, the pinned Shiplord
+    commit, the quality job, and every local edit survive byte for byte. A hand-written workflow is refused.
+    """
+    if manifest["runtime"] != "docker":
+        raise GitHubError("only Docker applications have a generated workflow; for a native binary, call "
+                          "`shiplord deploy --binary` from your own build job", 2, "workflow")
+    paths = (DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH)
+    missing = [path for path in paths if not (project / path).is_file()]
+    if missing:
+        raise GitHubError(f"there is no generated workflow at {', '.join(missing)}; run `shiplord github setup` "
+                          "to write the pipeline first", 2, "workflow")
+    before: dict[str, bytes] = {}
+    refreshed: dict[str, str] = {}
+    changes: list[dict] = []
+    for path in paths:
+        try:
+            before[path] = (project / path).read_bytes()
+            text, found = upgrade_action_pins(before[path].decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            raise GitHubError(f"could not read {path}", 1, "workflow") from None
+        except WorkflowError as error:
+            raise GitHubError(f"{path} was not rewritten: {error}", 2, "workflow") from None
+        refreshed[path] = text
+        changes.extend({"path": path, "action": change.repository, "from": change.previous, "to": change.commit,
+                        "version": change.version} for change in found)
+    written = [path for path in paths if refreshed[path].encode() != before[path]]
+    if not written:
+        return {"ok": True, "changed": [], "unchanged": list(paths), "pins": [],
+                "note": "the generated workflows already pin the current action commits"}
+    directory = ci_directory(manifest["name"], manifest["server"], home)
+    state = _load_state(directory)
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    previous = {path: hashlib.sha256(before[path]).hexdigest() for path in paths}
+    digests = {}
+    for path in paths:
+        target = project / path
+        if path in written:
+            temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+            temporary.write_text(refreshed[path])
+            os.replace(temporary, target)
+        digests[path] = hashlib.sha256((project / path).read_bytes()).hexdigest()
+    # Keep the "what Shiplord last wrote" record honest: a file the user had edited is still edited, so a
+    # later `github setup` keeps refusing to overwrite it without --force-workflow.
+    updated = dict(recorded)
+    for path in paths:
+        last_written = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+        if last_written == previous[path]:
+            updated[path] = digests[path]
+    state["workflows"] = updated
+    if state.get("workflow_sha256") == previous[WORKFLOW_PATH]:
+        state["workflow_sha256"] = digests[WORKFLOW_PATH]
+    result = {"ok": True, "changed": written, "unchanged": [path for path in paths if path not in written],
+              "pins": changes}
+    try:
+        _save_state(directory, state)
+    except OSError:
+        result["warning"] = ("the workflows were refreshed, but the local record was not updated; a later "
+                             "`github setup` may ask for --force-workflow")
+    return result
 
 
 def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: str, home: Path | None = None,
