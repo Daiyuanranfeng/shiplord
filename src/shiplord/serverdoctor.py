@@ -11,6 +11,7 @@ from .environment import EnvironmentError_, load_environment_file
 from .installer import DEPLOY_GROUP, SSHD_DROPIN, sshd_dropin_included, sshd_units
 from .layout import Layout
 from .native import NativeRuntime
+from .osbaseline import OS_RELEASE, check_os
 from .probes import http_get
 from .provision import GETENT
 from .registry import Registry
@@ -276,7 +277,7 @@ def application_inventory(layout: Layout, lock: HostLock) -> dict:
 
 
 def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
-    checks: dict[str, dict] = {}
+    checks: dict[str, dict] = {"os": check_os(layout.path(OS_RELEASE))}
     registrations, registry_error, ignored = [], None, []
     try:
         descriptor = os.open(layout.registrations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

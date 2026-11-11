@@ -222,6 +222,22 @@ class ServerDoctorTests(DoctorTestCase):
         healthy = FakeSsh((ok(report), b"", 0))
         self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=healthy))[0], 0)
 
+    def test_the_os_baseline_is_reported(self):
+        os_check = self.report()["checks"]["os"]
+        self.assertEqual((os_check["ok"], os_check["id"], os_check["version_id"]), (True, "ubuntu", "24.04"))
+
+    def test_an_unsupported_os_is_reported_by_the_os_check(self):
+        (self.layout.prefix / "etc" / "os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        report = self.report()
+        self.assertEqual((report["ok"], report["checks"]["os"]["ok"]), (False, False))
+        self.assertEqual(self.failing(report), ["os"])
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", report["checks"]["os"]["message"])
+        self.assertIn("ubuntu 22.04", report["checks"]["os"]["message"])
+        request = {"version": 1, "request_id": "doctor-os", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["os"]["ok"]), (0, False))
+
     def test_a_clean_registry_reports_no_ignored_files(self):
         self.provision()
         report = self.report()
@@ -406,8 +422,24 @@ class ServerDoctorTests(DoctorTestCase):
         self.assertIn("next_step", report["checks"]["docker"])
 
     def inspect_line(self, record, app="orders"):
-        return (f"true false {record['artifact']['image']}|10|force|google-adk|"
-                f" volume:shiplord-{app}-artifacts:/app/src/.adk")
+        import json as jsonlib
+
+        from shiplord import runtime
+        from shiplord.storage import container_path
+
+        registration = self.registration(app)
+        configuration = record["configuration"]
+        memory = configuration["resources"]["memory_mb"] * 1024 * 1024
+        environment = jsonlib.dumps([f"{key}={value}" for key, value in
+                                     runtime._managed_environment(registration, configuration).items()])
+        port = configuration["http"]["container_port"]
+        return (f"true false {record['artifact']['image']}|<no value>|<no value>|{configuration['template']}|"
+                f" volume:shiplord-{app}-artifacts:{container_path(configuration)}"
+                f"|{memory}|{memory}|{runtime.PIDS_LIMIT}|{runtime.RESTART_POLICY}"
+                f"|{jsonlib.dumps(list(runtime.SECURITY_OPTIONS))}|{jsonlib.dumps(list(runtime.CAP_DROP))}"
+                f"|{runtime.LOG_DRIVER}|{jsonlib.dumps(runtime.LOG_OPTIONS)}"
+                f"|{jsonlib.dumps({f'{port}/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(registration['host_port'])}]})}"
+                f"|{environment}")
 
     def test_consistency_passes_when_registration_release_runtime_and_route_agree(self):
         self.provision()
@@ -493,7 +525,7 @@ class ServerDoctorTests(DoctorTestCase):
             self.assertNotIn(forbidden, text)
 
     def test_every_failed_check_names_a_remedy_in_text_output(self):
-        from shiplord.cli import _render_doctor
+        from shiplord.output import render_doctor
         self.provision()
         self.commit_release()
         self.system.listeners = {"127.0.0.1:80"}
@@ -504,8 +536,7 @@ class ServerDoctorTests(DoctorTestCase):
             if not check["ok"]:
                 self.assertTrue(check.get("next_step"), name)
         lines = []
-        with patch("shiplord.cli.typer.echo", side_effect=lines.append):
-            _render_doctor(report, "server test")
+        render_doctor(report, "server test", say=lines.append)
         text = "\n".join(lines)
         self.assertIn("ports: failed", text)
         self.assertIn("sshd: failed", text)
