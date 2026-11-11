@@ -22,12 +22,14 @@ from pathlib import Path
 
 from . import __version__
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .release_state import HostLock
-from .routing import CaddyCommands, RouteManager, RoutingError
+from .routing import CaddyCommands, RouteManager, RoutingError, caddy_binary, probe_caddy
 from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
-CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
-                            "tailscale.py", "template.py", "transport.py", "workflow.py"})
+CLIENT_MODULES = frozenset({"build.py", "cli.py", "client.py", "commands.py", "configure.py", "detect.py",
+                            "github.py", "output.py", "servers.py", "setup.py", "tailscale.py", "template.py",
+                            "transport.py", "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
@@ -556,11 +558,37 @@ def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None)
     return True
 
 
+def _caddy_binary(caddy: CaddyCommands) -> str:
+    """The Caddy path a refusal names: the runner's own when it has one, else the documented resolution."""
+    configured = getattr(caddy, "caddy", None)
+    return configured if isinstance(configured, str) and configured else caddy_binary()
+
+
+def _caddy_preflight(caddy: CaddyCommands) -> None:
+    """Refuse a host whose Caddy cannot run, before any Shiplord directory or helper is written."""
+    try:
+        probe_caddy(caddy)
+    except RoutingError as error:
+        if error.kind == "unavailable":
+            raise BootstrapError(
+                "Caddy is not installed or cannot be started: install the caddy package or put the binary at "
+                f"{_caddy_binary(caddy)}") from None
+        raise BootstrapError(
+            f"Caddy rejected a minimal configuration ({error.kind}): check the Caddy installation") from None
+
+
 def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands, *,
               lock_timeout: float = 20) -> dict:
-    """Install or update the host. Safe to repeat; returns which steps changed something."""
+    """Install or update the host, refusing an unsupported operating system first.
+
+    Safe to repeat; returns which steps changed something.
+    """
     if layout.prefix == Path("/") and os.geteuid() != 0:
         raise BootstrapError("bootstrap must run as root")
+    supported = check_os(layout.path(OS_RELEASE))
+    if not supported["ok"]:
+        raise BootstrapError(supported["message"])
+    _caddy_preflight(caddy)
     unit, socket = _sshd_preflight(layout, system)
     changed: dict[str, bool] = {}
     for directory, mode in ((layout.path("/etc/shiplord"), 0o755), (layout.registrations, 0o700),
@@ -568,10 +596,6 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                             (layout.var, 0o755), (layout.app_state, 0o700), (layout.jobs, 0o700),
                             (layout.data, 0o755), (layout.releases, 0o755), (layout.lib, 0o755)):
         _ensure_dir(directory, mode)
-    name, files = _build_payload(source)
-    changed["code"] = _install_version(layout, name, files)
-    changed["current"] = _switch_current(layout, name)
-    changed["wrappers"] = _install_wrappers(layout)
 
     descriptor = os.open(layout.var, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -586,6 +610,10 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                 changed["caddy_import"] = RouteManager(layout.caddy_root, lock, caddy).ensure_import().changed
             except RoutingError as error:
                 raise BootstrapError(f"Caddy integration failed ({error.kind}): {error}") from None
+            name, files = _build_payload(source)
+            changed["code"] = _install_version(layout, name, files)
+            changed["current"] = _switch_current(layout, name)
+            changed["wrappers"] = _install_wrappers(layout)
             changed["sshd_group"] = _ensure_deployment_group(system)
             changed["sshd"] = _install_sshd(layout, system, unit, socket)
             collected, warnings = _collect_old_versions(layout)

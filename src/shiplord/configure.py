@@ -18,7 +18,8 @@ DEFAULT_CONTAINER_PORT = 8080
 DEFAULT_READINESS_PATH = "/ready"
 DEFAULT_MEMORY_MB = 512
 DEPLOYMENT_BRANCH = "main"
-# ghcr.io is the only registry Shiplord knows, so only a GitHub remote can justify an inferred repository.
+# Only a GitHub remote justifies the ghcr.io repository that a [github] table means; a Docker Hub image is
+# named explicitly in the manifest's [image] table instead.
 GITHUB_HOST = "github.com"
 # Deploys above the ceiling the administrator registered at provisioning are refused (4096 MiB by default), so the
 # interactive prompt stays inside it; an explicit --memory flag is checked only by the manifest rules.
@@ -40,6 +41,8 @@ class ConfigurationError(ValueError):
     """The manifest could not be created safely."""
 
 
+class ConfigurationCancelled(ConfigurationError):
+    """The person declined the summary; nothing was written."""
 def validate_repository(value: object) -> str:
     """An ``owner/repository`` pair, checked by the manifest's own ``github.repository`` rule."""
     return validate_manifest({**_REPOSITORY_PROBE, "github": {"repository": value,
@@ -50,8 +53,8 @@ def repository_from_url(url: str) -> str | None:
     """``owner/repository`` from a GitHub remote URL, or None when the URL names nothing Shiplord can justify.
 
     Both forms git writes are accepted: ``git@github.com:owner/orders.git`` and ``https://github.com/owner/orders.git``.
-    Only github.com is accepted, because ghcr.io is the only registry Shiplord knows. The URL itself is never returned
-    or reported: a remote can carry a credential.
+    Only github.com is accepted, because a GitHub repository is what the [github] table means. The URL itself is
+    never returned or reported: a remote can carry a credential.
     """
     text = url.strip()
     if not text:
@@ -143,6 +146,40 @@ def create_manifest(directory: Path, name: str, server: str, api_domain: str,
 Ask = Callable[[str, "str | None"], str]
 
 
+def configure_application(directory: Path, given: dict, *, interactive: bool,
+                          servers: list[dict[str, str]] | None = None, ask: Ask | None = None,
+                          say: Callable[[str], None] = lambda text: None,
+                          confirm: Callable[[dict], bool] | None = None) -> dict:
+    """Write ``ship.toml`` from the given values, asking for the missing ones only at a terminal.
+
+    ``given`` holds the ``configure`` options (None when not given). Returns the answers. Nothing is written when
+    the directory already has a manifest, an answer is invalid, or ``confirm`` declines the summary.
+    """
+    destination = directory / "ship.toml"
+    if destination.exists() or destination.is_symlink():
+        raise ConfigurationError("ship.toml already exists; no file was replaced")
+    if interactive:
+        answers = collect_answers(given, root=directory, servers=servers or [], ask=ask, say=say)
+        if confirm is not None and not confirm(answers):
+            raise ConfigurationCancelled("no file was created")
+    else:
+        if given["server"] is None or given["api_domain"] is None:
+            raise ConfigurationError("--server and --api-domain are required (run `shiplord configure` in a terminal "
+                                     "to be asked instead)")
+        if given["origins"] is None:
+            raise ConfigurationError("specify --frontend or explicitly choose --no-frontend")
+        answers = dict(given, name=given["name"] or directory.name, runtime=given["runtime"] or "docker",
+                       template=given["template"] or "google-adk")
+        answers["image_repository"] = resolve_image_repository(directory, answers["runtime"],
+                                                               answers.get("image_repository"), ask=None, say=say)
+    create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
+                    answers["runtime"], answers["template"],
+                    **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
+                       if answers[key] is not None},
+                    image_repository=answers.get("image_repository"))
+    return answers
+
+
 def _ask_valid(ask: Ask, say: Callable[[str], None], prompt: str, default: str | None, parse: Callable[[str], object]):
     """Ask until ``parse`` accepts the answer; give up after a few invalid answers so a script cannot loop forever."""
     for _ in range(ATTEMPTS):
@@ -224,7 +261,7 @@ def collect_answers(given: dict, *, root: Path, servers: list[dict[str, str]], a
     if answers["runtime"] is None:
         answers["runtime"] = "docker"  # native binaries are opt-in with --runtime native
 
-    if answers["image_repository"] is None:
+    if answers.get("image_repository") is None:
         answers["image_repository"] = resolve_image_repository(root, answers["runtime"], None, ask=ask, say=say,
                                                                remote=remote)
 

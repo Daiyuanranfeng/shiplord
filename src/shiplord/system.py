@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import select
 import signal
@@ -9,9 +10,11 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 MAX_OUTPUT_BYTES = 4096
+MAX_STREAM_CHUNK = 65536
+STREAM_POLL_SECONDS = 0.1
 DEFAULT_TIMEOUT_SECONDS = 60
 FIXED_ENVIRONMENT = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
 TRUNCATION_MARKER = "[shiplord: earlier output truncated]\n"
@@ -35,6 +38,8 @@ class CommandError(Exception):
 class System(Protocol):
     def run(self, argv: Sequence[str], *, input: bytes | None = None,
             timeout: float = DEFAULT_TIMEOUT_SECONDS, max_output: int = MAX_OUTPUT_BYTES) -> CommandResult: ...
+
+    def stream(self, argv: Sequence[str], *, timeout: float, on_chunk: Callable[[str], None]) -> str: ...
 
 
 def sanitize(data: bytes | bytearray, limit: int = MAX_OUTPUT_BYTES, *, truncated: bool = False) -> str:
@@ -111,9 +116,70 @@ def run_command(argv: Sequence[str], *, timeout: float = DEFAULT_TIMEOUT_SECONDS
             writer.join(timeout=1)
 
 
+def _stream_text(text: str) -> str:
+    """Keep line breaks and printable text; other control characters cannot reach a terminal."""
+    return "".join(char if char == "\n" or char.isprintable() else "?" for char in text)
+
+
+def stream_command(argv: Sequence[str], *, timeout: float, on_chunk: Callable[[str], None],
+                   env: Mapping[str, str] | None = None, cwd: str = "/") -> str:
+    """Run ``argv`` and forward its output as it arrives; returns "ended" or "timeout".
+
+    Output is handed to ``on_chunk`` immediately, so a long stream is never held in memory. The
+    deadline is enforced here: when it expires the process group is killed, not merely abandoned.
+    """
+    argv = [str(part) for part in argv]
+    if not argv or any("\0" in part for part in argv) or timeout <= 0:
+        raise CommandError("invalid command", "start")
+    try:
+        process = subprocess.Popen(argv, shell=False, env=dict(env if env is not None else FIXED_ENVIRONMENT),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   cwd=cwd, start_new_session=True)
+    except OSError:
+        raise CommandError("could not start the command", "start") from None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    deadline = time.monotonic() + timeout
+    reason = "ended"
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = "timeout"
+                break
+            if select.select([process.stdout], [], [], min(STREAM_POLL_SECONDS, remaining))[0]:
+                chunk = os.read(process.stdout.fileno(), MAX_STREAM_CHUNK)
+                if not chunk:
+                    break
+                text = _stream_text(decoder.decode(chunk))
+                if text:
+                    on_chunk(text)
+            elif process.poll() is not None and not select.select([process.stdout], [], [], 0)[0]:
+                break
+        if reason == "ended":
+            text = _stream_text(decoder.decode(b"", True))
+            if text:
+                on_chunk(text)
+            try:
+                process.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                reason = "timeout"
+        return reason
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait()
+        process.stdout.close()
+
+
 class HostSystem:
     """The production ``System``: fixed environment, no shell."""
 
     def run(self, argv: Sequence[str], *, input: bytes | None = None,
             timeout: float = DEFAULT_TIMEOUT_SECONDS, max_output: int = MAX_OUTPUT_BYTES) -> CommandResult:
         return run_command(argv, timeout=timeout, input=input, max_output=max_output)
+
+    def stream(self, argv: Sequence[str], *, timeout: float, on_chunk: Callable[[str], None]) -> str:
+        return stream_command(argv, timeout=timeout, on_chunk=on_chunk)

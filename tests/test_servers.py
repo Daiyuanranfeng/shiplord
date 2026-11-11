@@ -11,7 +11,25 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from shiplord.cli import app
-from shiplord.servers import ServerError, SSHCheckError, list_servers, load_server, register_server
+from shiplord.servers import (ServerError, SSHCheckError, list_servers, load_server, register_server, remove_server,
+                              rename_server)
+
+MANIFEST = '''schema_version = 1
+name = "orders"
+server = "production"
+template = "generic"
+runtime = "docker"
+[http]
+api_domain = "orders-api.example.com"
+frontend_origins = []
+container_port = 8080
+readiness_path = "/ready"
+[resources]
+memory_mb = 512
+[deploy]
+readiness_timeout_seconds = 90
+retain_successful_releases = 2
+'''
 
 
 class ServerRegistrationTests(unittest.TestCase):
@@ -265,3 +283,179 @@ class ServerListTests(unittest.TestCase):
             with self.assertRaisesRegex(ServerError, "could not access"):
                 load_server("production")
         self.assertFalse(self.config.exists())
+
+
+class ServerAliasChangeTests(unittest.TestCase):
+    """Removal and rename run in an application directory, where ship.toml can name an alias."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "config"
+        self.servers = self.config / "shiplord/servers"
+        self.app = self.root / "app"
+        self.app.mkdir()
+        self.env = {"XDG_CONFIG_HOME": str(self.config)}
+        previous = os.getcwd()
+        os.chdir(self.app)
+        self.addCleanup(os.chdir, previous)
+
+    def save(self, alias, target, *, name=None, contents=None):
+        self.servers.mkdir(parents=True, exist_ok=True)
+        for directory in (self.config, self.config / "shiplord", self.servers):
+            directory.chmod(0o700)
+        path = self.servers / (name or alias + ".json")
+        path.write_text(contents or json.dumps({"schema_version": 1, "alias": alias, "ssh": target}))
+        path.chmod(0o600)
+        return path
+
+    def invoke(self, command, *args):
+        with patch.dict(os.environ, self.env):
+            return CliRunner().invoke(app, ["server", command, *args])
+
+    def manifest(self, server="production"):
+        (self.app / "ship.toml").write_text(MANIFEST.replace('server = "production"', f'server = "{server}"'))
+
+    def names(self):
+        return sorted(item.name for item in self.servers.iterdir())
+
+    def test_remove_deletes_the_alias(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("remove", "production")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Removed server alias 'production'.", result.output)
+        self.assertEqual(self.names(), [])
+
+    def test_remove_json_reports_the_alias(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("remove", "production", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), {"ok": True, "removed": "production"})
+        self.assertEqual(self.names(), [])
+
+    def test_remove_refuses_while_the_current_manifest_uses_the_alias(self):
+        self.save("production", "admin@example.com")
+        self.manifest()
+        result = self.invoke("remove", "production", "--json")
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("in use by ship.toml", json.loads(result.output)["error"])
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_remove_proceeds_when_the_manifest_names_another_alias(self):
+        self.save("production", "admin@example.com")
+        self.manifest("staging")
+        result = self.invoke("remove", "production")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.names(), [])
+
+    def test_remove_refuses_an_unreadable_manifest_before_touching_the_alias(self):
+        self.save("production", "admin@example.com")
+        (self.app / "ship.toml").write_text("not = [valid")
+        result = self.invoke("remove", "production", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("could not check whether the server alias is in use", json.loads(result.output)["error"])
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_remove_rejects_an_invalid_alias_before_any_side_effect(self):
+        self.save("production", "admin@example.com")
+        for alias in ("Production", "bad--alias", "with space", "\x1b[31mevil"):
+            with self.subTest(alias=alias):
+                result = self.invoke("remove", alias)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertEqual(self.names(), ["production.json"])
+
+    def test_remove_unknown_alias_keeps_the_registration(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("remove", "staging", "--json")
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("not registered", json.loads(result.output)["error"])
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_remove_without_registered_servers_creates_nothing(self):
+        result = self.invoke("remove", "production")
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertFalse(self.config.exists())
+
+    def test_remove_server_reports_an_in_use_alias_without_deleting_it(self):
+        self.save("production", "admin@example.com")
+        self.manifest()
+        with patch.dict(os.environ, self.env):
+            with self.assertRaisesRegex(ServerError, "in use by ship.toml"):
+                remove_server("production")
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_rename_moves_the_registration_and_keeps_its_target(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("rename", "production", "prod")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Renamed server alias 'production' to 'prod'.", result.output)
+        self.assertEqual(self.names(), ["prod.json"])
+        self.assertEqual(json.loads((self.servers / "prod.json").read_text()),
+                         {"schema_version": 1, "alias": "prod", "ssh": "admin@example.com"})
+
+    def test_rename_json_reports_both_aliases(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("rename", "production", "prod", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), {"ok": True, "alias": "prod", "previous_alias": "production"})
+        self.assertEqual(self.names(), ["prod.json"])
+
+    def test_rename_refuses_an_existing_new_alias_without_changing_either(self):
+        self.save("production", "admin@example.com")
+        self.save("staging", "deploy@staging.example.com")
+        result = self.invoke("rename", "production", "staging", "--json")
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("already registered", json.loads(result.output)["error"])
+        self.assertEqual(self.names(), ["production.json", "staging.json"])
+        self.assertEqual(json.loads((self.servers / "production.json").read_text())["ssh"], "admin@example.com")
+        self.assertEqual(json.loads((self.servers / "staging.json").read_text())["ssh"], "deploy@staging.example.com")
+
+    def test_rename_refuses_an_unreadable_existing_entry_rather_than_replacing_it(self):
+        self.save("production", "admin@example.com")
+        self.save("staging", "ignored", contents="{not json")
+        result = self.invoke("rename", "production", "staging")
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual((self.servers / "staging.json").read_text(), "{not json")
+        self.assertTrue((self.servers / "production.json").exists())
+
+    def test_rename_refuses_the_same_alias(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("rename", "production", "production", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("same as the old alias", json.loads(result.output)["error"])
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_rename_rejects_invalid_aliases_before_any_side_effect(self):
+        self.save("production", "admin@example.com")
+        for old, new in (("production", "Bad"), ("Bad", "prod"), ("production", "bad--alias")):
+            with self.subTest(old=old, new=new):
+                result = self.invoke("rename", old, new)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertEqual(self.names(), ["production.json"])
+
+    def test_rename_unknown_old_alias_creates_nothing(self):
+        self.save("production", "admin@example.com")
+        result = self.invoke("rename", "missing", "prod")
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertEqual(self.names(), ["production.json"])
+
+    def test_rename_without_registered_servers_creates_nothing(self):
+        result = self.invoke("rename", "production", "prod")
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertFalse(self.config.exists())
+
+    def test_rename_rolls_back_the_new_alias_when_removing_the_old_one_fails(self):
+        self.save("production", "admin@example.com")
+        real_unlink = os.unlink
+
+        def failing_unlink(path, *, dir_fd=None):
+            if path == "production.json":
+                raise OSError("injected failure")
+            return real_unlink(path, dir_fd=dir_fd)
+
+        with patch.dict(os.environ, self.env), patch("shiplord.servers.os.unlink", side_effect=failing_unlink):
+            with self.assertRaisesRegex(ServerError, "old alias was kept"):
+                rename_server("production", "prod")
+        self.assertEqual(self.names(), ["production.json"])
+        self.assertEqual(json.loads((self.servers / "production.json").read_text())["alias"], "production")

@@ -39,6 +39,7 @@ class UninstallTestCase(unittest.TestCase):
         sshd = self.prefix / "etc" / "ssh"
         sshd.mkdir(parents=True)
         (sshd / "sshd_config").write_text("Include sshd_config.d/*.conf\n")
+        (self.prefix / "etc" / "os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
         bootstrap(self.layout, SOURCE, self.system, self.caddy)
