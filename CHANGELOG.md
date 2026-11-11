@@ -29,6 +29,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   permanently to the canonical `http.api_domain`, keeping the path and query
   string. The extra hostnames are part of the registration, so a deployment
   cannot add or drop them.
+- Generate a GitHub Actions release workflow for native applications: it builds
+  the binary, uploads it as an artifact, and deploys it with
+  `shiplord deploy --binary`. `github setup` takes `--build-command` and
+  `--binary-path` and records both in `[github]`.
 
 ### Fixed
 

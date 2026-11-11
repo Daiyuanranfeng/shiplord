@@ -1221,7 +1221,8 @@ def _github_setup(manifest: dict, repository: Optional[str], *, json_output: boo
                   tailscale_client_id: Optional[str] = None, tailscale_audience: Optional[str] = None,
                   tailscale_tags: Optional[str] = None, deployment_branch: Optional[str] = None,
                   quality_workflow: Optional[str] = None, no_quality_workflow: bool = False,
-                  force_workflow: bool = False, upgrade_workflow: bool = False) -> tuple[int, dict]:
+                  force_workflow: bool = False, upgrade_workflow: bool = False,
+                  build_command: Optional[str] = None, binary_path: Optional[str] = None) -> tuple[int, dict]:
     """Create the CI key, secret, variables, and workflow for an application. Shared by `github setup` and `setup`."""
     if quality_workflow is not None and no_quality_workflow:
         raise CommandError("choose either --quality-workflow or --no-quality-workflow")
@@ -1248,6 +1249,7 @@ def _github_setup(manifest: dict, repository: Optional[str], *, json_output: boo
         raise CommandError(str(error)) from None
     result = github.github_setup(manifest, repository, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                  admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
+                                 build_command=build_command, binary_path=binary_path,
                                  tailscale=settings, deployment_branch=branch, force_workflow=force_workflow,
                                  quality_workflow=quality_workflow, include_quality=not no_quality_workflow)
     result["tailscale"] = origin
@@ -1259,6 +1261,10 @@ def github_setup_command(repo: Optional[str] = typer.Option(None, "--repo", help
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
                          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
+                         build_command: Optional[str] = typer.Option(None, "--build-command",
+                                                                     help="Native only: the command CI runs to build the binary."),
+                         binary_path: Optional[str] = typer.Option(None, "--binary-path",
+                                                                   help="Native only: the path that command writes the binary to."),
                          deployment_branch: Optional[str] = typer.Option(None, "--deployment-branch",
                                                                         help="Branch releases deploy from (default: the manifest's, or main)."),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
@@ -1287,6 +1293,7 @@ def github_setup_command(repo: Optional[str] = typer.Option(None, "--repo", help
                                    tailscale_audience=tailscale_audience, tailscale_tags=tailscale_tags,
                                    deployment_branch=deployment_branch, quality_workflow=quality_workflow,
                                    no_quality_workflow=no_quality_workflow, force_workflow=force_workflow,
+                                   build_command=build_command, binary_path=binary_path,
                                    upgrade_workflow=upgrade_workflow), json_output, renderer)
 
 
@@ -1355,8 +1362,11 @@ def setup(server: Optional[str] = typer.Option(None, "--server", help="Registere
         if template_hint == "generic":
             _fail("--template generic needs --skip-ci; github setup generates an ADK workflow", 2, json_output)
         if runtime_hint != "docker" and not (directory / github.WORKFLOW_PATH).is_file():
-            _fail(f"--runtime native needs your own {github.WORKFLOW_PATH} or --skip-ci; github setup does not "
-                  "generate one", 2, json_output)
+            recorded = (existing or {}).get("github") or {}
+            if not (recorded.get("build_command") and recorded.get("binary_path")):
+                _fail("--runtime native needs github.build_command and github.binary_path in ship.toml, a "
+                      f"workflow at {github.WORKFLOW_PATH}, or --skip-ci; `shiplord github setup "
+                      "--build-command ... --binary-path ...` records both", 2, json_output)
     provision_image = image_repository or (f"ghcr.io/{repository.lower()}" if repository else None)
     if runtime_hint == "docker" and provision_image is None:
         _fail("pass --repo owner/repository or --image-repository so provision knows the image repository",

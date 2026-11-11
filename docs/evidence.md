@@ -156,8 +156,9 @@ What it found:
   rather than allocating a TTY; requests are frames, so secrets never touch argv.
 - **Architectures:** native binaries may be `linux-amd64` or `linux-arm64`; the server accepts only its own.
 - **Names:** repository variables and secrets use a `SHIPLORD_` prefix instead of `SHIP_`.
-- **Workflow generation** covers Docker applications. A native application gets the CI key, secret, and variables, but
-  you call `shiplord deploy --binary` from your own build job.
+- **Workflow generation** covers Docker applications and native binaries. A native workflow runs the build command
+  recorded in `[github]`, uploads the binary as an artifact, and deploys it with `shiplord deploy --binary`; it is
+  covered by unit tests, but no GitHub Actions run of a generated native workflow has been observed yet.
 - **`doctor --server`** is a cheap protocol probe by default; `--deep` adds the sudo-backed health report.
 - **Registry pull logins** are per application, read-only, and stored root-only; only `ghcr.io` is accepted.
 

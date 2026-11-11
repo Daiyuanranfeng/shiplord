@@ -73,7 +73,7 @@ shiplord deploy \
   --commit <40-character-commit-sha>
 ```
 
-`plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
+`plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`. `shiplord github setup --repo owner/name --build-command '<build command>' --binary-path dist/orders` generates a workflow that builds the binary, uploads it as an artifact, and deploys it.
 
 To build and deploy in one step from the application's checkout, run `shiplord release`. It refuses a dirty
 working tree, builds and pushes the image for the server's platform with the commit recorded in the image's
