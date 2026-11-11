@@ -28,6 +28,26 @@ def frame(message) -> bytes:
     return buffer.getvalue()
 
 
+class FakeProcess:
+    """A process whose stdout already holds the frames a server would stream."""
+
+    def __init__(self, data=b"", *, returncode=None):
+        self.stdout, self.stdin, self.stderr = io.BytesIO(data), io.BytesIO(), io.BytesIO()
+        self.returncode, self.killed, self.waits = returncode, False, 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed, self.returncode = True, -9
+
+
 class ClientTestCase(HelperTestCase):
     """The client's runner is wired straight into the real privileged helper."""
 
@@ -38,11 +58,17 @@ class ClientTestCase(HelperTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = HelperClient("orders", "admin@server.example.com", runner=self.runner,
-                                   payload_runner=self.payload_runner)
+                                   payload_runner=self.payload_runner, stream_runner=self.stream_runner)
 
     def payload_runner(self, command, header, path, timeout):
         self.commands.append(command)
         return self.runner(command, header + path.read_bytes(), timeout)
+
+    def stream_runner(self, command, payload, timeout):
+        self.commands.append(command)
+        output = io.BytesIO()
+        code = serve(io.BytesIO(payload), output, self.factory)
+        return FakeProcess(output.getvalue(), returncode=code)
 
     def runner(self, command, payload, timeout):
         self.commands.append(command)
@@ -85,6 +111,52 @@ class HelperClientTests(ClientTestCase):
         with self.assertRaises(ClientError) as caught:
             garbage.call("status")
         self.assertEqual(caught.exception.code, 3)
+
+    def follow(self, data, *, on_chunk=lambda chunk: None, request_id="r1"):
+        self.process = FakeProcess(data)
+        client = HelperClient("orders", "a@h", stream_runner=lambda command, payload, timeout: self.process)
+        return client.follow("logs", arguments={"tail": 5, "follow": True}, timeout=10, on_chunk=on_chunk,
+                             request_id=request_id)
+
+    def test_follow_reads_streamed_frames_until_the_final_result(self):
+        chunks = []
+        data = (frame({"status": "stream", "request_id": "r1", "chunk": "one\n"})
+                + frame({"status": "stream", "request_id": "r1", "chunk": "two\n"})
+                + frame({"status": "ok", "request_id": "r1", "result": {"stopped": "timeout", "release": "a" * 12}}))
+        self.assertEqual(self.follow(data, on_chunk=chunks.append),
+                         {"stopped": "timeout", "release": "a" * 12})
+        self.assertEqual(chunks, ["one\n", "two\n"])
+        self.assertTrue(self.process.stdout.closed)
+
+    def test_follow_reports_a_stream_cut_short(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "stream", "request_id": "r1", "chunk": "one\n"}))
+        self.assertEqual(caught.exception.code, 3)
+
+    def test_follow_surfaces_a_server_error_frame_and_closes_the_process(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "error", "request_id": "r1", "error": "failed", "message": "disk is full"}))
+        self.assertEqual(str(caught.exception), "disk is full")
+        self.assertTrue(self.process.killed)  # the process was still running, so it is stopped
+
+    def test_follow_reports_a_rejected_request_as_invalid_rather_than_a_failure(self):
+        # An older helper rejects the follow arguments as unknown, which is exit code 2, not a failure.
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "error", "request_id": "r1", "error": "invalid_request"}))
+        self.assertEqual((caught.exception.code, str(caught.exception)),
+                         (2, "the server stopped the log stream (invalid_request)"))
+
+    def test_follow_rejects_an_uncorrelated_frame(self):
+        with self.assertRaises(ClientError) as caught:
+            self.follow(frame({"status": "ok", "request_id": "other", "result": {}}))
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_follow_closes_the_process_when_the_caller_interrupts(self):
+        def interrupt(_chunk):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.follow(frame({"status": "stream", "request_id": "r1", "chunk": "one\n"}), on_chunk=interrupt)
+        self.assertTrue(self.process.killed)
 
 
 class DeployFlowTests(ClientTestCase):
@@ -174,6 +246,11 @@ class FakeSsh:
         return self.responses.pop(0)
 
 
+def server_ssh(*responses, python=b"3 12\n"):
+    """A server that answers the interpreter probe first, then ``responses`` in order."""
+    return FakeSsh((python, b"", 0), *responses)
+
+
 def ok(result=None):
     return frame({"status": "ok", "request_id": "x", "result": result or {}})
 
@@ -250,10 +327,13 @@ class BootstrapTests(unittest.TestCase):
 
     def test_bootstrap_uploads_runs_the_installer_under_sudo_and_always_cleans_up(self):
         result = {"version": "0.1.0-abc", "changed": {"code": True}}
-        ssh = FakeSsh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0), (frame({"status": "ok", "result": result}), b"", 0),
-                      (b"", b"", 0))
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "ok", "result": result}), b"", 0), (b"", b"", 0))
         self.assertEqual(bootstrap_server("appuser@server", self.SOURCE, runner=ssh), result)
-        upload, install, cleanup = ssh.calls
+        probe, upload, install, cleanup = ssh.calls
+        self.assertIn("/usr/bin/python3", probe[0][-1])
+        self.assertIn("sys.version_info", probe[0][-1])
+        self.assertEqual(probe[1], b"")  # the probe sends nothing but the command
         self.assertIn("mktemp -d /tmp/shiplord-install.XXXXXXXX", upload[0][-1])
         self.assertTrue(tarfile.is_tarfile(io.BytesIO(upload[1])))
         self.assertTrue(install[0][-1].startswith("sudo -n /usr/bin/python3 -I -S -B -c "))
@@ -261,8 +341,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(cleanup[0][-1], "rm -rf -- /tmp/shiplord-install.Ab12Cd34")
 
     def test_a_failed_install_still_removes_the_upload_and_reports_the_step(self):
-        ssh = FakeSsh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
-                      (frame({"status": "error", "message": "Caddy is not installed"}), b"", 1), (b"", b"", 0))
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "error", "message": "Caddy is not installed"}), b"", 1), (b"", b"", 0))
         with self.assertRaisesRegex(ClientError, "Caddy is not installed"):
             bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
         self.assertTrue(ssh.calls[-1][0][-1].startswith("rm -rf -- "))
@@ -270,7 +350,39 @@ class BootstrapTests(unittest.TestCase):
     def test_an_unexpected_upload_directory_is_never_used(self):
         for output in (b"/etc\n", b"/tmp/shiplord-install.$(id)\n", b"", b"/tmp/shiplord-install.Ab12Cd34/../x\n"):
             with self.subTest(output=output), self.assertRaises(ClientError):
-                bootstrap_server("appuser@server", self.SOURCE, runner=FakeSsh((output, b"", 0)))
+                bootstrap_server("appuser@server", self.SOURCE, runner=server_ssh((output, b"", 0)))
+
+    def test_a_server_with_an_old_interpreter_is_refused_before_the_helper_is_uploaded(self):
+        ssh = FakeSsh((b"3 10\n", b"", 0))
+        with self.assertRaises(ClientError) as caught:
+            bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
+        message = str(caught.exception)
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("/usr/bin/python3", message)
+        self.assertIn("Python 3.11 or later", message)
+        self.assertIn("3.10", message)
+        self.assertEqual(len(ssh.calls), 1)  # nothing was uploaded or installed
+        self.assertEqual(ssh.calls[0][1], b"")
+        self.assertNotIn("shiplord-install", message)
+        self.assertNotIn("\n", message)
+
+    def test_a_server_without_a_usable_interpreter_is_refused(self):
+        for answer, status in ((b"", 127), (b"", 0), (b"3\n", 0), (b"Traceback (most recent call last):\n", 0)):
+            with self.subTest(answer=answer, status=status):
+                ssh = FakeSsh((answer, b"", status))
+                with self.assertRaises(ClientError) as caught:
+                    bootstrap_server("appuser@server", self.SOURCE, runner=ssh)
+                self.assertEqual(caught.exception.code, 3)
+                self.assertIn("/usr/bin/python3", str(caught.exception))
+                self.assertIn("Python 3.11 or later", str(caught.exception))
+                self.assertEqual(len(ssh.calls), 1)
+
+    def test_python_311_is_the_oldest_interpreter_accepted(self):
+        result = {"version": "0.1.0-abc", "changed": {}}
+        ssh = server_ssh((b"/tmp/shiplord-install.Ab12Cd34\n", b"", 0),
+                         (frame({"status": "ok", "result": result}), b"", 0), (b"", b"", 0), python=b"3 11\n")
+        self.assertEqual(bootstrap_server("appuser@server", self.SOURCE, runner=ssh), result)
+        self.assertEqual(len(ssh.calls), 4)
 
 
 if __name__ == "__main__":

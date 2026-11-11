@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -7,13 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shiplord.layout import Layout
-from shiplord.runtime import MAX_LOG_BYTES, DockerRuntime, RuntimeFailure, release_id
+from shiplord.runtime import (MAX_FOLLOW_SECONDS, MAX_LOG_BYTES, DockerRuntime, RuntimeFailure, release_id,
+                              validate_follow_timeout, validate_since)
 from shiplord.system import CommandError, CommandResult, run_command
 
 ID_A, ID_B = "a" * 64, "b" * 64
 
 
-def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None, template="google-adk"):
+def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None, template="google-adk",
+            cpu=None, init=False):
     value = {"commit": commit * 40, "sequence": sequence,
             "artifact": {"kind": "docker", "image": "ghcr.io/example/orders@sha256:" + image * 64},
             "configuration": {"schema_version": 1, "name": "orders", "server": "production", "template": template,
@@ -23,6 +26,10 @@ def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=
                               "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}}
     if storage is not None:
         value["configuration"]["storage"] = storage
+    if cpu is not None:
+        value["configuration"]["resources"]["cpu_limit"] = cpu
+    if init:
+        value["configuration"]["deploy"]["init"] = True
     return value
 
 
@@ -36,20 +43,68 @@ REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "o
 class FakeDocker:
     def __init__(self):
         self.calls: list[list[str]] = []
+        self.max_outputs: list[int] = []
         self.results: dict[str, CommandResult] = {}
         self.raise_for: dict[str, CommandError] = {}
+
+    @staticmethod
+    def _key(argv):
+        """The command a call names; a pull with the application's login still names its own command."""
+        rest = list(argv[1:])
+        if rest[:1] == ["--config"]:
+            rest = rest[2:]
+        return " ".join(rest[:2]) if rest[0] in ("image", "volume") else rest[0]
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         argv = list(argv)
         self.calls.append(argv)
+        self.max_outputs.append(max_output)
         assert argv[0] == "/usr/bin/docker"
-        key = " ".join(argv[1:3]) if argv[1] in ("image", "volume") else argv[1]
+        key = self._key(argv)
         if key in self.raise_for:
             raise self.raise_for[key]
         return self.results.get(key, CommandResult(0, ""))
 
     def sub(self, name):
-        return [c for c in self.calls if (" ".join(c[1:3]) if c[1] in ("image", "volume") else c[1]) == name]
+        return [c for c in self.calls if self._key(c) == name]
+
+
+class StreamingDocker(FakeDocker):
+    """A Docker whose follow stream is scripted; the argv and deadline are what the test inspects."""
+
+    def __init__(self):
+        super().__init__()
+        self.stream_calls: list[tuple[list[str], float]] = []
+        self.chunks = ["one\n", "two\n"]
+        self.reason = "timeout"
+
+    def stream(self, argv, *, timeout, on_chunk):
+        self.stream_calls.append((list(argv), timeout))
+        for chunk in self.chunks:
+            on_chunk(chunk)
+        return self.reason
+
+
+class LabelledDocker:
+    """Answers ``docker ps`` from the labels in its own argv, so release selection is what is under test."""
+
+    def __init__(self, containers):
+        self.containers = containers  # (id, labels) newest first, like docker ps -aq
+        self.calls: list[list[str]] = []
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[1] != "ps":
+            return CommandResult(0, "the current release\n")
+        wanted = {}
+        for part in argv:
+            if part.startswith("label="):
+                key, value = part[len("label="):].split("=", 1)
+                wanted[key] = value
+        matches = [identifier for identifier, labels in self.containers
+                   if all(labels.get(key) == value for key, value in wanted.items())]
+        return CommandResult(0, "\n".join(matches) + ("\n" if matches else ""))
 
 
 class RuntimeTestCase(unittest.TestCase):
@@ -78,19 +133,30 @@ class FakeStopState:
             raise RuntimeError("simulated worker interruption")
         self.record = dict(record)
 
+    def clear_stop(self, container_id):
+        if self.record is None or self.record["container_id"] != container_id:
+            raise AssertionError("clearing an unknown stop record")
+        self.record = None
+
 
 class StatefulStopDocker:
-    def __init__(self, *, exit_on_signal=False):
+    def __init__(self, *, exit_on_signal=False, action="force", signal="", container_id=ID_A):
         self.status = "running"
         self.restart_policy = "unless-stopped"
         self.calls = []
         self.exit_on_signal = exit_on_signal
         self.exit_on_kill = True
+        self.action = action
+        self.signal = signal
+        self.container_id = container_id
+        self.exists = True
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         argv = list(argv)
         self.calls.append(argv)
         command = argv[1]
+        if command == "ps":
+            return CommandResult(0, self.container_id + "\n" if self.exists else "")
         if command == "update":
             self.restart_policy = "no"
             return CommandResult(0, "")
@@ -101,7 +167,14 @@ class StatefulStopDocker:
                 self.status = "exited"
             return CommandResult(0, "")
         if command == "inspect":
+            if any("RestartPolicy" in argument for argument in argv):
+                return CommandResult(0, f"{self.status} {self.restart_policy} {self.signal}|2|{self.action}\n")
             return CommandResult(0, self.status + "\n")
+        if command == "rm":
+            if self.status == "running":
+                return CommandResult(1, "cannot remove a running container")
+            self.exists = False
+            return CommandResult(0, "")
         raise AssertionError(f"unexpected command: {argv}")
 
 
@@ -166,6 +239,44 @@ class DurableShutdownTests(RuntimeTestCase):
         kills = [call for call in self.stateful.calls if call[1] == "kill" and call[3] == "KILL"]
         self.assertEqual(len(kills), 2)
         self.assertEqual(state.record["phase"], "killed")
+
+
+class ForcedStopTests(RuntimeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.clock = [0.0]
+        self.wall = [100.0]
+        self.stateful = StatefulStopDocker(action="fail")
+        self.runtime = DockerRuntime(self.stateful, self.layout, platform_name="linux/amd64",
+                                     clock=lambda: self.clock[0], sleep=lambda _: None,
+                                     wall_clock=lambda: self.wall[0])
+
+    def kills(self):
+        return [call[3] for call in self.stateful.calls if call[1] == "kill"]
+
+    def test_a_legacy_container_without_a_saved_record_is_killed_and_removed(self):
+        self.stateful.restart_policy = "no"  # an older helper disabled restart but saved no stop intent
+        self.runtime.force_stop(REGISTRATION)
+        self.assertEqual(self.kills(), ["KILL"])  # restart "no" means a previous helper already signalled it
+        self.assertFalse(self.stateful.exists)
+        self.assertTrue(self.runtime.stop_report[0]["forced"])
+
+    def test_a_paused_container_is_still_refused_before_any_signal(self):
+        self.stateful.status, self.stateful.restart_policy = "paused", "no"
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.force_stop(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "paused")
+        self.assertEqual([call for call in self.stateful.calls if call[1] in ("kill", "update", "rm")], [])
+
+    def test_two_live_containers_are_refused_before_anything_is_signalled(self):
+        docker = FakeDocker()
+        docker.results["ps"] = CommandResult(0, f"{ID_A}\n{ID_B}\n")
+        docker.results["inspect"] = CommandResult(0, "running unless-stopped |2|fail\n")
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        with self.assertRaises(RuntimeFailure) as caught:
+            runtime.force_stop(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "ambiguous")
+        self.assertEqual(docker.sub("kill") + docker.sub("update") + docker.sub("rm"), [])
 
 
 class IdentityTests(unittest.TestCase):
@@ -382,11 +493,87 @@ class StartTests(RuntimeTestCase):
         self.assertEqual(self.docker.sub("rm"), [])
 
 
+class StartImageTests(RuntimeTestCase):
+    """A start must fetch a release's image itself: an implicit `docker run` pull is anonymous."""
+
+    IMAGE = "ghcr.io/example/orders@sha256:" + "b" * 64
+
+    def start(self, value=None):
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        self.runtime.start(REGISTRATION, release() if value is None else value)
+
+    def login(self):
+        login = self.layout.registry_logins / "orders"
+        login.mkdir(parents=True, exist_ok=True)
+        (login / "config.json").write_text('{"auths": {}}')
+        return login
+
+    def test_an_image_that_is_on_the_host_is_never_fetched_again(self):
+        self.docker.results["image inspect"] = CommandResult(0, "sha256:" + ID_A + "\n")
+        self.start()
+        self.assertEqual(self.docker.sub("pull"), [])  # a deploy already pulled it in prepare: no registry round trip
+        self.assertEqual(self.docker.calls[0], ["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}", self.IMAGE])
+        self.assertEqual(self.docker.sub("run")[0][-1], self.IMAGE)
+
+    def test_a_missing_image_is_fetched_with_this_applications_login_before_anything_is_stopped(self):
+        login = self.login()
+        self.docker.results["image inspect"] = CommandResult(1, "Error: No such image")
+        self.start()
+        self.assertEqual(self.docker.sub("pull"),
+                         [["/usr/bin/docker", "--config", str(login), "pull", "--quiet", self.IMAGE]])
+        fetched = self.docker.calls.index(self.docker.sub("pull")[0])
+        self.assertLess(fetched, self.docker.calls.index(self.docker.sub("rm")[0]))  # the old release keeps serving
+        self.assertLess(fetched, self.docker.calls.index(self.docker.sub("run")[0]))
+        self.assertEqual(self.docker.sub("run")[0][-1], self.IMAGE)
+
+    def test_a_start_that_cannot_fetch_the_image_leaves_the_previous_release_alone(self):
+        self.login()
+        for host in ("ghcr.io", "localhost:5000"):
+            with self.subTest(host):
+                self.docker.calls.clear()
+                value = release()
+                value["artifact"]["image"] = f"{host}/example/orders@sha256:" + "b" * 64
+                self.docker.results = {"volume inspect": LABELLED_VOLUME, "ps": CommandResult(0, ID_A + "\n"),
+                                       "image inspect": CommandResult(1, "Error: No such image"),
+                                       "pull": CommandResult(1, "unauthorized: authentication required")}
+                with self.assertRaises(RuntimeFailure) as caught:
+                    self.runtime.start(REGISTRATION, value)
+                self.assertEqual(caught.exception.phase, "start")
+                self.assertIn(f"the release's image could not be fetched from {host}", str(caught.exception))
+                self.assertIn("the previous release is still running", str(caught.exception))
+                self.assertEqual(caught.exception.detail, "")  # raw pull output can echo what the pull was given
+                self.assertEqual((self.docker.sub("rm"), self.docker.sub("run")), ([], []))
+
+    def test_a_nearly_full_disk_stops_a_start_before_it_pulls_or_touches_anything(self):
+        self.docker.results["image inspect"] = CommandResult(1, "Error: No such image")
+        with patch("shiplord.runtime.shutil.disk_usage", return_value=type("U", (), {"free": 10 * 2**20})()):
+            with self.assertRaisesRegex(RuntimeFailure, "not enough free disk space.*10 MiB free") as caught:
+                self.runtime.start(REGISTRATION, release())
+        self.assertEqual(caught.exception.phase, "start")
+        self.assertEqual((self.docker.sub("pull"), self.docker.sub("volume inspect"), self.docker.sub("rm"),
+                          self.docker.sub("run")), ([], [], [], []))
+
+
 class InspectTests(RuntimeTestCase):
+    MANAGED = ("HOST=0.0.0.0", "PORT=8080", "LOG_LEVEL=INFO", "AGENT_DIR=/app/src", "AGENT_NAME=orders",
+               "RELOAD_AGENTS=false", "SERVE_WEB_INTERFACE=false", "ALLOW_ORIGINS=[]")
+
+    def environment(self, *extra, **overrides):
+        values = dict(item.partition("=")[::2] for item in (*self.MANAGED, *extra))
+        values.update(overrides)
+        return json.dumps([f"{key}={value}" for key, value in values.items()])
+
     def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",),
-                       timeout="<no value>", action="<no value>", template="google-adk"):
-        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64}|{timeout}|{action}|{template}|"
-                                f" {' '.join(mounts)}\n")
+                       timeout="<no value>", action="<no value>", template="google-adk",
+                       memory=512 * 1024 * 1024, memory_swap=512 * 1024 * 1024, pids=512,
+                       restart="unless-stopped", security='["no-new-privileges"]', capabilities='["ALL"]',
+                       log_driver="json-file", log_options='{"max-size":"10m","max-file":"3"}',
+                       ports='{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"20007"}]}',
+                       environment=None, repository="ghcr.io/example/orders"):
+        environment = self.environment() if environment is None else environment
+        return CommandResult(0, f"{state} {repository}@sha256:{image * 64}|{timeout}|{action}|{template}|"
+                                f" {' '.join(mounts)}|{memory}|{memory_swap}|{pids}|{restart}|{security}|"
+                                f"{capabilities}|{log_driver}|{log_options}|{ports}|{environment}\n")
 
     def test_profile_changes_require_a_new_container_even_with_the_same_image_and_identity(self):
         for actual in ("generic", "google-adk", "", "<no value>", "unknown", "google-adk|generic"):
@@ -426,14 +613,12 @@ class InspectTests(RuntimeTestCase):
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
 
     def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
-        mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
-                                 + "|<no value>|<no value>|google-adk| volume:shiplord-orders-artifacts:/app/src/.adk\n")
-        self.docker.results["inspect"] = mirrored
+        self.docker.results["inspect"] = self.inspect_output(repository="localhost:5000/example/orders")
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
-        self.docker.results["inspect"] = CommandResult(0, mirrored.output.replace("b" * 64, "c" * 64))
+        self.docker.results["inspect"] = self.inspect_output(image="c", repository="localhost:5000/example/orders")
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
-        self.docker.results["inspect"] = CommandResult(0, "true false orders:latest|<no value>|<no value>|google-adk|"
-                                                         "volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.docker.results["inspect"] = CommandResult(0, self.inspect_output(repository="orders:latest").output
+                                                       .replace("orders:latest@sha256:" + "b" * 64, "orders:latest"))
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
 
     def test_shutdown_policy_is_part_of_running_identity(self):
@@ -445,6 +630,85 @@ class InspectTests(RuntimeTestCase):
         self.assertTrue(self.runtime.is_running(REGISTRATION, candidate))
         self.docker.results["inspect"] = self.inspect_output(timeout="120", action="bad")
         self.assertFalse(self.runtime.is_running(REGISTRATION, candidate))
+
+    def test_memory_and_memory_swap_are_part_of_running_identity(self):
+        self.docker.results["inspect"] = self.inspect_output(memory=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(memory_swap=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(memory=256 * 1024 * 1024, memory_swap=256 * 1024 * 1024)
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(memory=256)))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_every_fixed_run_value_is_part_of_running_identity(self):
+        changed = {
+            "another pids limit": {"pids": 256},
+            "another restart policy": {"restart": "always"},
+            "another security option": {"security": '["no-new-privileges:false"]'},
+            "no security option": {"security": "null"},
+            "another dropped capability": {"capabilities": '["CHOWN"]'},
+            "no dropped capability": {"capabilities": "null"},
+            "another log driver": {"log_driver": "local"},
+            "another log size": {"log_options": '{"max-size":"1m","max-file":"3"}'},
+            "another log file count": {"log_options": '{"max-size":"10m","max-file":"1"}'},
+            "another published port": {"ports": '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"20008"}]}'},
+            "another container port": {"ports": '{"8081/tcp":[{"HostIp":"127.0.0.1","HostPort":"20007"}]}'},
+            "a public bind": {"ports": '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"20007"}]}'},
+        }
+        for label, fields in changed.items():
+            with self.subTest(label):
+                self.docker.results["inspect"] = self.inspect_output(**fields)
+                self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_the_environment_the_container_was_created_with_is_part_of_running_identity(self):
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment(ALLOW_ORIGINS='["https://old.example"]'))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(origins=["https://new.example"])))
+        self.docker.results["inspect"] = self.inspect_output(environment=self.environment(PORT="8081"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_a_custom_environment_value_is_compared_and_image_keys_are_tolerated(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=placeholder\n")
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", "VERSION=v1", CUSTOM_TOKEN="placeholder"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", CUSTOM_TOKEN="old"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output(environment=self.environment("PATH=/usr/bin"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_an_environment_value_containing_the_field_separator_does_not_shift_the_other_fields(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=a|b\n")
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output(
+            environment=self.environment("PATH=/usr/bin", CUSTOM_TOKEN="a|b"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_an_unusable_environment_file_is_not_a_mismatch_by_itself(self):
+        """A start would fail on the same file, so a restart cannot fix it; the record still decides."""
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("PORT=1\n")  # a managed key: the parser refuses it
+        path.chmod(0o600)
+        self.docker.results["inspect"] = self.inspect_output()
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        path.write_text("OK=1\n")
+        path.chmod(0o644)  # not private to the installing account
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        # The record-derived values are still compared, so a candidate that replaced them is caught.
+        self.docker.results["inspect"] = self.inspect_output(memory=768 * 1024 * 1024)
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_absent_or_unreadable_fields_are_a_mismatch(self):
+        for fields in ({"pids": 0}, {"restart": ""}, {"security": "not json"}, {"capabilities": "null"},
+                       {"log_options": "null"}, {"ports": "null"}, {"environment": "not json"},
+                       {"environment": '["no-separator"]'}):
+            with self.subTest(fields=fields):
+                self.docker.results["inspect"] = self.inspect_output(**fields)
+                self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
 
     def test_an_image_declared_mount_does_not_change_release_identity(self):
         self.docker.results["inspect"] = self.inspect_output(
@@ -460,13 +724,70 @@ class InspectTests(RuntimeTestCase):
         self.assertFalse(self.runtime.is_running(REGISTRATION, configured))
 
     def test_logs_are_bounded_and_empty_without_a_container(self):
-        self.assertEqual(self.runtime.logs(REGISTRATION, 50), "")
+        self.assertEqual(self.runtime.logs(REGISTRATION, None, 50), "")
+        self.assertEqual(self.docker.sub("ps"), [])  # no release means nothing to look for
         self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
         self.docker.results["logs"] = CommandResult(0, "line1\nline2\n")
-        self.assertEqual(self.runtime.logs(REGISTRATION, 10**9), "line1\nline2\n")
+        self.assertEqual(self.runtime.logs(REGISTRATION, release(), 10**9), "line1\nline2\n")
         self.assertEqual(self.docker.sub("logs")[0][2:4], ["--tail", "1000"])
-        self.runtime.logs(REGISTRATION, -5)
+        self.runtime.logs(REGISTRATION, release(), -5)
         self.assertEqual(self.docker.sub("logs")[1][2:4], ["--tail", "1"])
+
+    def test_logs_pass_since_and_timestamps_to_docker(self):
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        self.docker.results["logs"] = CommandResult(0, "2026-11-10T12:00:00Z line\n")
+        self.runtime.logs(REGISTRATION, release(), 25, since="15m", timestamps=True)
+        self.assertEqual(self.docker.sub("logs")[0][1:], ["logs", "--tail", "25", "--since", "15m", "--timestamps", ID_A])
+
+    def test_follow_streams_the_current_release_for_a_bounded_time(self):
+        docker = StreamingDocker()
+        docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        received = []
+        reason = runtime.follow_logs(REGISTRATION, release(), tail=50, since="15m", timestamps=True, duration=120,
+                                     emit=received.append)
+        self.assertEqual((reason, received), ("timeout", ["one\n", "two\n"]))
+        argv, timeout = docker.stream_calls[0]
+        self.assertEqual(timeout, 120)
+        self.assertEqual(argv[1:], ["logs", "--follow", "--tail", "50", "--since", "15m", "--timestamps", ID_A])
+
+    def test_follow_without_the_current_release_returns_immediately(self):
+        self.assertEqual(self.runtime.follow_logs(REGISTRATION, None, tail=10, duration=120), "unavailable")
+        self.assertEqual(self.docker.sub("logs"), [])
+
+    def test_logs_read_only_the_current_releases_container(self):
+        current, stale = release(), release(commit="c", sequence=900)
+        docker = LabelledDocker([(ID_A, {"shiplord.app": "orders", "shiplord.release": release_id(stale)}),
+                                 (ID_B, {"shiplord.app": "orders", "shiplord.release": release_id(current)})])
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        self.assertEqual(runtime.logs(REGISTRATION, current, 50), "the current release\n")
+        self.assertEqual(docker.calls[-1][-1], ID_B)  # not the older release listed first
+        self.assertEqual(docker.calls[0][4:], ["--filter", "label=shiplord.app=orders",
+                                               "--filter", f"label=shiplord.release={release_id(current)}"])
+
+    def test_a_stopped_container_from_an_older_release_is_never_read(self):
+        stale = release(commit="c", sequence=900)
+        docker = LabelledDocker([(ID_A, {"shiplord.app": "orders", "shiplord.release": release_id(stale)})])
+        runtime = DockerRuntime(docker, self.layout, platform_name="linux/amd64")
+        self.assertEqual(runtime.logs(REGISTRATION, release(), 50), "")
+        self.assertEqual([call for call in docker.calls if call[1] == "logs"], [])
+        self.assertEqual(runtime.follow_logs(REGISTRATION, release(), tail=50), "unavailable")
+
+    def test_release_logs_read_that_release_own_container_by_name(self):
+        self.docker.results["logs"] = CommandResult(0, "boom\n")
+        self.assertEqual(self.runtime.release_logs(REGISTRATION, release(), 10**9), "boom\n")
+        (call,) = self.docker.sub("logs")
+        self.assertEqual(call[1:], ["logs", "--tail", "1000", self.runtime.container_name(REGISTRATION, release())])
+        self.assertEqual(self.docker.max_outputs, [MAX_LOG_BYTES])
+        self.runtime.release_logs(REGISTRATION, release(), -5)
+        self.assertEqual(self.docker.sub("logs")[1][2:4], ["--tail", "1"])
+
+    def test_release_logs_are_none_only_when_the_container_is_gone(self):
+        self.docker.results["logs"] = CommandResult(1, "Error: No such container: shiplord-orders-missing\n")
+        self.assertIsNone(self.runtime.release_logs(REGISTRATION, release(), 50))
+        self.docker.results["logs"] = CommandResult(1, "permission denied while reading logs\n")
+        with self.assertRaises(RuntimeFailure):
+            self.runtime.release_logs(REGISTRATION, release(), 50)
 
     def test_discard_reports_but_does_not_raise_when_the_image_is_in_use(self):
         self.assertEqual(self.runtime.discard(REGISTRATION, release()), [])
@@ -498,9 +819,31 @@ class LogTruncationTests(unittest.TestCase):
                                      platform_name="linux/amd64")
 
     def test_the_newest_log_lines_survive_the_log_cap(self):
-        logs = self.runtime.logs(REGISTRATION, 50)
+        logs = self.runtime.logs(REGISTRATION, release(), 50)
         self.assertLessEqual(len(logs), MAX_LOG_BYTES)
         self.assertTrue(logs.endswith("the failure\n"))
+
+    def test_a_release_log_capture_keeps_the_newest_bytes_within_its_own_bound(self):
+        logs = self.runtime.release_logs(REGISTRATION, release(), 50, max_bytes=4096)
+        self.assertLessEqual(len(logs), 4096)
+        self.assertTrue(logs.startswith("[shiplord: earlier output truncated]"))
+        self.assertTrue(logs.endswith("the failure\n"))
+
+
+class LogOptionTests(unittest.TestCase):
+    def test_only_relative_durations_both_runtimes_read_are_accepted(self):
+        for value in ("0s", "30s", "15m", "2h", "99999h"):
+            self.assertEqual(validate_since(value), value)
+        for value in ("", "1d", "5", "15 m", "-15m", "2026-11-10T12:00:00Z", "1h; rm -rf /"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_since(value)
+
+    def test_the_follow_timeout_is_bounded_and_never_a_boolean(self):
+        self.assertEqual(validate_follow_timeout(1), 1)
+        self.assertEqual(validate_follow_timeout(MAX_FOLLOW_SECONDS), MAX_FOLLOW_SECONDS)
+        for value in (0, MAX_FOLLOW_SECONDS + 1, True, "60", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_follow_timeout(value)
 
 
 class StorageMountTests(RuntimeTestCase):

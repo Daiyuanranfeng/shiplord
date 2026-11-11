@@ -13,13 +13,15 @@ import re
 import shlex
 import subprocess
 import tarfile
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
 
 from .framing import read_frame, write_frame
-from .installer import helper_modules
+from .installer import (PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON, helper_modules, python_supported,
+                        python_version)
 from .layout import ADMIN_PATH, DISPATCH_PATH, deployment_user
 from .protocol import MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProtocolError
 from .servers import SshOptions, ssh_command
@@ -27,6 +29,7 @@ from .servers import SshOptions, ssh_command
 Runner = Callable[[list[str], bytes, float], tuple[bytes, bytes, int]]
 POLL_INTERVAL_SECONDS = 2.0
 POLL_FAILURE_LIMIT = 5
+PYTHON_PROBE_TIMEOUT = 60.0
 
 
 class ClientError(Exception):
@@ -54,6 +57,7 @@ def run_ssh(command: list[str], payload: bytes, timeout: float) -> tuple[bytes, 
 PayloadRunner = Callable[[list[str], bytes, "Path", float], tuple[bytes, bytes, int]]
 UPLOAD_MINIMUM_RATE = 131072  # bytes per second assumed when sizing the upload deadline
 CHUNK = 1 << 20
+STREAM_GRACE_SECONDS = 60  # how long a stream may outlive its own bound before the local process is killed
 
 
 def upload_timeout(size: int) -> float:
@@ -104,6 +108,41 @@ def _frame(message: dict) -> bytes:
     return buffer.getvalue()
 
 
+StreamRunner = Callable[[list[str], bytes, float], "subprocess.Popen"]
+
+
+def open_ssh_stream(command: list[str], payload: bytes, timeout: float) -> "subprocess.Popen":
+    """Start an SSH exchange whose response arrives as frames over time; the caller closes it."""
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        raise ClientError("could not start ssh", 3) from None
+    try:
+        process.stdin.write(payload)
+        process.stdin.close()
+    except OSError:  # the server may refuse and close early; its response is still read below
+        pass
+    return process
+
+
+def _close_stream(process: "subprocess.Popen") -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 def _parse(stdout: bytes) -> dict:
     try:
         stream = io.BytesIO(stdout)
@@ -125,13 +164,13 @@ class HelperClient:
 
     def __init__(self, application_id: str, server_target: str, runner: Runner = run_ssh,
                  payload_runner: PayloadRunner = run_ssh_stream, *, ssh_options: SshOptions | None = None,
-                 explicit_target: bool = False):
+                 explicit_target: bool = False, stream_runner: StreamRunner = open_ssh_stream):
         """``server_target`` is the administrator login; the deployment account is derived from it unless
         ``explicit_target`` says it already names the deployment account (CI supplies it directly)."""
         user, _, host = server_target.partition("@")
         self.target = server_target if explicit_target else f"{deployment_user(application_id)}@{host}"
         self.application_id, self.runner, self.payload_runner = application_id, runner, payload_runner
-        self.ssh_options = ssh_options
+        self.stream_runner, self.ssh_options = stream_runner, ssh_options
 
     def call(self, action: str, *, request_id: str | None = None, commit: str | None = None,
              arguments: dict | None = None, timeout: float = 60, payload: Path | None = None) -> dict:
@@ -157,10 +196,56 @@ class HelperClient:
                               2 if response.get("error") in ("invalid_request", "invalid_payload") else 1)
         return response
 
+    def follow(self, action: str, *, arguments: dict | None = None, timeout: float = 300,
+               on_chunk: Callable[[str], None] = lambda chunk: None, request_id: str | None = None) -> dict:
+        """Read a streamed response frame by frame until the server ends it or the deadline stops it.
+
+        The local process is always closed, and the caller's KeyboardInterrupt is not swallowed, so
+        Ctrl-C ends a follow promptly rather than waiting for the server's bound.
+        """
+        request_id = request_id or new_request_id()
+        message = {"version": PROTOCOL_VERSION, "request_id": request_id, "action": action,
+                   "application_id": self.application_id, "commit": None, "arguments": arguments or {}}
+        process = self.stream_runner(ssh_command(self.target, DISPATCH_PATH, self.ssh_options), _frame(message), timeout)
+        watchdog = threading.Timer(timeout + STREAM_GRACE_SECONDS, process.kill)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            while True:
+                try:
+                    response = read_frame(process.stdout)
+                except ProtocolError:
+                    raise ClientError("the log stream ended before the server finished; check the SSH login and that "
+                                      "the server helper is running", 3) from None
+                if response.get("request_id") != request_id:
+                    raise ClientError("the server response did not match the request", 1)
+                status = response.get("status")
+                if status == "stream":
+                    chunk = response.get("chunk")
+                    if not isinstance(chunk, str):
+                        raise ClientError("the server returned an invalid log stream", 1)
+                    on_chunk(chunk)
+                    continue
+                if status == "ok":
+                    result = response.get("result")
+                    if not isinstance(result, dict):
+                        raise ClientError("the server returned an invalid log stream", 1)
+                    return result
+                if status == "error":
+                    error = response.get("error")
+                    raise ClientError(response.get("message") or f"the server stopped the log stream ({error})",
+                                      2 if error in ("invalid_request", "invalid_payload") else 1)
+                if status == "incompatible":
+                    raise ClientError("the server helper speaks a different protocol version; upgrade one side", 4)
+                raise ClientError("the server returned an invalid log stream", 1)
+        finally:
+            watchdog.cancel()
+            _close_stream(process)
+
 
 def wait_for_job(client: HelperClient, job_id: str, *, timeout: float, on_progress: Callable[[str], None] = lambda p: None,
                  interval: float = POLL_INTERVAL_SECONDS, sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> dict:
+                 clock: Callable[[], float] = time.monotonic, lookup_command: str | None = None) -> dict:
     """Poll a job by ID until it finishes; tolerates brief SSH failures. Returns the outcome dict."""
     deadline, failures, last_phase = clock() + timeout, 0, None
     while True:
@@ -183,13 +268,14 @@ def wait_for_job(client: HelperClient, job_id: str, *, timeout: float, on_progre
                         "detail": {"error": "worker_vanished", "job_id": job_id,
                                    "message": "the job stopped before finishing; run `shiplord recover`"}}
         if clock() >= deadline:
-            raise ClientError(f"timed out waiting for job {job_id}; it may still be running: run `shiplord status`", 1)
+            hint = f"run `{lookup_command}`" if lookup_command else "run `shiplord status`"
+            raise ClientError(f"timed out waiting for job {job_id}; it may still be running: {hint}", 1)
         sleep(interval)
 
 
 def submit_and_wait(client: HelperClient, action: str, *, request_id: str, commit: str | None = None,
                     arguments: dict | None = None, timeout: float, on_progress: Callable[[str], None] = lambda p: None,
-                    payload: Path | None = None, **wait_options) -> dict:
+                    payload: Path | None = None, lookup_command: str | None = None, **wait_options) -> dict:
     response = client.call(action, request_id=request_id, commit=commit, arguments=arguments, payload=payload)
     if response["status"] == "finished":
         return response["outcome"]
@@ -199,7 +285,8 @@ def submit_and_wait(client: HelperClient, action: str, *, request_id: str, commi
     on_progress(job["phase"])
     if job["state"] == "finished":
         return job["outcome"]
-    return wait_for_job(client, request_id, timeout=timeout, on_progress=on_progress, **wait_options)
+    return wait_for_job(client, request_id, timeout=timeout, on_progress=on_progress,
+                        lookup_command=lookup_command, **wait_options)
 
 
 class AdminClient:
@@ -243,6 +330,19 @@ class AdminClient:
 _INSTALL_DIRECTORY = re.compile(r"/tmp/shiplord-install\.[A-Za-z0-9]{6,12}\Z")
 
 
+def require_server_python(runner: Runner, server_target: str) -> None:
+    """Refuse a server whose interpreter cannot run the helper, before anything is uploaded or switched."""
+    command = shlex.join([SERVER_PYTHON, "-I", "-S", "-B", "-c", PYTHON_PROBE])
+    stdout, _stderr, status = runner(ssh_command(server_target, command), b"", PYTHON_PROBE_TIMEOUT)
+    answer = stdout.decode("utf-8", "replace")
+    if status == 0 and python_supported(answer):
+        return
+    version = python_version(answer)
+    found = f"it is Python {version[0]}.{version[1]}" if version else "it is missing or did not report a version"
+    raise ClientError(f"{SERVER_PYTHON} on the server must be Python {REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]} or "
+                      f"later because the helper imports tomllib; {found}", 3)
+
+
 def package_helper(source: Path) -> bytes:
     """A tar archive of exactly the modules the server runs, with fixed ownership and modes."""
     buffer = io.BytesIO()
@@ -257,7 +357,8 @@ def package_helper(source: Path) -> bytes:
 
 def bootstrap_server(server_target: str, source: Path, *, prompt: Callable[[str], str] = getpass.getpass,
                      runner: Runner = run_ssh) -> dict:
-    """Upload the helper, run the installer as root, and remove the upload."""
+    """Check the server's interpreter, upload the helper, run the installer as root, and remove the upload."""
+    require_server_python(runner, server_target)
     stdout, stderr, status = runner(ssh_command(server_target, "umask 077 && d=$(mktemp -d /tmp/shiplord-install.XXXXXXXX)"
                                                 " && tar -x -C \"$d\" && echo \"$d\""), package_helper(source), 120)
     directory = stdout.decode("utf-8", "replace").strip()
@@ -265,7 +366,7 @@ def bootstrap_server(server_target: str, source: Path, *, prompt: Callable[[str]
         raise ClientError("could not upload the helper to the server", 3)
     try:
         admin = AdminClient(server_target, prompt, runner)
-        stdout, _, _ = admin._sudo(["/usr/bin/python3", "-I", "-S", "-B", "-c",  # -B: root must not write bytecode into the upload
+        stdout, _, _ = admin._sudo([SERVER_PYTHON, "-I", "-S", "-B", "-c",  # -B: root must not write bytecode into the upload
                                     "import sys;sys.path.insert(0,sys.argv[1]);from shiplord.installer import main;main()",
                                     directory], b"", 300)
         response = _parse(stdout)

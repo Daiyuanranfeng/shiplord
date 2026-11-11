@@ -7,6 +7,7 @@ an unhealthy release, and a crashing release.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -26,14 +27,20 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fakes import FakeCaddy  # noqa: E402
 from shiplord import registries  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
+from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import Probes  # noqa: E402
-from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  # noqa: E402
+from shiplord.protocol import PROTOCOL_VERSION  # noqa: E402
+from shiplord.privileged_host import serve  # noqa: E402
+from shiplord.registry import PORT_RANGE, Registry, port_is_free, validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
 from shiplord.routing import RoutingError  # noqa: E402
+from shiplord.retire import make_retirer  # noqa: E402
 from shiplord.runtime import DockerRuntime, release_id  # noqa: E402
+from shiplord.services import HostServices  # noqa: E402
 from shiplord.system import HostSystem  # noqa: E402
+from shiplord.worker import run_job  # noqa: E402
 
 ENABLED = os.environ.get("SHIPLORD_TEST_DOCKER") == "1" and shutil.which("docker")
 REGISTRY_PORT = 5000
@@ -315,13 +322,18 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertOutcome(unhealthy, "rolled_back")
         self.assertEqual(unhealthy.exit_code, 5)
         self.assertEqual(unhealthy.detail["kind"], "timeout")
+        self.assertIn("fixture started version=v3", unhealthy.detail["candidate_logs"]["output"])
         self.assertEqual(self.get("/version"), "v2")
         self.assertEqual(self.get("/counter"), "3")
 
         crashing = self.deploy("req-4", "v4", 1003)
         self.assertOutcome(crashing, "rolled_back")
         self.assertEqual(crashing.detail["kind"], "exited")
+        self.assertIn("fixture crashing on purpose", crashing.detail["candidate_logs"]["output"])
+        self.assertEqual(crashing.detail["candidate_logs"]["tail"], 100)
         self.assertEqual(self.get("/version"), "v2")
+        self.assertIn("fixture started version=v2",
+                      self.runtime.logs(self.registration, self.state.read_state()["current"], 50))  # restored release
         self.assertEqual(self.state.read_state()["current"]["commit"], "b" * 40)
         self.assertIsNone(self.state.read_journal())
 
@@ -345,8 +357,24 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(self.get("/version"), "v1")
         self.assertIsNone(self.state.read_journal())
 
-        logs = self.runtime.logs(self.registration, 50)
+        logs = self.runtime.logs(self.registration, self.state.read_state()["current"], 50, timestamps=True)
         self.assertIn("fixture started version=v1", logs)
+        self.assertRegex(logs, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")  # timestamps are real, not invented
+
+        # A stopped container of another release is never read, even when docker lists it first.
+        stale = docker("run", "-d", "--label", f"shiplord.app={self.app}", "--label", "shiplord.release=000000000000",
+                       self.images["v1"]["image"], "sh", "-c", "echo stale-release").stdout.strip()
+        try:
+            self.assertNotIn("stale-release", self.runtime.logs(self.registration, self.state.read_state()["current"], 50))
+        finally:
+            docker("rm", "-f", stale, check=False)
+
+        # Following is bounded by its own deadline, and it starts from --since.
+        chunks = []
+        self.assertEqual(self.runtime.follow_logs(self.registration, self.state.read_state()["current"], tail=10,
+                                                  since="1h", timestamps=True, duration=2, emit=chunks.append),
+                         "timeout")
+        self.assertIn("fixture started version=v1", "".join(chunks))
 
         # preparation failures leave the running container untouched
         before = self.containers()
@@ -387,6 +415,54 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual((status["running"], status["current"], status["unfinished_transaction"]),
                          (True, identity(state["current"]), None))
         self.assertEqual(release_id(state["current"]), self.inspect()["Config"]["Labels"]["shiplord.release"])
+
+    def stored_login(self):
+        """A stored docker login for this application whose credential helper records that docker used it.
+
+        The fixture registry is anonymous, so the fetch cannot fail without the login; a helper in the application's
+        own config directory is what proves the fetch was given that directory. It returns no credentials, because a
+        throwaway password would prove nothing more and would put a value in the test.
+        """
+        login = self.layout.registry_logins / self.app
+        login.mkdir(parents=True, exist_ok=True)
+        login.chmod(0o700)
+        record = self.base / "login-record"
+        name = f"shiplord-fixture-{self.app}"
+        helper = Path("/usr/local/bin") / f"docker-credential-{name}"
+        helper.write_text('#!/bin/sh\nprintf "%s %s\\n" "$1" "$(cat)" >> ' + str(record) + '\n'
+                          'printf \'{"ServerURL":"localhost:' + str(REGISTRY_PORT) + '","Username":"","Secret":""}\'\n')
+        helper.chmod(0o755)
+        self.addCleanup(helper.unlink, missing_ok=True)
+        self.addCleanup(shutil.rmtree, login, ignore_errors=True)
+        (login / "config.json").write_text(json.dumps({"credHelpers": {f"localhost:{REGISTRY_PORT}": name}}))
+        (login / "config.json").chmod(0o600)
+        return record
+
+    def test_pruned_image_is_fetched_with_the_stored_login_when_the_release_is_started(self):
+        """`docker image prune -a` is routine host maintenance: the committed release must still come back."""
+        self.assertOutcome(self.deploy("req-i1", "v1", 2500), "succeeded")
+        self.assertOutcome(self.deploy("req-i2", "v2", 2501), "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+
+        docker("rm", "-f", *self.containers())  # the application is down, and host maintenance pruned its image
+        docker("rmi", self.images["v2"]["image"])
+        self.assertNotEqual(docker("image", "inspect", self.images["v2"]["image"], check=False).returncode, 0)
+        record = self.stored_login()  # only from here on: the fetches above must not be credited to it
+
+        # A worker interrupted mid-transaction leaves a journal; recovery starts the committed release again.
+        with self.lock.acquire():
+            self.state.begin("req-i3", self.state.read_state()["current"] | {"sequence": 2502})
+            self.state.advance("runtime-changing")
+        with self.lock.acquire():
+            recovered = self.deployer.recover()
+        self.assertOutcome(recovered, "recovered")
+        self.assertEqual(recovered.detail["target"]["commit"], "b" * 40)
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(docker("image", "inspect", self.images["v2"]["image"], check=False).returncode, 0,
+                         "the start did not fetch the pruned image")
+        self.assertEqual(record.read_text().split(), ["get", f"localhost:{REGISTRY_PORT}"],
+                         "the fetch did not use this application's stored login")
+        self.assertIsNone(self.state.read_journal())
 
     def test_redeploying_a_release_that_is_down_keeps_the_real_rollback_target(self):
         """A CI re-run deploys the same release again with a new request ID; the rollback target must survive."""
@@ -490,12 +566,55 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started, 2)
         self.assertEqual(self.get("/version"), "v8")
 
-    def test_zz_fail_keeps_the_original_and_recovery_waits_for_its_exit(self):
+    def test_zz_fail_force_stop_unblocks_deploy_and_retirement(self):
         self.fresh_container_slate()
+        self.set_data_dir("/app/src/.adk")
         policy = self.policy_configuration(2, "fail")
         self.assertOutcome(self.deploy("req-x1", "v7", 8000, configuration=policy), "succeeded")
         (original,) = self.containers()
         blocked = self.deploy("req-x2", "v8", 8001, configuration=policy)
+        self.assertOutcome(blocked, "intervention_required")
+        self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
+        self.assertIn("--force-stop", blocked.detail["recovery"])
+        self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}", original).stdout.strip(),
+                         "true no")
+        self.assertIsNotNone(self.state.read_journal())
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "intervention_required")  # still draining: nothing is cleared
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}}", original).stdout.strip(), "true")
+
+        with self.lock.acquire():
+            forced = self.deployer.recover(force_stop=True)
+        self.assertOutcome(forced, "recovered")
+        self.assertFalse(forced.detail["running"])
+        self.assertTrue(forced.detail["forced_stop"]["forced"])
+        self.assertEqual(forced.detail["forced_stop"]["signal"], "SIGKILL")
+        self.assertEqual(forced.detail["forced_stop"]["policy"], {"timeout_seconds": 2, "action": "fail"})
+        self.assertIn("forced", forced.detail["forced_stop"]["stages"])
+        self.assertEqual(self.containers(), [])
+        self.assertIsNone(self.state.read_journal())
+        self.assertFalse((self.layout.caddy_root / "ship" / f"{self.app}.caddy").exists())
+
+        following = self.deploy("req-x3", "v8", 8002, configuration=policy)
+        self.assertOutcome(following, "succeeded")
+        self.assertEqual(self.get("/version"), "v8")
+
+        retire = make_retirer(self.layout, HostSystem(), self.lock, FakeCaddy(),
+                              runtime_for=lambda registration: self.runtime)
+        with self.lock.acquire():
+            removed = retire(self.registration, self.state.read_state())
+        self.assertIn("public route", removed["removed"])
+        self.assertIn("running release", removed["removed"])
+        self.assertEqual(self.containers(), [])
+
+    def test_zz_fail_plain_recovery_after_the_process_exits(self):
+        # The release state is shared by this class, so the sequences continue after the forced-stop case.
+        self.fresh_container_slate()
+        policy = self.policy_configuration(2, "fail")
+        self.assertOutcome(self.deploy("req-p1", "v7", 8003, configuration=policy), "succeeded")
+        (original,) = self.containers()
+        blocked = self.deploy("req-p2", "v8", 8004, configuration=policy)
         self.assertOutcome(blocked, "intervention_required")
         self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
         self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
@@ -512,6 +631,7 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIsNone(self.state.read_journal())
         self.assertEqual(self.get("/version"), "v7")
         self.assertEqual(len(self.containers()), 1)
+
     def test_z_image_declared_volume_does_not_break_readiness_or_release_identity(self):
         deployed = self.deploy("req-v6", "v6-volume", 5002)
         self.assertOutcome(deployed, "succeeded")
@@ -566,9 +686,123 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertOutcome(self.runtime_rollback("req-profile5"), "succeeded")
         self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
 
+    def test_zzz_failed_routing_restores_the_previous_configuration(self):
+        """A same-release redeploy that changes configuration must restart the old one, not adopt the candidate."""
+        self.fresh_container_slate()
+        self.set_data_dir("/app/src/.adk")
+        original = self.configuration()
+        original["http"].update(container_port=8080, frontend_origins=["https://a.example.test"])
+        original["resources"] = {"memory_mb": 512}
+        self.assertOutcome(self.deploy("req-c1", "v1", 9000, configuration=original), "succeeded")
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertEqual(json.loads(self.get("/env"))["ALLOW_ORIGINS"], '["https://a.example.test"]')
+
+        # Same image, commit, sequence, and therefore the same container: only the configuration differs.
+        changed = self.configuration()
+        changed["http"].update(container_port=8081, frontend_origins=["https://b.example.test"])
+        changed["resources"] = {"memory_mb": 768}
+        with patch.object(self.deployer.routes, "apply", side_effect=RoutingError("fixture routing failure", "reload")):
+            failed = self.deploy("req-c2", "v1", 9000, configuration=changed)
+        self.assertOutcome(failed, "rolled_back")
+        self.assertEqual(failed.exit_code, 5)
+
+        host = self.inspect()["HostConfig"]
+        self.assertEqual((host["Memory"], host["MemorySwap"]), (512 * 1024 * 1024, 512 * 1024 * 1024))
+        self.assertEqual(host["PortBindings"], {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.port)}]})
+        self.assertEqual(json.loads(self.get("/env"))["ALLOW_ORIGINS"], '["https://a.example.test"]')
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
     def runtime_rollback(self, request_id):
         with self.lock.acquire():
             return self.deployer.rollback(request_id)
+
+    # the authorized helper path, for a test that must go through the dispatcher and the worker ----
+    def register_application(self):
+        """Write the registration the helper reads; it must match the record every deploy in this class used."""
+        self.layout.registrations.mkdir(parents=True, exist_ok=True)
+        self.layout.registrations.chmod(0o700)
+        descriptor = os.open(self.layout.registrations, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        with self.lock.acquire():
+            registration = Registry(descriptor, self.lock).register(
+                self.app, deployment_uid=1001, deployment_user="ship-fixture", runtime="docker",
+                api_domain="fixture.example.test", image_repository=REPOSITORY,
+                probe=lambda port: port == self.port)
+        self.assertEqual(registration["host_port"], self.port)
+        return registration
+
+    def helper_services(self, registration):
+        """The worker's services: the real runtime and lock, a launcher that only records, no Caddy admin."""
+        launched = []
+
+        class Launcher:
+            def launch(self, application_id, request_id):
+                launched.append((application_id, request_id))
+
+            def is_active(self, application_id, request_id):
+                return True
+
+        services = HostServices(self.layout, HostSystem(), Launcher(), FakeCaddy(), probes=Probes(admin_port=1),
+                                runtime_factory=lambda services, value: self.runtime)
+        self.authorize = patch("shiplord.privileged_host.authorize_application", lambda application_id: registration)
+        self.authorize.start()
+        self.addCleanup(self.authorize.stop)
+        return services, launched
+
+    def helper_call(self, services, action, request_id, **arguments):
+        message = {"version": PROTOCOL_VERSION, "request_id": request_id, "action": action,
+                   "application_id": self.app, "commit": None, "arguments": arguments}
+        encoded = io.BytesIO()
+        write_frame(encoded, message)
+        output = io.BytesIO()
+        code = serve(io.BytesIO(encoded.getvalue()), output, lambda: services)
+        return read_frame(io.BytesIO(output.getvalue())), code
+
+    def test_restart_applies_a_changed_environment_without_a_new_release(self):
+        """An env change reaches the process through an authorized restart; a redeploy is not `unchanged`."""
+        env_file = self.layout.environments / self.app / "app.env"
+        env_file.write_text("CUSTOM_TOKEN=before\n")
+        env_file.chmod(0o600)
+        self.assertOutcome(self.deploy("req-e1", "v5", 4000), "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "before")
+        self.assertEqual(self.state.read_state()["current"]["commit"], "e" * 40)
+
+        # Writing the file changes nothing by itself: the running container was created with `before`.
+        env_file.write_text("CUSTOM_TOKEN=after\n")
+        env_file.chmod(0o600)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "before")
+
+        # Criterion 2: the same release record with a new request ID is applied, not reported `unchanged`.
+        again = self.deploy("req-e2", "v5", 4000)
+        self.assertOutcome(again, "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "after")
+        self.assertEqual(self.get("/version"), "v5")
+        state = self.state.read_state()
+        self.assertEqual((state["current"]["commit"], state["previous"]["commit"]), ("e" * 40, "a" * 40))
+
+        # Criterion 1: an authorized `restart` job applies a later change to the process already deployed.
+        env_file.write_text("CUSTOM_TOKEN=final\n")
+        env_file.chmod(0o600)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "after")
+        services, launched = self.helper_services(self.register_application())
+        before = self.containers()
+        response, code = self.helper_call(services, "restart", "req-e3")
+        self.assertEqual((code, response["status"], response["job"]["action"]), (0, "accepted", "restart"))
+        self.assertEqual(launched, [(self.app, "req-e3")])
+        self.assertEqual(run_job(services, self.app, "req-e3"), 0)
+        job = self.helper_call(services, "status", "req-e4", job_id="req-e3")[0]["result"]["job"]
+        self.assertEqual((job["state"], job["outcome"]["status"], job["outcome"]["exit_code"]),
+                         ("finished", "succeeded", 0))
+        self.assertEqual(job["outcome"]["detail"]["release"]["commit"], "e" * 40)
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "final")
+        self.assertEqual(self.get("/version"), "v5")  # the recorded release never moved
+        self.assertNotEqual(self.containers(), before)  # the process was replaced, not just told to re-read
+        self.assertEqual(len(self.containers()), 1)
+        self.assertIsNone(self.state.read_journal())
+        state = self.state.read_state()
+        self.assertEqual((state["current"]["commit"], state["previous"]["commit"]), ("e" * 40, "a" * 40))
+        self.assertEqual(state["transaction_id"], "req-e3")
 
 
 if __name__ == "__main__":

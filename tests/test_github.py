@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from shiplord import github  # noqa: E402
+from shiplord import github, tailscale  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, ci_key_labels, fetch_host_keys,  # noqa: E402
@@ -36,13 +36,13 @@ def host_key(seed=1, key_type="ssh-ed25519"):
     return key_type, base64.b64encode(field(key_type.encode()) + field(bytes([seed]) * 32)).decode()
 
 
-def manifest(runtime="docker", with_github=False, server="production", template="google-adk"):
+def manifest(runtime="docker", with_github=False, server="production", template="google-adk", branch="main"):
     value = {"schema_version": 1, "name": "orders", "server": server, "template": template, "runtime": runtime,
              "http": {"api_domain": "orders.example.com", "frontend_origins": [], "container_port": 8080,
                       "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
              "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
     if with_github:
-        value["github"] = {"repository": "Example/orders", "deployment_branch": "main"}
+        value["github"] = {"repository": "Example/orders", "deployment_branch": branch}
     return validate_manifest(value)
 
 
@@ -187,6 +187,64 @@ class GitHubTestCase(unittest.TestCase):
 
     def state(self, server="production"):
         return json.loads((self.state_directory(server) / "state.json").read_text())
+
+
+class TailscaleCredentialTests(unittest.TestCase):
+    """The automatable half of issue #48: create the trust credential when a token is present."""
+
+    TOKEN = "tskey-api-throwaway-fixture-value"
+
+    def setUp(self):
+        self.gh = GitHub(FakeGh())
+
+    def create(self, *, environ, oidc=None):
+        if oidc is not None:
+            self.gh.runner.oidc = oidc
+        self.requests = []
+
+        def transport(url, headers, body):
+            self.requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        return github.tailscale_credential(self.gh, "Example/orders", manifest(), environ=environ,
+                                           transport=transport)
+
+    def test_without_a_token_the_printed_instructions_are_the_fallback(self):
+        self.assertIsNone(self.create(environ={}))
+        self.assertIsNone(self.create(environ={tailscale.API_TOKEN_ENV: "  "}))
+
+    def test_a_token_creates_the_owner_wide_credential_so_later_repositories_reuse_it(self):
+        settings, warnings = self.create(environ={tailscale.API_TOKEN_ENV: self.TOKEN},
+                                         oidc={"use_default": True, "sub_claim_prefix": "repo:Example@11/orders@22"})
+        self.assertEqual(settings, {"SHIPLORD_TS_CLIENT_ID": "id123456",
+                                    "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        self.assertEqual(warnings, [])
+        (url, headers, body), = self.requests
+        payload = json.loads(body)
+        self.assertEqual(payload["subject"], "repo:Example@11/*:ref:refs/heads/main")
+        self.assertEqual((payload["issuer"], payload["scopes"], payload["tags"]),
+                         (tailscale.GITHUB_ISSUER, ["auth_keys"], ["tag:ci"]))
+        self.assertEqual(payload["description"], "shiplord: Example/orders")
+        self.assertNotIn(self.TOKEN, json.dumps(settings) + json.dumps(warnings) + json.dumps(payload))
+
+    def test_extra_tags_are_created_with_the_credential(self):
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        github.tailscale_credential(self.gh, "Example/orders", manifest(), tags=["tag:ci", "tag:deploy"],
+                                    environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=transport)
+        self.assertEqual(json.loads(requests[0][2])["tags"], ["tag:ci", "tag:deploy"])
+
+    def test_a_refusal_does_not_echo_the_token(self):
+        def refusing(url, headers, body):
+            return 401, json.dumps({"message": f"bad token {self.TOKEN}"}).encode()
+        with self.assertRaises(tailscale.TailscaleError) as caught:
+            github.tailscale_credential(self.gh, "Example/orders", manifest(),
+                                        environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=refusing)
+        self.assertNotIn(self.TOKEN, str(caught.exception))
 
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
@@ -342,6 +400,60 @@ class SetupTests(GitHubTestCase):
         with self.assertRaisesRegex(GitHubError, "owner/repository"):
             self.setup_call(repository="not a repo")
 
+    def test_a_workflow_generated_for_trunk_triggers_and_uses_the_subject_on_trunk(self):
+        result = self.setup_call(deployment_branch="trunk")
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["trunk"]', text)
+        self.assertNotIn("refs/heads/main", text)
+        guidance = result["tailscale_setup"]
+        self.assertEqual(guidance["subject_repository"], "repo:Example/orders:ref:refs/heads/trunk")
+        self.assertEqual(guidance["subject_all_repositories"], "repo:Example/*:ref:refs/heads/trunk")
+        self.assertIn("refs/heads/trunk", " ".join(guidance["steps"]))
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        self.assertEqual(result["steps"]["manifest"], "ship.toml names Example/orders on trunk")
+        expected = render_workflow(manifest() | {"github": {"repository": "Example/orders", "deployment_branch": "trunk"}},
+                                   tooling_ref=REF)
+        self.assertEqual(text, expected)
+
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.setup_call()
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["main"]', text)
+        self.assertEqual(result["tailscale_setup"]["subject_repository"], "repo:Example/orders:ref:refs/heads/main")
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_a_changed_branch_is_recorded_without_touching_the_rest_of_ship_toml(self):
+        self.setup_call()
+        text = (self.project / "ship.toml").read_text()
+        text = text.replace('deployment_branch = "main"', 'deployment_branch = "main"  # current release branch')
+        (self.project / "ship.toml").write_text(text)
+        self.setup_call(deployment_branch="trunk")
+        updated = (self.project / "ship.toml").read_text()
+        self.assertEqual(updated.count("[github]"), 1)
+        self.assertIn('deployment_branch = "trunk"  # current release branch', updated)
+        self.assertEqual(updated.replace('deployment_branch = "trunk"', 'deployment_branch = "main"'), text)
+        self.assertIn('branches: ["trunk"]', (self.project / WORKFLOW_PATH).read_text())
+
+    def test_a_github_section_without_a_branch_gets_the_default_and_a_chosen_one(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call(deployment_branch="trunk")
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call()
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_an_invalid_deployment_branch_is_refused_before_anything_changes(self):
+        before = (self.project / "ship.toml").read_bytes()
+        for branch in ("main..other", ".hidden", "-main", "release/", "main.lock", "main branch"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(GitHubError) as caught:
+                    self.setup_call(deployment_branch=branch)
+                self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+
     def test_a_failure_registering_leaves_the_key_for_resumption_and_never_stores_the_secret(self):
         self.server.fail_add = True
         with self.assertRaises(GitHubError) as caught:
@@ -485,6 +597,7 @@ class SetupTests(GitHubTestCase):
     def test_the_remaining_manual_steps_are_stated_and_no_run_is_claimed(self):
         text = " ".join(self.setup_call()["remaining"])
         self.assertIn("Tailscale", text)
+        self.assertIn("TAILSCALE_API_KEY", text)
         self.assertIn("No GitHub Actions run has been performed", text)
 
 
@@ -631,6 +744,41 @@ class StatusTests(GitHubTestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+@unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
+class SetupCompleteTests(GitHubTestCase):
+    """The local evidence `shiplord setup` uses to skip a finished github setup; it never queries GitHub."""
+
+    def complete(self, repository="Example/orders", project=None):
+        return github.setup_complete(manifest(with_github=True), project=project or self.project,
+                                     repository=repository, home=self.home)
+
+    def test_it_needs_the_manifest_workflow_and_a_stored_secret(self):
+        self.assertFalse(self.complete())  # nothing has run yet
+        self.setup_call()
+        self.assertTrue(self.complete())
+
+    def test_a_missing_workflow_or_a_different_repository_is_not_complete(self):
+        self.setup_call()
+        self.assertFalse(self.complete(repository="Other/repo"))
+        self.assertFalse(self.complete(project=self.project / "elsewhere"))
+        (self.project / WORKFLOW_PATH).unlink()
+        self.assertFalse(self.complete())
+
+    def test_a_secret_that_was_never_stored_is_not_complete(self):
+        self.setup_call()
+        state_path = github.ci_directory("orders", "production", self.home) / "state.json"
+        state = json.loads(state_path.read_text())
+        state["secret_set"] = False
+        state_path.write_text(json.dumps(state))
+        self.assertFalse(self.complete())
+
+    def test_native_applications_do_not_need_a_generated_workflow(self):
+        native = manifest(runtime="native", with_github=True)
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        self.setup_call(manifest=native)
+        self.assertTrue(github.setup_complete(native, project=self.project, repository="Example/orders", home=self.home))
+
+
 class HostKeyTests(unittest.TestCase):
     def test_host_keys_are_validated_and_formatted_for_known_hosts(self):
         key_type, blob = host_key(3)
@@ -731,11 +879,12 @@ class CheckCiTests(unittest.TestCase):
         self.slept = []
         self.now = [0.0]
 
-    def check(self, timeout=1200):
+    def check(self, timeout=1200, **changes):
         def sleep(seconds):
             self.slept.append(seconds)
             self.now[0] += seconds
-        return check_ci(manifest(with_github=True), gh=self.gh, timeout=timeout, clock=lambda: self.now[0], sleep=sleep)
+        return check_ci(manifest(with_github=True, **changes), gh=self.gh, timeout=timeout,
+                        clock=lambda: self.now[0], sleep=sleep)
 
     def test_a_check_dispatches_check_only_on_the_deployment_branch_and_waits_for_the_new_run(self):
         self.gh_runner.views = [{"status": "in_progress"}, check_view()]
@@ -746,6 +895,15 @@ class CheckCiTests(unittest.TestCase):
         self.assertIn("check_only=true", dispatch)
         self.assertEqual(result["steps"]["Deploy"], "skipped")
         self.assertEqual(self.slept, [10])
+
+    def test_a_check_uses_the_configured_branch_for_the_dispatch_and_the_subject(self):
+        self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}
+        self.gh_runner.views = [check_view("failure", "Join the tailnet")]
+        code, result = self.check(branch="trunk")
+        dispatch = next(a for a, _ in self.gh_runner.calls if a[:2] == ["workflow", "run"])
+        self.assertEqual(dispatch[dispatch.index("--ref") + 1], "trunk")
+        self.assertEqual((code, result["failed_step"]), (1, "Join the tailnet"))
+        self.assertEqual(result["subject_expected"], "repo:Example@1/orders@2:ref:refs/heads/trunk")
 
     def test_a_tailscale_refusal_names_the_subject_github_presents(self):
         self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}
