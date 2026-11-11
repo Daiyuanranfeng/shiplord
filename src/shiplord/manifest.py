@@ -20,6 +20,8 @@ _NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 GENERIC_DOCKER_FEATURE = "docker_generic_v1"
+DEFAULT_DEPLOYMENT_BRANCH = "main"
+MAX_READINESS_SECONDS = 900  # the ceiling for deploy.readiness_timeout_seconds
 
 
 def _table(value: object, name: str, allowed: set[str]) -> dict:
@@ -48,6 +50,21 @@ def validate_app_name(value: object) -> str:
     if len(name) > 48 or not _NAME.fullmatch(name):
         raise ManifestError("name must be a lowercase application name")
     return name
+
+
+def validate_deployment_branch(value: object) -> str:
+    """Validate the branch releases deploy from, with git's own restrictions where TOML can express them."""
+    branch = _string(value, "github.deployment_branch")
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or any(x in branch for x in ("..", "//", "@{"))
+            or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") for part in branch.split("/"))):
+        raise ManifestError("github.deployment_branch must be a valid branch name")
+    return branch
+
+
+def configured_branch(manifest: dict) -> str:
+    """The branch releases deploy from: ``[github] deployment_branch``, or main when it is not set."""
+    github = manifest.get("github")
+    return github.get("deployment_branch", DEFAULT_DEPLOYMENT_BRANCH) if isinstance(github, dict) else DEFAULT_DEPLOYMENT_BRANCH
 
 
 def _hostname(value: object, name: str) -> str:
@@ -149,7 +166,8 @@ def validate_manifest(raw: dict) -> dict:
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases",
                                                    "shutdown_timeout_seconds", "shutdown_timeout_action"})
-    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 900)
+    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1,
+                       MAX_READINESS_SECONDS)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
@@ -175,8 +193,6 @@ def validate_manifest(raw: dict) -> dict:
         repository = _string(github.get("repository"), "github.repository")
         if not _REPOSITORY.fullmatch(repository) or any(part in {".", ".."} or part.startswith("-") for part in repository.split("/")):
             raise ManifestError("github.repository must be an owner/repository pair")
-        branch = _string(github.get("deployment_branch"), "github.deployment_branch")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or any(x in branch for x in ("..", "//", "@{")) or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") for part in branch.split("/")):
-            raise ManifestError("github.deployment_branch must be a valid branch name")
+        branch = validate_deployment_branch(github.get("deployment_branch", DEFAULT_DEPLOYMENT_BRANCH))
         result["github"] = {"repository": repository, "deployment_branch": branch}
     return result

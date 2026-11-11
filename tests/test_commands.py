@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -19,7 +20,10 @@ from shiplord.client import AdminClient, ClientError, HelperClient  # noqa: E402
 from shiplord.commands import CommandError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
+from shiplord.protocol import IncompatibleProtocol  # noqa: E402
 from shiplord.runtime import RuntimeFailure  # noqa: E402
+from shiplord.servers import ServerError  # noqa: E402
+from shiplord.transport import TransportError  # noqa: E402
 from shiplord.worker import run_job  # noqa: E402
 from test_client import ClientTestCase, FakeSsh, frame, ok  # noqa: E402
 from test_provision import ed25519  # noqa: E402
@@ -122,6 +126,37 @@ class AdminCommandTests(unittest.TestCase):
         self.assertEqual((code, output["deploy_login"]), (0, "ship-orders@server.example.com"))
         self.assertIn("DNS", output["next"])
 
+    def test_provision_update_sends_the_flag_and_explains_what_was_kept(self):
+        result = {"application_id": "orders", "deployment_user": "ship-orders", "host_port": 20000,
+                  "api_domain": "new.example.com", "runtime": "docker", "max_memory_mb": 8192,
+                  "key_fingerprint": "SHA256:x", "created": {}, "updated": True, "route_changed": True,
+                  "changes": {"api_domain": {"from": "orders.example.com", "to": "new.example.com"},
+                              "max_memory_mb": {"from": 4096, "to": 8192}}}
+        github = {"github": {"repository": "Example/Orders", "deployment_branch": "main"}}
+        ssh = FakeSsh((ok(result), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertTrue(sent["arguments"]["update"])
+        self.assertEqual((code, output["updated"]), (0, True))
+        self.assertIn("public route was moved", output["next"])
+        self.assertIn("DNS", output["next"])
+
+        memory_only = dict(result, api_domain="orders.example.com", route_changed=False,
+                           changes={"max_memory_mb": {"from": 4096, "to": 8192}})
+        ssh = FakeSsh((ok(memory_only), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        self.assertIn("memory ceiling", output["next"])
+        self.assertNotIn("route", output["next"])
+
+        unchanged = dict(result, api_domain="orders.example.com", route_changed=False, updated=False, changes={})
+        ssh = FakeSsh((ok(unchanged), b"", 0))
+        code, output = commands.provision_application(
+            manifest(**github), AdminClient("appuser@server.example.com", runner=ssh), public_key=self.key, update=True)
+        self.assertEqual((code, output["updated"]), (0, False))
+        self.assertIn("nothing changed", output["next"])
+
     def test_empty_or_invalid_environment_input_is_refused_before_any_connection(self):
         ssh = FakeSsh()
         client = AdminClient("a@h", runner=ssh)
@@ -131,13 +166,24 @@ class AdminCommandTests(unittest.TestCase):
                 commands.set_environment(manifest(), client, "set", text)
         self.assertEqual(ssh.calls, [])
 
+    def test_deprovision_sends_the_application_and_only_the_retire_flag_when_asked(self):
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                ssh = FakeSsh((ok({"removed": {"registration": True}}), b"", 0))
+                code, output = commands.deprovision_application("orders", AdminClient("a@h", runner=ssh), retire=retire)
+                sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+                self.assertEqual((sent["action"], sent["application_id"], sent["arguments"]),
+                                 ("deprovision", "orders", arguments))
+                self.assertEqual((code, output["ok"]), (0, True))
+                self.assertIn("data", output["note"])
+
     def test_environment_values_travel_in_the_frame_and_never_come_back(self):
         secret = "postgres://u:s3cr3t@db/x"
         ssh = FakeSsh((ok({"keys": ["DATABASE_URL"], "changed": True}), b"", 0))
         code, output = commands.set_environment(manifest(), AdminClient("a@h", runner=ssh), "set", f"DATABASE_URL={secret}\n")
         self.assertIn(secret.encode(), ssh.calls[0][1])
         self.assertNotIn("s3cr3t", str(ssh.calls[0][0]) + str(output))
-        self.assertIn("next time a release starts", output["note"])
+        self.assertIn("shiplord restart", output["note"])
         _, listing = commands.set_environment(manifest(), AdminClient("a@h", runner=FakeSsh((ok({"keys": ["A"]}), b"", 0))), "keys")
         self.assertNotIn("note", listing)
 
@@ -176,6 +222,39 @@ class AdminCommandTests(unittest.TestCase):
                     self.assertRaisesRegex(CommandError, expected) as caught:
                 commands.edit_environment(manifest(), client, *operation, **arguments)
             self.assertNotIn("s3cr3t", str(caught.exception))
+
+    def test_environment_diff_reports_only_key_name_changes(self):
+        secret, other = "postgres://u:first-secret@db/x", "postgres://u:second-secret@db/y"
+        ssh = FakeSsh((ok({"keys": ["KEEP", "REMOVE"]}), b"", 0))
+        code, output = commands.diff_environment(manifest(), AdminClient("a@h", runner=ssh),
+                                                 f"KEEP={other}\nADD={secret}\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(output["added"], ["ADD"])
+        self.assertEqual(output["removed"], ["REMOVE"])
+        self.assertEqual(output["operation"], "diff")
+        self.assertIn("key names only", output["note"].lower())
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["action"], "environment")
+        self.assertEqual(sent["arguments"], {"operation": "keys"})
+        self.assertNotIn(secret.encode(), ssh.calls[0][1])
+        self.assertNotIn(other.encode(), ssh.calls[0][1])
+        self.assertNotIn("secret", str(output).lower())
+
+    def test_environment_diff_with_only_a_value_change_is_empty(self):
+        ssh = FakeSsh((ok({"keys": ["KEEP"]}), b"", 0))
+        code, output = commands.diff_environment(manifest(), AdminClient("a@h", runner=ssh), "KEEP=another-secret\n")
+        self.assertEqual((code, output["added"], output["removed"]), (0, [], []))
+        self.assertEqual(read_frame(io.BytesIO(ssh.calls[0][1]))["arguments"], {"operation": "keys"})
+        self.assertNotIn("another-secret", str(output))
+
+    def test_invalid_environment_diff_input_is_refused_before_any_connection(self):
+        ssh = FakeSsh()
+        client = AdminClient("a@h", runner=ssh)
+        for text, expected in (("", "no variables"), ("# only a comment\n\n", "no variables"),
+                               ("PORT=1\n", "managed by Shiplord"), ("BAD LINE\n", "not KEY=VALUE"),
+                               ("A=1\nA=2\n", "set more than once")):
+            with self.subTest(text=text), self.assertRaisesRegex(CommandError, expected):
+                commands.diff_environment(manifest(), client, text)
         self.assertEqual(ssh.calls, [])
 
 
@@ -262,6 +341,51 @@ class DeployCommandTests(ClientTestCase):
                 self.deploy(**kwargs)
         self.assertEqual(self.commands, [])
 
+    def test_a_timed_out_deploy_reports_a_copyable_lookup_command(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+        seen = {}
+        ticks = iter(range(0, 1000, 10))
+
+        def wait(client, job_id, **options):
+            seen.update(options)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda seconds: None,
+                                                    clock=lambda: next(ticks)))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        with self.assertRaises(ClientError) as caught:
+            commands.deploy_application(manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000,
+                                        request_id="req-1", timeout=25)
+        lookup = "shiplord status orders --server production --job-id req-1"
+        self.assertEqual(seen["lookup_command"], lookup)
+        self.assertIn(lookup, str(caught.exception))
+        self.assertIn("may still be running", str(caught.exception))
+
+    def test_a_finished_rollback_can_be_looked_up_with_a_zero_exit_code(self):
+        self.deploy()
+        from fakes import record
+        from shiplord.runtime import release_id
+        self.runtime.start_errors[release_id(record(commit="c", image="d", sequence=1001))] = RuntimeFailure("boom", "start")
+        code, result = self.deploy(request_id="req-2", image="ghcr.io/example/orders@sha256:" + "d" * 64,
+                                   commit=OTHER, sequence=1001)
+        self.assertEqual((code, result["status"]), (5, "rolled_back"))
+        code, status = commands.application_status(self.client, "req-2")
+        self.assertEqual((code, status["job"]["state"], status["job"]["outcome"]["status"],
+                          status["job"]["outcome"]["exit_code"]), (0, "finished", "rolled_back", 5))
+
+
+def begin_unfinished_transaction(case):
+    """Leave the journal of an interrupted deployment behind, as a killed worker would."""
+    from fakes import record
+    from shiplord.release_state import HostLock, ReleaseState
+    var_fd = os.open(case.layout.var, os.O_RDONLY | os.O_DIRECTORY)
+    state_fd = os.open(case.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
+    case.addCleanup(os.close, var_fd)
+    case.addCleanup(os.close, state_fd)
+    lock = HostLock(var_fd)
+    with lock.acquire():
+        ReleaseState("orders", state_fd, lock).begin("req-x", record())
+
 
 class QueryCommandTests(ClientTestCase):
     def test_plan_status_and_logs_use_read_only_actions(self):
@@ -275,6 +399,27 @@ class QueryCommandTests(ClientTestCase):
                 commands.application_logs(self.client, tail)
         code, status = commands.application_status(self.client)
         self.assertEqual((code, status["application"]["current"], status["job"]), (0, None, None))
+
+    def test_job_lookup_is_read_only_and_reports_the_recorded_outcome(self):
+        commit, arguments = self.deploy_arguments()
+        self.client.call("deploy", request_id="req-1", commit=commit, arguments=arguments)
+        launched = len(self.launcher.launched)
+        code, status = commands.application_status(self.client, "req-1")
+        self.assertEqual((code, status["job"]["state"], status["job"]["phase"]), (0, "queued", "queued"))
+        self.assertEqual(len(self.launcher.launched), launched)  # a lookup starts no new work
+        run_job(self.services, "orders", "req-1")
+        code, status = commands.application_status(self.client, "req-1")
+        self.assertEqual((code, status["job"]["state"], status["job"]["outcome"]["status"]),
+                         (0, "finished", "succeeded"))
+
+    def test_job_lookup_reports_an_unknown_job_and_rejects_a_malformed_id(self):
+        code, status = commands.application_status(self.client, "missing")
+        self.assertEqual((code, status["job"]), (0, None))
+        before = len(self.commands)
+        with self.assertRaises(CommandError) as malformed:
+            commands.application_status(self.client, "../etc/passwd")
+        self.assertEqual(malformed.exception.code, 2)
+        self.assertEqual(len(self.commands), before)  # rejected before any remote request
 
     def test_rollback_and_recover_run_as_jobs_and_return_their_exit_codes(self):
         import shiplord.client as client_module
@@ -292,6 +437,113 @@ class QueryCommandTests(ClientTestCase):
         code, result = commands.run_job_command(manifest(), self.client, "rollback", request_id="rb-1")
         self.assertEqual((code, result["ok"], result["error"]), (1, False, "no_previous_release"))
         self.assertEqual(calls, ["rc-1", "rb-1"])
+
+    def recover_job(self, manifest_value, request_id):
+        """Run the real recovery job through the helper, as a polling client would."""
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        return commands.run_job_command(manifest_value, self.client, "recover", request_id=request_id)
+
+    def test_an_interrupted_deployment_recovers_without_a_local_manifest(self):
+        begin_unfinished_transaction(self)
+        code, result = self.recover_job(None, "rc-explicit")
+        self.assertEqual((code, result["ok"], result["status"]), (0, True, "recovered"))
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.runtime.calls, [("stop",)])
+
+    def test_a_recovery_that_cannot_reconcile_keeps_its_exit_code_and_journal(self):
+        begin_unfinished_transaction(self)
+        self.routes_reload_failure()
+        code, result = self.recover_job(None, "rc-failed")
+        self.assertEqual((code, result["ok"], result["status"]), (6, False, "intervention_required"))
+        self.assertIsNotNone(self.state.read_journal())
+
+    def routes_reload_failure(self):
+        self.caddy.fail_reload.add(self.caddy.reload_calls + 1)
+
+    def test_a_named_recovery_without_a_manifest_waits_for_every_runtime(self):
+        native_max = commands.job_timeout({"runtime": "native", "deploy": {"readiness_timeout_seconds": 900}})
+        self.assertGreaterEqual(commands.explicit_job_timeout(), commands.job_timeout({"runtime": "docker"}))
+        self.assertGreaterEqual(commands.explicit_job_timeout(), native_max)
+        outcome = {"status": "recovered", "exit_code": 0, "detail": {}}
+        with patch("shiplord.commands.submit_and_wait", return_value=outcome) as submit:
+            code, result = commands.run_job_command(None, self.client, "recover", request_id="rc-explicit")
+        self.assertEqual((code, result["ok"], result["status"]), (0, True, "recovered"))
+        self.assertEqual(submit.call_args.kwargs["timeout"], commands.explicit_job_timeout())
+
+    def test_a_manifest_recovery_keeps_the_manifest_wait_bound(self):
+        outcome = {"status": "nothing_to_recover", "exit_code": 0, "detail": {}}
+        with patch("shiplord.commands.submit_and_wait", return_value=outcome) as submit:
+            code, result = commands.run_job_command(manifest(), self.client, "recover", request_id="rc-manifest")
+        self.assertEqual((code, result["status"]), (0, "nothing_to_recover"))
+        self.assertEqual(submit.call_args.kwargs["timeout"], commands.job_timeout(manifest()))
+
+    def test_a_restart_runs_as_a_job_and_reports_the_unchanged_release(self):
+        import shiplord.client as client_module
+
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        code, result = commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+        self.assertEqual((code, result["status"], result["exit_code"]), (0, "succeeded", 0))
+        self.assertEqual(result["release"]["commit"], COMMIT)
+        self.assertEqual(self.state.read_state()["current"]["commit"], COMMIT)
+
+    def test_a_restart_with_nothing_deployed_returns_exit_two_without_a_job(self):
+        code, result = commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+        self.assertEqual((code, result["status"], result["error"]), (2, "rejected", "nothing_deployed"))
+        self.assertIn("nothing to restart", result["message"])
+        self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
+        self.assertEqual(self.launcher.launched, [])
+
+    def test_restart_requires_the_helper_capability_before_any_job(self):
+        old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",
+               "actions": ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
+                           "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]}
+        with patch.object(self.client, "call", return_value=old) as call:
+            with self.assertRaises(CommandError) as caught:
+                commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+            self.assertEqual(caught.exception.code, 4)
+            self.assertIn("does not support restart", str(caught.exception))
+            self.assertIn("shiplord server bootstrap", str(caught.exception))
+            self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])  # no job was submitted
+
+    def test_force_stop_requires_the_helper_capability_before_any_job(self):
+        old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",
+               "actions": ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
+                           "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]}
+        with patch.object(self.client, "call", return_value=old) as call:
+            with self.assertRaisesRegex(CommandError, "does not support --force-stop"):
+                commands.run_job_command(manifest(), self.client, "recover", force_stop=True)
+            self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])
+
+    def test_force_stop_is_recorded_in_the_recovery_outcome(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        code, result = commands.run_job_command(manifest(), self.client, "recover", request_id="rc-force",
+                                                force_stop=True)
+        self.assertEqual((code, result["status"]), (0, "recovered"))
+        self.assertTrue(result["forced_stop"]["forced"])
+        self.assertEqual(result["forced_stop"]["signal"], "SIGKILL")
+        self.assertFalse(result["running"])
 
 
 class DoctorTests(ClientTestCase):
@@ -324,15 +576,95 @@ class DoctorTests(ClientTestCase):
         self.assertEqual(result["checks"]["application"]["hint"], "run `shiplord recover`")
 
     def state_begin(self):
-        from fakes import record
-        from shiplord.release_state import HostLock, ReleaseState
-        var_fd = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
-        state_fd = os.open(self.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
-        self.addCleanup(os.close, var_fd)
-        self.addCleanup(os.close, state_fd)
-        lock = HostLock(var_fd)
-        with lock.acquire():
-            ReleaseState("orders", state_fd, lock).begin("req-x", record())
+        begin_unfinished_transaction(self)
+
+
+class InventoryCompatibilityTests(unittest.TestCase):
+    def test_only_stable_releases_older_than_the_minimum_are_confirmed_unsupported(self):
+        cases = {"0.0.9": "unsupported", "0.1.99": "unsupported", "0.2.0": "supported",
+                 "0.10.0": "supported", "1.0.0": "supported", "0.2.0+abc.1": "supported",
+                 "0.2.0-rc1": "unknown", "01.2.0": "unknown", "v0.2.0": "unknown", "": "unknown",
+                 None: "unknown", 2: "unknown"}
+        for version, expected in cases.items():
+            with self.subTest(version=version):
+                self.assertEqual(commands.inventory_support(version), expected)
+
+    def test_upgrade_guidance_names_only_the_confirmed_old_helper(self):
+        self.assertIsNone(commands.inventory_upgrade("alpha", "0.2.0"))
+        self.assertIsNone(commands.inventory_upgrade("alpha", "0.2.0-rc1"))
+        self.assertIsNone(commands.inventory_upgrade("alpha", None))
+        self.assertEqual(commands.inventory_upgrade("alpha", "0.1.0"),
+                         {"error": "App inventory requires helper 0.2.0 or later.",
+                          "error_code": "helper_upgrade_required", "helper_version": "0.1.0",
+                          "minimum_helper_version": "0.2.0",
+                          "upgrade_command": "shiplord server bootstrap alpha"})
+
+
+class FleetDoctorTests(unittest.TestCase):
+    SERVERS = [{"alias": "alpha", "ssh": "admin@alpha.example.com"},
+               {"alias": "beta", "ssh": "admin@beta.example.com"},
+               {"alias": "gamma", "ssh": "admin@gamma.example.com"}]
+
+    def probe(self, versions=None, failures=None, calls=None):
+        versions, failures = versions or {}, failures or {}
+
+        def run(target, timeout):
+            if calls is not None:
+                calls.append((target, timeout))
+            alias = target.split("@")[1].split(".")[0]
+            if alias in failures:
+                raise failures[alias]
+            return {"helper_version": versions.get(alias, "0.2.0")}
+        return run
+
+    def test_a_mixed_fleet_reports_every_alias_and_keeps_probing(self):
+        calls = []
+        probe = self.probe(versions={"gamma": "0.1.0"}, failures={"beta": TransportError("timed out")}, calls=calls)
+        code, result = commands.doctor_all_servers(self.SERVERS, probe=probe)
+        self.assertEqual(code, 3)
+        self.assertEqual((result["ok"], result["partial"]), (False, True))
+        self.assertEqual([item["server"] for item in result["servers"]], ["alpha", "beta", "gamma"])
+        self.assertEqual(len(calls), 3)  # a failed probe never stops the sweep
+        self.assertTrue(all(timeout == commands.FLEET_PROBE_TIMEOUT_SECONDS for _, timeout in calls))
+        alpha, beta, gamma = result["servers"]
+        self.assertEqual((alpha["ok"], alpha["reachable"], alpha["inventory_support"]), (True, True, "supported"))
+        self.assertEqual(alpha["helper_version"], "0.2.0")
+        self.assertNotIn("upgrade_command", alpha)
+        self.assertEqual((beta["ok"], beta["reachable"], beta["inventory_support"]), (False, False, "unknown"))
+        self.assertNotIn("upgrade_command", beta)
+        self.assertEqual((gamma["ok"], gamma["reachable"], gamma["inventory_support"]), (False, True, "unsupported"))
+        self.assertEqual(gamma["error_code"], "helper_upgrade_required")
+        self.assertEqual(gamma["upgrade_command"], "shiplord server bootstrap gamma")
+
+    def test_a_complete_compatible_fleet_exits_zero(self):
+        code, result = commands.doctor_all_servers(self.SERVERS, probe=self.probe())
+        self.assertEqual((code, result["ok"], result["partial"]), (0, True, False))
+        self.assertTrue(all(item["inventory_support"] == "supported" for item in result["servers"]))
+
+    def test_an_incompatible_protocol_is_reachable_but_not_confirmed_old(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(failures={"alpha": IncompatibleProtocol("unsupported version")}))
+        self.assertEqual(code, 3)
+        item = result["servers"][0]
+        self.assertEqual((item["reachable"], item["inventory_support"]), (True, "unknown"))
+        self.assertEqual(item["error_code"], "incompatible_protocol")
+        self.assertIsNone(item["helper_version"])
+        self.assertNotIn("upgrade_command", item)
+
+    def test_an_unreadable_registration_is_unreachable_not_old(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(failures={"alpha": ServerError("unreadable")}))
+        self.assertEqual(code, 3)
+        self.assertEqual((result["servers"][0]["reachable"], result["servers"][0]["inventory_support"]),
+                         (False, "unknown"))
+        self.assertNotIn("upgrade_command", result["servers"][0])
+
+    def test_an_unorderable_version_is_not_reported_as_unsupported(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(versions={"alpha": "0.2.0-rc1"}))
+        item = result["servers"][0]
+        self.assertEqual((code, item["ok"], item["inventory_support"]), (0, True, "unknown"))
+        self.assertNotIn("upgrade_command", item)
 
 
 def tls_server(cert: Path, key: Path, statuses: list[int]) -> int:

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-10
+goal: A redeploy of the release that is already current never replaces the real
+  rollback target or drops its artifact
