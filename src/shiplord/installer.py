@@ -3,26 +3,33 @@
 Installs the helper code under a content-addressed version directory, switches
 ``current`` to it atomically, creates the managed directories, makes Caddy import
 the managed route directory, and installs an sshd drop-in that confines
-deployment accounts to the forced-command dispatcher. Re-running changes nothing
+deployment accounts to the forced-command dispatcher. Before the drop-in is
+written, the host's sshd unit is discovered and the main sshd configuration is
+checked to make sure it reads the drop-in directory. Re-running changes nothing
 when everything is already in place.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import hashlib
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
 
 from . import __version__
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .release_state import HostLock
-from .routing import CaddyCommands, RouteManager, RoutingError
-from .system import CommandError, System
+from .routing import CaddyCommands, RouteManager, RoutingError, caddy_binary, probe_caddy
+from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
-CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
-                            "setup.py", "tailscale.py", "template.py", "transport.py", "workflow.py"})
+CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py",
+                            "output.py", "servers.py", "setup.py", "tailscale.py", "template.py", "transport.py",
+                            "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
@@ -35,10 +42,14 @@ LAUNCHER_TEMPLATE = (
     "from {module} import main\n\nmain()\n"
 )
 PLACEHOLDER = b"# Managed by Shiplord. Generated route files live in this directory.\n"
+DEPLOY_GROUP = "shiplord-deploy"  # the only accounts the sshd drop-in matches; provisioning adds each new one
+DEPLOY_MARKER = "shiplord-deploy"  # prefix of the passwd comment that marks an account as a deployment account
 SSHD_DROPIN = """\
 # Managed by Shiplord. Confines deployment accounts to the forced-command dispatcher.
-Match User ship-*
+Match Group {group}
     AuthorizedKeysFile {keys}/%u
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
     AuthenticationMethods publickey
     PasswordAuthentication no
     KbdInteractiveAuthentication no
@@ -52,6 +63,15 @@ Match User ship-*
 """
 SSHD = "/usr/sbin/sshd"
 SYSTEMCTL = "/usr/bin/systemctl"
+SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
+SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
+SSHD_INCLUDE_DEPTH = 8
+SSHD_CONFIG = "sshd_config"
+GROUPADD, GETENT, USERMOD = "/usr/sbin/groupadd", "/usr/bin/getent", "/usr/sbin/usermod"
+ACCOUNT_DATABASE_BYTES = 1 << 20  # room for a whole passwd or group dump; a cut-short one is refused, not guessed
+SERVER_PYTHON = "/usr/bin/python3"  # the interpreter the installed launchers run, and the one bootstrap checks
+REQUIRED_PYTHON = (3, 11)  # manifest.py imports tomllib, which exists only from Python 3.11
+PYTHON_PROBE = "import sys;print(sys.version_info[0],sys.version_info[1])"  # two integers, whatever the locale
 
 
 class BootstrapError(Exception):
@@ -61,6 +81,20 @@ class BootstrapError(Exception):
 def helper_modules(source: Path) -> list[str]:
     """Modules installed on the server: everything except client-only modules."""
     return sorted(path.name for path in source.glob("*.py") if path.name not in CLIENT_MODULES)
+
+
+def python_version(answer: str) -> tuple[int, int] | None:
+    """The major and minor version a ``PYTHON_PROBE`` answer reports, or None when it reports none."""
+    fields = answer.split()
+    if len(fields) != 2 or not all(field.isdigit() and len(field) <= 2 for field in fields):
+        return None
+    return int(fields[0]), int(fields[1])
+
+
+def python_supported(answer: str) -> bool:
+    """Whether the interpreter that answered ``PYTHON_PROBE`` is new enough to run the helper."""
+    version = python_version(answer)
+    return version is not None and version >= REQUIRED_PYTHON
 
 
 def _chown_root(path: Path | int) -> None:
@@ -173,14 +207,189 @@ def _install_wrappers(layout: Layout) -> bool:
                 layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
     for target, launcher in wrappers.items():
         _ensure_dir(target.parent, 0o755)
-        text = f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B {layout.lib}/current/{launcher} "$@"\n'
+        text = f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'
         changed |= _write_atomic(target, text.encode(), 0o755)
     return changed
 
 
-def _install_sshd(layout: Layout, system: System) -> bool:
+def _installed_sshd_units(system: System) -> set[str]:
+    """The sshd unit files systemd knows about; empty when none are installed."""
+    result = system.run([SYSTEMCTL, "list-unit-files", "--no-legend", "--no-pager",
+                         *SSHD_SERVICE_UNITS, *SSHD_SOCKET_UNITS])
+    if result.code != 0:
+        return set()
+    installed = set()
+    for line in result.output.splitlines():
+        fields = line.split()
+        if fields and fields[0] in SSHD_SERVICE_UNITS + SSHD_SOCKET_UNITS:
+            installed.add(fields[0])
+    return installed
+
+
+def sshd_units(system: System) -> tuple[str | None, str | None]:
+    """Return the sshd service unit and its socket unit installed on this host, if any."""
+    installed = _installed_sshd_units(system)
+    service = next((unit for unit in SSHD_SERVICE_UNITS if unit in installed), None)
+    socket = next((unit for unit in SSHD_SOCKET_UNITS if unit in installed), None)
+    if service is not None and service.replace(".service", ".socket") in installed:
+        socket = service.replace(".service", ".socket")
+    return service, socket
+
+
+def _unit_active(system: System, unit: str) -> bool | None:
+    """Whether systemd reports ``unit`` active; None when that cannot be determined."""
+    try:
+        return system.run([SYSTEMCTL, "is-active", "--quiet", unit]).code == 0
+    except CommandError:
+        return None
+
+
+def _include_patterns(text: str) -> list[str]:
+    """The arguments of every ``Include`` directive in an sshd configuration file."""
+    patterns = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # sshd_config separates a keyword from its arguments with a space, a tab, or "="; splitting on a
+        # space alone would miss a tab-separated Include, and on "=" alone would truncate a path containing one.
+        match = re.fullmatch(r"([A-Za-z]+)(?:\s*=\s*|\s+)(.*)", stripped)
+        if match is None:
+            continue
+        keyword, arguments = match.groups()
+        if keyword.lower() == "include":
+            patterns.extend(argument.strip('"') for argument in arguments.split())
+    return patterns
+
+
+def _pattern_covers(pattern: str, path: Path) -> bool:
+    """Whether a glob pattern covers ``path``; a wildcard does not cross a path separator."""
+    parts = Path(pattern).parts
+    return len(parts) == len(path.parts) and all(
+        fnmatch.fnmatchcase(actual, expected) for actual, expected in zip(path.parts, parts))
+
+
+def _includes(path: Path, target: Path, base: Path, seen: set[Path], depth: int) -> bool:
+    """Whether ``path``, or a file it includes, reads ``target``."""
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for pattern in _include_patterns(text):
+        candidate = Path(pattern) if Path(pattern).is_absolute() else base / pattern
+        if _pattern_covers(str(candidate), target):
+            return True
+        if depth <= 0:
+            continue
+        for match in sorted(glob.glob(str(candidate))):
+            included = Path(match)
+            if included in seen:
+                continue
+            seen.add(included)
+            if _includes(included, target, base, seen, depth - 1):
+                return True
+    return False
+
+
+def sshd_dropin_included(layout: Layout) -> bool:
+    """Whether the main sshd configuration makes sshd read the Shiplord drop-in file."""
+    dropin = layout.sshd_dropin
+    config = dropin.parent.parent / SSHD_CONFIG
+    return _includes(config, dropin, config.parent, {config}, SSHD_INCLUDE_DEPTH)
+
+
+def _require_sshd_include(layout: Layout) -> None:
+    if sshd_dropin_included(layout):
+        return
+    raise BootstrapError(
+        "the main sshd configuration does not include the Shiplord drop-in: "
+        f"add `Include {layout.sshd_dropin.parent.name}/*.conf` and re-run bootstrap")
+
+
+def _sshd_preflight(layout: Layout, system: System) -> tuple[str, str | None]:
+    """Refuse a host whose sshd policy cannot be verified, before anything is written."""
+    _require_sshd_include(layout)
+    try:
+        unit, socket = sshd_units(system)
+    except CommandError:
+        raise BootstrapError("could not run sshd checks") from None
+    if unit is None:
+        raise BootstrapError("could not find the sshd service unit (looked for ssh.service and sshd.service)")
+    return unit, socket
+
+
+def _account_database(system: System, *arguments: str) -> CommandResult:
+    """A ``getent`` answer, read with room for a whole listing rather than the default short window."""
+    try:
+        return system.run([GETENT, *arguments], max_output=ACCOUNT_DATABASE_BYTES)
+    except CommandError:
+        raise BootstrapError("could not read the account database") from None
+
+
+def _untruncated(result: CommandResult) -> str:
+    """The output of a listing, refusing one that was cut short: a missed account would stay unconfined."""
+    if result.output.startswith(TRUNCATION_MARKER):
+        raise BootstrapError("the account database is too large to inspect")
+    return result.output
+
+
+def _group_members(system: System, group: str) -> set[str] | None:
+    """The members of ``group``, or None when the group does not exist."""
+    result = _account_database(system, "group", group)
+    if result.code != 0:
+        return None
+    fields = _untruncated(result).strip().split(":")
+    if len(fields) < 4 or fields[0] != group:
+        raise BootstrapError("could not read the account database")
+    return {name for name in fields[3].split(",") if name}
+
+
+def _deployment_accounts(system: System) -> list[str]:
+    """Every account this host marks as a Shiplord deployment account, by its passwd comment."""
+    result = _account_database(system, "passwd")
+    if result.code != 0:
+        raise BootstrapError("could not read the account database")
+    accounts = []
+    for line in _untruncated(result).splitlines():
+        fields = line.split(":")
+        if len(fields) == 7 and fields[4].startswith(DEPLOY_MARKER + "-"):
+            accounts.append(fields[0])
+    return accounts
+
+
+def _ensure_deployment_group(system: System) -> bool:
+    """Create the group the sshd policy matches on and put every existing deployment account in it.
+
+    The policy is replaced as a whole, so an account created under an earlier policy would otherwise fall back to
+    the host's default sshd policy. This runs before the drop-in is written and reloaded.
+    """
+    created = False
+    members = _group_members(system, DEPLOY_GROUP)
+    if members is None:
+        try:
+            result = system.run([GROUPADD, "--system", DEPLOY_GROUP])
+        except CommandError:
+            raise BootstrapError("could not create the deployment group") from None
+        if result.code != 0:
+            raise BootstrapError("could not create the deployment group")
+        created, members = True, set()
+    changed = False
+    for account in _deployment_accounts(system):
+        if account in members:
+            continue
+        try:
+            result = system.run([USERMOD, "--append", "--groups", DEPLOY_GROUP, account])
+        except CommandError:
+            raise BootstrapError("could not add a deployment account to the deployment group") from None
+        if result.code != 0:
+            raise BootstrapError("could not add a deployment account to the deployment group")
+        changed = True
+    return created or changed
+
+
+def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None) -> bool:
     path = layout.sshd_dropin
-    desired = SSHD_DROPIN.format(keys=layout.authorized_keys).encode()
+    desired = SSHD_DROPIN.format(keys=layout.authorized_keys, group=DEPLOY_GROUP).encode()
     _ensure_dir(path.parent, 0o755)
     previous = path.read_bytes() if path.exists() else None
     if previous == desired:
@@ -190,9 +399,12 @@ def _install_sshd(layout: Layout, system: System) -> bool:
         result = system.run([SSHD, "-t"])
         if result.code != 0:
             raise BootstrapError("sshd rejected the Shiplord configuration: " + (result.output.strip() or "no output"))
-        result = system.run([SYSTEMCTL, "try-reload-or-restart", "ssh.service"])
-        if result.code != 0:
-            raise BootstrapError("sshd could not reload the Shiplord configuration: " + (result.output.strip() or "no output"))
+        socket_activated = (socket is not None and _unit_active(system, socket) is True
+                            and _unit_active(system, unit) is False)
+        if not socket_activated:
+            result = system.run([SYSTEMCTL, "try-reload-or-restart", unit])
+            if result.code != 0:
+                raise BootstrapError(f"sshd could not reload {unit}: " + (result.output.strip() or "no output"))
     except (BootstrapError, CommandError) as error:
         if previous is None:
             path.unlink(missing_ok=True)
@@ -204,21 +416,44 @@ def _install_sshd(layout: Layout, system: System) -> bool:
     return True
 
 
+def _caddy_binary(caddy: CaddyCommands) -> str:
+    """The Caddy path a refusal names: the runner's own when it has one, else the documented resolution."""
+    configured = getattr(caddy, "caddy", None)
+    return configured if isinstance(configured, str) and configured else caddy_binary()
+
+
+def _caddy_preflight(caddy: CaddyCommands) -> None:
+    """Refuse a host whose Caddy cannot run, before any Shiplord directory or helper is written."""
+    try:
+        probe_caddy(caddy)
+    except RoutingError as error:
+        if error.kind == "unavailable":
+            raise BootstrapError(
+                "Caddy is not installed or cannot be started: install the caddy package or put the binary at "
+                f"{_caddy_binary(caddy)}") from None
+        raise BootstrapError(
+            f"Caddy rejected a minimal configuration ({error.kind}): check the Caddy installation") from None
+
+
 def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands, *,
               lock_timeout: float = 20) -> dict:
-    """Install or update the host. Safe to repeat; returns which steps changed something."""
+    """Install or update the host, refusing an unsupported operating system first.
+
+    Safe to repeat; returns which steps changed something.
+    """
     if layout.prefix == Path("/") and os.geteuid() != 0:
         raise BootstrapError("bootstrap must run as root")
+    supported = check_os(layout.path(OS_RELEASE))
+    if not supported["ok"]:
+        raise BootstrapError(supported["message"])
+    _caddy_preflight(caddy)
+    unit, socket = _sshd_preflight(layout, system)
     changed: dict[str, bool] = {}
     for directory, mode in ((layout.path("/etc/shiplord"), 0o755), (layout.registrations, 0o700),
                             (layout.environments, 0o700), (layout.authorized_keys, 0o755),
                             (layout.var, 0o755), (layout.app_state, 0o700), (layout.jobs, 0o700),
                             (layout.data, 0o755), (layout.releases, 0o755), (layout.lib, 0o755)):
         _ensure_dir(directory, mode)
-    name, files = _build_payload(source)
-    changed["code"] = _install_version(layout, name, files)
-    changed["current"] = _switch_current(layout, name)
-    changed["wrappers"] = _install_wrappers(layout)
 
     descriptor = os.open(layout.var, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -233,7 +468,12 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                 changed["caddy_import"] = RouteManager(layout.caddy_root, lock, caddy).ensure_import().changed
             except RoutingError as error:
                 raise BootstrapError(f"Caddy integration failed ({error.kind}): {error}") from None
-            changed["sshd"] = _install_sshd(layout, system)
+            name, files = _build_payload(source)
+            changed["code"] = _install_version(layout, name, files)
+            changed["current"] = _switch_current(layout, name)
+            changed["wrappers"] = _install_wrappers(layout)
+            changed["sshd_group"] = _ensure_deployment_group(system)
+            changed["sshd"] = _install_sshd(layout, system, unit, socket)
     finally:
         os.close(descriptor)
     return {"version": name, "changed": changed}

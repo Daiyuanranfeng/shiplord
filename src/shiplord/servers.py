@@ -9,12 +9,22 @@ import re
 import secrets
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .manifest import validate_app_name
+from .manifest import ManifestError, load_manifest, validate_app_name
 from .protocol import _invalid_constant, _unique_keys
+from .system import sanitize
+
+STDERR_LIMIT = 4096
+_HOST_TRUST_LINE = re.compile(
+    r"(?:Host key verification failed\.|"
+    r"No \S+ host key is known for \S+ and you have requested strict checking\.|"
+    r"The authenticity of host .+ can't be established\.|"
+    r"\S+ key fingerprint is \S+\.)")
+_HOST_KEY_CHANGED = "REMOTE HOST IDENTIFICATION HAS CHANGED"
 
 
 class ServerError(ValueError):
@@ -31,6 +41,18 @@ class SSHCheckError(ServerError):
 
 class NoServerDirectory(ServerError):
     """No server has been registered on this machine yet (the directory does not exist)."""
+
+
+class UnknownServer(ServerError):
+    """No alias with that name is registered."""
+
+
+class ServerInUse(ServerError):
+    """A manifest still names the alias, so removing it would break that application."""
+
+
+class InvalidAlias(ServerError):
+    """The requested alias change is invalid."""
 
 
 def validate_target(target: str) -> str:
@@ -108,6 +130,8 @@ def _read_record(directory: int, alias: str) -> str:
                 or record["alias"] != alias):
             raise ServerError("server alias file is invalid")
         return validate_target(record["ssh"])
+    except FileNotFoundError:
+        raise UnknownServer("server alias is not registered") from None
     except (OSError, UnicodeDecodeError, ValueError):
         raise ServerError("could not read a valid private server alias") from None
 
@@ -153,8 +177,8 @@ def list_servers() -> tuple[list[dict[str, str]], int]:
     return servers, invalid
 
 
-def _save_server(alias: str, target: str) -> None:
-    directory = _private_servers_directory()
+def _write_record(directory: int, alias: str, target: str) -> None:
+    """Publish one complete alias file inside an already opened private directory."""
     temporary = ".new-" + secrets.token_hex(16)
     created = False
     try:
@@ -172,11 +196,81 @@ def _save_server(alias: str, target: str) -> None:
     except OSError:
         raise ServerError("could not save the server alias") from None
     finally:
-        try:
-            if created:
+        if created:
+            try:
                 os.unlink(temporary, dir_fd=directory)
-        finally:
-            os.close(directory)
+            except OSError:
+                pass
+
+
+def _save_server(alias: str, target: str) -> None:
+    directory = _private_servers_directory()
+    try:
+        _write_record(directory, alias, target)
+    finally:
+        os.close(directory)
+
+
+def manifest_uses_server(alias: str, path: Path = Path("ship.toml")) -> bool:
+    """Return whether the manifest at path names this alias.
+
+    Shiplord keeps no registry of manifests, so the manifest in the current directory is
+    the strongest local check available. A manifest elsewhere is not detected. A manifest
+    that exists but cannot be loaded raises ``ManifestError`` rather than guessing.
+    """
+    if not path.exists():
+        return False
+    try:
+        return load_manifest(path)["server"] == alias
+    except ManifestError as error:
+        raise ManifestError(f"could not check whether the server alias is in use: {error}") from None
+
+
+def remove_server(alias: str, path: Path = Path("ship.toml")) -> None:
+    """Delete one registered alias, refusing while a manifest in the current directory uses it."""
+    alias = validate_app_name(alias)
+    if manifest_uses_server(alias, path):
+        raise ServerInUse("the server alias is in use by ship.toml; change the manifest's server first")
+    directory = _private_servers_directory(create=False)
+    try:
+        _read_record(directory, alias)
+        try:
+            os.unlink(alias + ".json", dir_fd=directory)
+        except OSError:
+            raise ServerError("could not remove the server alias") from None
+    finally:
+        os.close(directory)
+
+
+def rename_server(old: str, new: str) -> None:
+    """Move a registration to a new alias, keeping the old one if anything fails."""
+    old = validate_app_name(old)
+    new = validate_app_name(new)
+    if old == new:
+        raise InvalidAlias("the new alias is the same as the old alias; nothing was changed")
+    directory = _private_servers_directory(create=False)
+    try:
+        target = _read_record(directory, old)
+        try:
+            os.stat(new + ".json", dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise ServerError("could not check the server alias directory") from None
+        else:
+            raise ServerError("the new alias is already registered; no file was replaced")
+        # Publish the complete new record first: a failure here leaves the old alias untouched.
+        _write_record(directory, new, target)
+        try:
+            os.unlink(old + ".json", dir_fd=directory)
+        except OSError:
+            try:
+                os.unlink(new + ".json", dir_fd=directory)
+            except OSError:
+                raise ServerError("could not finish the rename; check `shiplord server list`") from None
+            raise ServerError("could not rename the server alias; the old alias was kept") from None
+    finally:
+        os.close(directory)
 
 
 @dataclass(frozen=True)
@@ -230,15 +324,35 @@ def ssh_command(target: str, remote_command: str, options: SshOptions | None = N
     return command
 
 
+def _ssh_failure_message(target: str, stderr: bytes) -> str:
+    """Explain a failed SSH check, repeating only the host-trust lines that are safe to show."""
+    # OpenSSH writes CRLF to a stderr that is not a terminal, and sanitize renders a bare CR as "?", which
+    # would stop the allowlist from recognising the line. Line endings carry no meaning in this message.
+    text = sanitize(stderr.replace(b"\r\n", b"\n").replace(b"\r", b"\n"), STDERR_LIMIT)
+    if _HOST_KEY_CHANGED in text:
+        return ("SSH check failed: the host key for this server has changed since it was trusted; "
+                "remove the stale known-hosts entry, then retry")
+    detail = " ".join(line.strip() for line in text.splitlines() if _HOST_TRUST_LINE.fullmatch(line.strip()))
+    if not detail:
+        return "SSH check failed; verify host trust, login, and any locked SSH key"
+    host = target.split("@", 1)[1]
+    return (f"SSH check failed: the host key for {host} is not trusted yet. "
+            f"Run `ssh {target}` once to review and accept it, then retry. ssh said: {detail}")
+
+
 def register_server(alias: str, target: str) -> None:
     alias = validate_app_name(alias)
     target = validate_target(target)
     command = ssh_command(target, "true")
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=15, check=False)
+        with tempfile.TemporaryFile() as stderr:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=stderr, timeout=15, check=False)
+            stderr.seek(0, os.SEEK_END)
+            stderr.seek(max(0, stderr.tell() - STDERR_LIMIT))
+            output = stderr.read(STDERR_LIMIT)
     except (OSError, subprocess.TimeoutExpired):
         raise SSHCheckError("SSH check could not be completed; verify OpenSSH and your connection") from None
     if result.returncode != 0:
-        raise SSHCheckError("SSH check failed; verify host trust, login, and any locked SSH key")
+        raise SSHCheckError(_ssh_failure_message(target, output))
     _save_server(alias, target)
