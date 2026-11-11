@@ -85,6 +85,8 @@ GITHUB_CHECK = {"ok": True, "run": "https://github.com/QueryPlanner/orders/actio
                 "conclusion": "success", "steps": {"Check access only": "success"}}
 GITHUB_ROTATED = {"ok": True, "repository": "QueryPlanner/orders", "old_label": "ci-old",
                   "key_label": "ci-new", "key_fingerprint": "SHA256:new", "steps": {"register": "ci-new"}}
+RESTARTED = {"ok": True, "request_id": "restart-1", "status": "succeeded", "exit_code": 0}
+KEYS = {"keys": [{"label": "ci", "fingerprint": "SHA256:abc"}]}
 
 # A dumped dict or list: a line, or the value after its first label, starts with a structure.
 STRUCTURE_DUMP = ("OrderedDict(", "dict_keys(", "dict_values(")
@@ -208,6 +210,7 @@ class CommandOutputTests(unittest.TestCase):
             Case("doctor", lambda as_json: self.invoke(
                 ["doctor"], as_json,
                 patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._manifest_present", {"return_value": True}),
                          ("shiplord.cli._helper", {}),
                          ("shiplord.cli.commands.application_doctor",
                           {"return_value": (0, {"ok": True, "scope": "local tools, SSH access, helper, "
@@ -332,7 +335,7 @@ class CommandOutputTests(unittest.TestCase):
             Case("github setup", lambda as_json: self.invoke(
                 ["github", "setup", "--repo", "QueryPlanner/orders", "--tailscale-tags", "tag:ci"], as_json,
                 patches=[("shiplord.cli._manifest", {"return_value": manifest}),
-                         ("shiplord.cli.github.validate_setup_profile", {"return_value": None}),
+                         ("shiplord.cli.github.validate_setup_request", {"return_value": None}),
                          ("shiplord.cli.load_server", {"return_value": "admin@example.com"}),
                          ("shiplord.cli.github.GitHub", {"return_value": MagicMock()}),
                          ("shiplord.cli.github.github_setup", {"return_value": dict(GITHUB_SETUP)})]),
@@ -357,7 +360,55 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli.github.GitHub", {"return_value": MagicMock()}),
                          ("shiplord.cli.github.rotate_key", {"return_value": dict(GITHUB_ROTATED)})]),
                 GITHUB_ROTATED, ("Outcome: CI key replaced", "New key: ci-new", "register: ci-new")),
+            Case("restart", lambda as_json: self.invoke(
+                ["restart"], as_json,
+                patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._helper", {}),
+                         ("shiplord.cli.commands.run_job_command", {"return_value": (0, RESTARTED)})]),
+                RESTARTED, ("Outcome: succeeded", "Request ID: restart-1")),
+            Case("server remove", lambda as_json: self.invoke(
+                ["server", "remove", "production"], as_json,
+                patches=[("shiplord.cli.remove_server", {"return_value": None})]),
+                {"ok": True, "removed": "production"}, ("Removed server alias 'production'.",)),
+            Case("server rename", lambda as_json: self.invoke(
+                ["server", "rename", "production", "staging"], as_json,
+                patches=[("shiplord.cli.rename_server", {"return_value": None})]),
+                {"ok": True, "alias": "staging", "previous_alias": "production"},
+                ("Renamed server alias 'production' to 'staging'.",)),
+            Case("env diff", lambda as_json: self.with_temp_file(
+                "app.env", "TOKEN=secret-value\n",
+                lambda path: self.invoke(["env", "diff", "--from-file", str(path)], as_json,
+                                         patches=self.admin_patches(
+                                             "shiplord.cli.commands.diff_environment",
+                                             (0, {"ok": True, "added": ["TOKEN"], "removed": [],
+                                                  "note": "Key names only."})))),
+                {"ok": True, "added": ["TOKEN"], "removed": [], "note": "Key names only."},
+                ("Added: TOKEN", "Removed: none", "Key names only.")),
+            Case("keys add", lambda as_json: self.invoke(
+                ["keys", "add", "--label", "ci", "--public-key-stdin"], as_json,
+                patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._admin", {"return_value": self.keys_admin()}),
+                         ("shiplord.cli._read_public_key", {"return_value": ("ssh-ed25519 AAAA", "SHA256:abc")})]),
+                {"ok": True, **KEYS, "label": "ci", "fingerprint": "SHA256:abc"},
+                ("Outcome: key ci registered", "ci: SHA256:abc")),
+            Case("keys list", lambda as_json: self.invoke(
+                ["keys", "list"], as_json,
+                patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._admin", {"return_value": self.keys_admin()})]),
+                {"ok": True, **KEYS}, ("Outcome: 1 key", "ci: SHA256:abc")),
+            Case("keys remove", lambda as_json: self.invoke(
+                ["keys", "remove", "--label", "ci", "--yes"], as_json,
+                patches=[("shiplord.cli._manifest", {"return_value": manifest}),
+                         ("shiplord.cli._admin", {"return_value": self.keys_admin()})]),
+                {"ok": True, **KEYS, "label": "ci"}, ("Outcome: key ci removed", "ci: SHA256:abc")),
         ]
+
+    @staticmethod
+    def keys_admin():
+        """An admin client whose only request returns the fixture key list."""
+        admin = MagicMock()
+        admin.call.return_value = dict(KEYS)
+        return admin
 
     def admin_patches(self, target: str, result: tuple[int, dict]):
         return [("shiplord.cli._manifest", {"return_value": dict(MANIFEST)}),

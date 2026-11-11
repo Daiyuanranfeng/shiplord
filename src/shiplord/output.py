@@ -159,7 +159,7 @@ def render_server_list(servers: list[dict], invalid: int, say: Say | None = None
 def render_server_add(result: dict, say: Say | None = None) -> None:
     say = _say(say)
     say(f"Server alias saved: {result['alias']} ({result['ssh']})")
-    say("Run `shiplord server bootstrap` next. CI host-key setup is not implemented yet.")
+    say("Run `shiplord server bootstrap` next.")
 
 
 def render_init(result: dict, say: Say | None = None) -> None:
@@ -514,6 +514,9 @@ def render_status(application: str, server: str | None, result: dict, say: Say |
     target = f"{application} on {server}" if server else application
     say(f"Target: {target}")
     say(f"Outcome: {outcome}")
+    job = result.get("job")
+    if isinstance(job, dict):
+        render_job_record(job, say)
     say(f"Current release: {short_release(current)}")
     if previous is not None:
         say(f"Previous release: {short_release(previous)}")
@@ -524,7 +527,10 @@ def render_status(application: str, server: str | None, result: dict, say: Say |
         phase = transaction.get("phase", "unknown")
         say(f"Unfinished transaction: {phase} ({transaction.get('request_id', 'request ID unavailable')})")
         say("Why: the server has an unfinished deployment transaction that must be reconciled before another deploy.")
-        say("Next: run `shiplord recover` from this application's repository.")
+        if server:
+            say(f"Next: run `shiplord recover {application} --server {server}` to reconcile it.")
+        else:
+            say("Next: run `shiplord recover` from this application's repository.")
 
 
 def render_operation(code: int, result: dict, target: str, operation: str, say: Say | None = None) -> None:
@@ -575,7 +581,8 @@ def _doctor_value(value: object) -> str:
         if "ok" in value:
             state = "passed" if value["ok"] else "failed"
             details = []
-            for key in ("helper_version", "version", "protocol", "current", "running", "unfinished_transaction", "hint"):
+            for key in ("helper_version", "version", "protocol", "id", "version_id", "current", "running",
+                        "unfinished_transaction", "hint", "message"):
                 if value.get(key) is not None:
                     details.append(f"{key.replace('_', ' ')}: {_scalar(value[key])}")
             return state + (" (" + "; ".join(details) + ")" if details else "")
@@ -595,6 +602,7 @@ def render_doctor(result: dict, target: str, say: Say | None = None) -> None:
     checks = result.get("checks", {})
     groups = (
         ("Local tools", ("ssh", "git", "gh")),
+        ("Server baseline", ("os",)),
         ("Server access", ("server_access", "helper_actions", "helper")),
         ("Application", ("application", "applications")),
         ("Network", ("dns",)),
@@ -616,6 +624,73 @@ def render_doctor(result: dict, target: str, say: Say | None = None) -> None:
                     release = "yes" if application.get("deployed") else "no"
                     state = application.get("unfinished_transaction") or "none"
                     say(f"    {label}: release {release}; unfinished transaction {state}")
+                render_ignored_files(value.get("ignored_files", []), say)
     for name, value in checks.items():
         if name not in shown:
             say(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
+
+
+def render_job_record(job: dict, say: Say | None = None) -> None:
+    """A durable job record attached to a status result; it is not a release transition."""
+    say = _say(say)
+    say(f"Job: {job.get('request_id', 'unknown')}")
+    state = str(job.get("state", "unknown"))
+    say(f"Job state: {state}")
+    say(f"Job phase: {job.get('phase', 'unknown')}")
+    outcome = job.get("outcome")
+    if state == "finished" and isinstance(outcome, dict):
+        say(f"Job outcome: {outcome.get('status', 'unknown')} (exit {outcome.get('exit_code', 'unknown')})")
+
+
+def render_environment_diff(result: dict, say: Say | None = None) -> None:
+    """Preview only key names; values are never printed or compared."""
+    say = _say(say)
+    for label in ("added", "removed"):
+        names = result.get(label) or []
+        say(f"{label.capitalize()}: {', '.join(names) if names else 'none'}")
+    say(result.get("note") or "Key names only.")
+
+
+def render_fleet_doctor(result: dict, say: Say | None = None) -> None:
+    say = _say(say)
+    say("Target: all registered servers")
+    say(f"Outcome: {'compatible' if result.get('ok') else 'attention required'}")
+    client = result.get("client")
+    if client:
+        say("Client:")
+        say(f"  shiplord {client['version']}")
+        say(f"  executable: {client['executable']}")
+    for item in result.get("servers", []):
+        if item.get("reachable"):
+            version = item.get("helper_version") or "unknown"
+            say(f"{item['server']}: reachable, helper {version}, inventory {item['inventory_support']}")
+        else:
+            say(f"{item['server']}: unreachable, inventory unknown")
+        if item.get("error_code") == "helper_upgrade_required":
+            say("  " + upgrade_message(item))
+        elif item.get("error"):
+            say(f"  Error: {item['error']}")
+    if result.get("invalid_entries"):
+        count = result["invalid_entries"]
+        say(f"Ignored {count} invalid server {'entry' if count == 1 else 'entries'}.")
+
+
+def render_keys(result: dict, target: str, operation: str, say: Say | None = None) -> None:
+    """Key labels and fingerprints only; a public key line is never printed."""
+    say = _say(say)
+    keys = result.get("keys") or []
+    noun = "key" if len(keys) == 1 else "keys"
+    say(f"Target: {target}")
+    if operation == "add":
+        say(f"Outcome: key {result.get('label', 'unknown')} registered")
+    elif operation == "remove":
+        say(f"Outcome: key {result.get('label', 'unknown')} removed")
+    else:
+        say(f"Outcome: {len(keys)} {noun}" if keys else "Outcome: no keys")
+    if keys:
+        say("Deploy keys:")
+        for item in keys:
+            if isinstance(item, dict):
+                say(f"  {item.get('label', 'unknown')}: {item.get('fingerprint', 'unknown')}")
+    if result.get("note"):
+        say(f"Note: {result['note']}")

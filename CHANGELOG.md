@@ -11,6 +11,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Render every command's result as readable lines, and accept `--json` on
   `init`, `configure`, and `server add` as the other commands already did.
+- Add a `QueryPlanner/shiplord/deploy` composite action and make the generated
+  workflow call it instead of inlining the tailnet, SSH, deploy and summary steps.
+- Add `shiplord recover <app> --server <alias>`, so an interrupted deployment can be
+  reconciled from any directory without a checkout, and print that target-specific
+  command in human-readable `status` output.
+- Add `shiplord server remove` and `shiplord server rename`, both with `--json`.
+  Removal refuses while the current directory's `ship.toml` names the alias.
+- Add `shiplord provision --update` to apply a changed hostname or memory
+  ceiling without removing the application's state, environment, or keys.
 
 ### Fixed
 
