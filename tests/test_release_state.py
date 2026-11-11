@@ -52,6 +52,45 @@ class ReleaseStateTests(unittest.TestCase):
             self.store.clear_after_reconciliation()
         self.assertIsNone(self.store.read_journal())
 
+    def commit(self, request_id, value):
+        self.store.begin(request_id, value)
+        for phase in ("runtime-changing", "runtime-ready", "routing-changing", "routing-ready"):
+            self.store.advance(phase)
+        committed = self.store.record_commit()
+        self.store.clear_after_reconciliation()
+        return committed
+
+    def test_redeploying_the_committed_release_keeps_the_previous_release(self):
+        with self.lock.acquire():
+            self.commit("request-1", release())
+            self.commit("request-2", release("c", "d"))
+            committed = self.commit("request-3", release("c", "d"))  # the release that is already current
+        self.assertEqual(committed["current"], release("c", "d"))
+        self.assertEqual(committed["previous"], release())  # still the release to return to, not the redeployed one
+        self.assertEqual(self.store.read_state(), committed)
+
+    def test_record_commit_returns_the_state_it_wrote(self):
+        with self.lock.acquire():
+            committed = self.commit("request-1", release())
+        self.assertEqual(committed, self.store.read_state())
+
+    def test_recovery_accepts_a_commit_written_before_the_redeploy_rule(self):
+        with self.lock.acquire():
+            self.commit("request-1", release())
+            self.commit("request-2", release("c", "d"))
+            self.store.begin("request-3", release("c", "d"))
+            for phase in ("runtime-changing", "runtime-ready", "routing-changing", "routing-ready"):
+                self.store.advance(phase)
+            committed = self.store.record_commit()
+            # An older helper rotated the release it redeployed into `previous`; an upgrade must still recover it.
+            legacy = dict(committed, previous=committed["current"])
+            state = self.directory / "state.json"
+            state.write_text(json.dumps(legacy))
+            state.chmod(0o600)
+            self.assertEqual(self.store.reconciliation_target(), release("c", "d"))
+            self.store.clear_after_reconciliation()
+        self.assertIsNone(self.store.read_journal())
+
     def test_first_release_failure_targets_empty_state_and_blocks_new_transaction(self):
         with self.lock.acquire():
             self.store.begin("request-1", release())
@@ -78,8 +117,20 @@ class ReleaseStateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 self.store.clear_after_reconciliation()
 
+    def test_docker_hub_images_are_stored_pinned_in_their_one_spelling(self):
+        for given, stored in (("docker.io/example/orders@sha256:" + "b" * 64, "docker.io/example/orders@sha256:" + "b" * 64),
+                              ("docker.io/library/nginx@sha256:" + "c" * 64, "docker.io/library/nginx@sha256:" + "c" * 64),
+                              ("nginx@sha256:" + "d" * 64, "docker.io/library/nginx@sha256:" + "d" * 64)):
+            with self.subTest(image=given), self.lock.acquire():
+                item = release()
+                item["artifact"] = {"kind": "docker", "image": given}
+                self.assertEqual(self.commit("request-hub-" + stored[-8:], item)["current"]["artifact"]["image"], stored)
+
     def test_invalid_artifacts_and_configuration_are_rejected_before_journal(self):
         examples = [dict(release(), commit="bad"), dict(release(), artifact={"kind": "docker", "image": "latest"}),
+                    dict(release(), artifact={"kind": "docker", "image": "quay.io/example/orders@sha256:" + "a" * 64}),
+                    dict(release(), artifact={"kind": "docker", "image": "example/orders@sha256:" + "a" * 64}),
+                    dict(release(), artifact={"kind": "docker", "image": "docker.io/nginx@sha256:" + "a" * 64}),
                     dict(release(), artifact={"kind": "native", "sha256": "bad", "size": 1, "architecture": "linux-amd64"}),
                     dict(release(), artifact={"kind": "other"}), dict(release(), configuration={}),
                     dict(release(), extra="secretvalue")]

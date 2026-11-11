@@ -8,6 +8,7 @@ a transient systemd unit; tests and containers without systemd use a detached pr
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -24,8 +25,11 @@ WORKER_PATH = "/usr/local/sbin/shiplord-worker"
 KEEP_JOBS = 25
 MAX_RUNTIME_SECONDS = 3600  # a job that has not finished by then is stopped, releasing the host lock
 MAX_PENDING_JOBS = 4  # unfinished jobs per application; further submissions are refused
+# Past RuntimeMaxSec the launcher has stopped the worker; the margin covers its shutdown and a clock that moved on.
+INTERRUPTED_SECONDS = MAX_RUNTIME_SECONDS + 300
+_UNIT_ID_LENGTH = 24  # a request ID that fits stays readable in the unit name; a longer one is hashed whole
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
-ACTIONS = ("deploy", "rollback", "recover")
+ACTIONS = ("deploy", "rollback", "restart", "recover", "backup", "restore")
 TERMINAL = ("finished",)
 
 
@@ -33,10 +37,17 @@ class JobError(StateError):
     """A job record is invalid, or the job cannot be created or launched."""
 
 
+def valid_job_id(value: object) -> bool:
+    """Whether a value can name a job; request IDs and job IDs share one grammar."""
+    return isinstance(value, str) and bool(_ID.fullmatch(value))
+
+
 def unit_name(application_id: str, request_id: str) -> str:
     # ":" is legal in a unit name but cannot occur in an application name or request ID, so two (app, request) pairs
     # can never produce the same name, and no job name can equal a native application's "shiplord-<app>.service".
-    return f"shiplord-job-{application_id}:{request_id[:24]}"
+    # A request ID that does not fit is hashed whole: truncating it let two IDs that share a prefix collide.
+    suffix = request_id if len(request_id) <= _UNIT_ID_LENGTH else hashlib.sha256(request_id.encode()).hexdigest()[:32]
+    return f"shiplord-job-{application_id}:{suffix}"
 
 
 def _validate(record: object, application_id: str) -> dict:
@@ -62,7 +73,7 @@ class JobStore:
 
     @staticmethod
     def _name(request_id: str) -> str:
-        if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
+        if not valid_job_id(request_id):
             raise JobError("invalid job ID")
         return request_id + ".json"
 
@@ -72,6 +83,7 @@ class JobStore:
 
     def create(self, request_id: str, action: str, request: dict) -> tuple[dict, bool]:
         """Create a queued job, or return the existing record for a repeated request ID."""
+        self._prune_interrupted()  # an interrupted record must not keep its request ID burned
         existing = self.get(request_id)
         if existing is not None:
             if existing["action"] != action or existing["request"] != request:
@@ -120,6 +132,21 @@ class JobStore:
                     found.append(record["request_id"])
         return found
 
+    def _prune_interrupted(self) -> None:
+        """Remove unfinished records whose worker cannot still be running; their request IDs become reusable."""
+        now = int(self.clock())
+        for name in os.listdir(self.directory):
+            if not name.endswith(".json"):
+                continue
+            record = _read(self.directory, name, missing_ok=True)
+            if record and record.get("state") in ("queued", "running") and self._interrupted(record, now):
+                self._unlink(name)
+
+    @staticmethod
+    def _interrupted(record: dict, now: int) -> bool:
+        started = record.get("started_at") if record.get("started_at") is not None else record.get("submitted_at")
+        return type(started) is int and now - started > INTERRUPTED_SECONDS
+
     def _prune(self) -> None:
         names = [name for name in os.listdir(self.directory) if name.endswith(".json")]
         if len(names) <= KEEP_JOBS:
@@ -130,10 +157,13 @@ class JobStore:
             if record and record.get("state") == "finished":
                 finished.append((record.get("finished_at") or 0, name))
         for _, name in sorted(finished)[: len(names) - KEEP_JOBS]:
-            try:
-                os.unlink(name, dir_fd=self.directory)
-            except OSError:
-                pass
+            self._unlink(name)
+
+    def _unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self.directory)
+        except OSError:
+            pass
 
 
 class Launcher(Protocol):

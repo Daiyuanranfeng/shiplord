@@ -44,6 +44,7 @@ application is denied (`{"status": "error", "error": "access_denied"}`, exit 3).
 | `plan` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `result`: what a deploy would do; read-only |
 | `deploy` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `accepted` with a job, or `finished` with an outcome |
 | `rollback` | null | none | `accepted` with a job |
+| `restart` | null | none | `accepted` with a job |
 | `recover` | null | none | `accepted` with a job |
 
 `capabilities` lists optional features after the actions in the same `actions` array (an older client rejects unknown
@@ -59,6 +60,9 @@ requested optional features in one capabilities call before submitting `plan` or
 `shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
 (`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
 
+`runtime_knobs_v1` means the helper honours `resources.cpu_limit`, `deploy.init`, `deploy.readiness_status`, and
+`deploy.readiness_interval_seconds`, and refuses any value outside their documented ranges before a release is stored.
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered
@@ -66,8 +70,8 @@ one. `sequence` is the release ordering key (the commit's committer timestamp).
 
 ### Jobs
 
-`deploy`, `rollback`, and `recover` create a job record keyed by `request_id` and start a worker as a transient
-systemd unit, so the operation survives the SSH session. A repeated `request_id` returns the recorded job whatever
+`deploy`, `rollback`, `restart`, and `recover` create a job record keyed by `request_id` and start a worker as a
+transient systemd unit, so the operation survives the SSH session. A repeated `request_id` returns the recorded job whatever
 its outcome was; changed content under the same ID is refused. The response is:
 
 ```json
@@ -87,6 +91,13 @@ vanished; run `recover`). A `deploy` refused by the immediate checks returns `{"
 | `rolled_back` | 5 |
 | `intervention_required` | 6 |
 
+`restart` has the same `commit: null`, no-arguments shape as `rollback` and starts the committed release again so it
+reads the current environment file; it never changes the recorded release or its sequence. With no deployed release it
+is refused as `finished` with `rejected` (exit 2) before a job exists; while a journal exists it is refused with
+`recovery_required` (exit 1). A restart that fails after its journal opens reports `intervention_required` with
+`detail.error = restart_failed`, keeps the journal, and never reports `rolled_back` or a restored release: the
+previous release record would run the same environment file. `detail.recovery` names `shiplord recover`.
+
 ### Native upload
 
 A `deploy` whose artifact is `native` is followed on the same stream by exactly `size` raw bytes. The helper streams
@@ -102,7 +113,7 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 | Action | `arguments` |
 | --- | --- |
-| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label` |
+| `provision` | `runtime`, `api_domain`, optional `hostnames` (additional hostnames that redirect to it), `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname, additional hostnames, or ceiling to an existing application |
 | `keys` | `operation` (`add`, `remove`, `list`), `label`, `public_key` |
 | `environment` | `operation` (`set`, `clear`, `keys`), `text` |
 | `registry` | `operation` (`login`, `logout`, `list`), `registry` (`ghcr.io`), `username`, `token` |
@@ -111,7 +122,9 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 Responses are `{"status": "ok", "request_id", "result"}` or `{"status": "error", "request_id", "error":
 "denied|invalid_request|failed", "message"}`. Provisioning is idempotent and writes the registration last, because
-the registration is what enables an application's access.
+the registration is what enables an application's access. An `update` keeps the account, port, state, environment,
+and keys; it may change only the hostname and the memory ceiling, and refuses a changed runtime or image repository
+before any side effect.
 
 ## Exit status of the entry points
 

@@ -22,12 +22,16 @@ FAKE_SSH = r'''import json, os, sys, time
 mode = os.environ.get("FAKE_SSH_MODE", "ok")
 if sys.argv[-1] != "/usr/local/libexec/shiplord-dispatch":
     sys.exit(90)
+user = sys.argv[-2].split("@")[0]
+if user == "down":
+    sys.exit(1)
+helper_version = {"new": "0.2.0", "old": "0.1.0"}.get(user, "0.1.0")
 if mode == "early":
     sys.exit(1)
 raw = sys.stdin.buffer.read()
 request = json.loads(raw[4:])
 response = {"status": "ok", "request_id": request["request_id"], "version": 1,
-            "helper_version": "0.1.0", "actions": ["capabilities"]}
+            "helper_version": helper_version, "actions": ["capabilities"]}
 if mode == "wrong-id": response["request_id"] = "wrong"
 if mode == "wrong-version": response["version"] = 2
 if mode == "unsupported": response["actions"] = ["status"]
@@ -67,12 +71,12 @@ class TransportTests(unittest.TestCase):
         ssh.chmod(0o700)
         self.env = {"PATH": str(directory), "XDG_CONFIG_HOME": str(self.root / "config")}
 
-    def make_alias(self, data=None):
+    def make_alias(self, data=None, alias="production", ssh="appuser@example.com"):
         path = self.root / "config/shiplord/servers"
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         (path.parent).chmod(0o700)
-        target = path / "production.json"
-        target.write_text(data if data is not None else json.dumps({"schema_version": 1, "alias": "production", "ssh": "appuser@example.com"}))
+        target = path / f"{alias}.json"
+        target.write_text(data if data is not None else json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
         target.chmod(0o600)
         return target
 
@@ -205,6 +209,21 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 3)
         self.assertFalse(json.loads(result.stdout)["ok"])
 
+    def test_doctor_all_servers_continues_past_an_unreachable_probe(self):
+        self.make_alias(alias="alpha", ssh="new@alpha.example.com")
+        self.make_alias(alias="beta", ssh="down@beta.example.com")
+        self.make_alias(alias="gamma", ssh="old@gamma.example.com")
+        with patch.dict(os.environ, dict(self.env, FAKE_SSH_MODE="ok")):
+            result = CliRunner().invoke(app, ["doctor", "--all-servers", "--json"])
+        self.assertEqual(result.exit_code, 3, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta", "gamma"])
+        self.assertEqual([item["reachable"] for item in data["servers"]], [True, False, True])
+        self.assertEqual([item["inventory_support"] for item in data["servers"]],
+                         ["supported", "unknown", "unsupported"])
+        self.assertEqual(data["servers"][2]["upgrade_command"], "shiplord server bootstrap gamma")
+        self.assertNotIn("upgrade_command", data["servers"][0])
+
     def test_missing_alias_does_not_create_directories_or_start_ssh(self):
         with patch.dict(os.environ, self.env), patch("subprocess.Popen") as popen:
             result = CliRunner().invoke(app, ["doctor", "--server", "production", "--json"])
@@ -242,7 +261,7 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(ServerError):
                 load_server("production")
 
-    def test_doctor_without_a_mode_needs_an_application_manifest(self):
+    def test_doctor_without_a_mode_reports_local_checks_when_no_manifest_is_present(self):
         with tempfile.TemporaryDirectory() as directory:
             original = os.getcwd()
             os.chdir(directory)
@@ -250,8 +269,10 @@ class TransportTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["doctor", "--json"])
             finally:
                 os.chdir(original)
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
+        self.assertIn(result.exit_code, (0, 3))
+        output = json.loads(result.stdout)
+        self.assertEqual(set(output), {"ok", "scope", "checks", "client"})
+        self.assertIn("server readiness was not checked", output["scope"])
 
     def test_server_capabilities_is_the_only_request_without_an_application(self):
         base = {"version": 1, "request_id": "request-1", "action": "capabilities", "application_id": None,
