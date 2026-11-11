@@ -1,0 +1,115 @@
+name: Shiplord deploy
+description: Join the tailnet, install the CI SSH identity, deploy one image by digest, and write a job summary.
+
+# The steps below are the ones the generated Shiplord deploy workflow used to inline. Every value a
+# caller supplies is an input: a composite action cannot read `secrets`, and nothing here is a command
+# line argument. The CI key is written to a file under RUNNER_TEMP and removed in the last step.
+
+inputs:
+  check-only:
+    description: Check CI access only (Tailscale, SSH, helper); deploy nothing
+    required: false
+    default: "false"
+  ssh-private-key:
+    description: The CI private key; store it as the SHIPLORD_SSH_PRIVATE_KEY secret
+    required: true
+  ssh-known-hosts:
+    description: Pinned host keys for the server; the SHIPLORD_SSH_KNOWN_HOSTS variable
+    required: true
+  deploy-user:
+    description: The account Shiplord deploys as; the SHIPLORD_DEPLOY_USER variable
+    required: true
+  server-host:
+    description: The server's host name on the tailnet; the SHIPLORD_SERVER_HOST variable
+    required: true
+  ssh-port:
+    description: The SSH port when it is not 22; leave empty for the default
+    required: false
+    default: ""
+  ts-client-id:
+    description: The Tailscale OIDC client ID; the SHIPLORD_TS_CLIENT_ID variable
+    required: true
+  ts-audience:
+    description: The Tailscale OIDC audience; the SHIPLORD_TS_AUDIENCE variable
+    required: true
+  ts-tags:
+    description: The tailnet tags the runner joins with; the SHIPLORD_TS_TAGS variable
+    required: false
+    default: "tag:ci"
+  image:
+    description: The image repository to deploy, without a digest (empty for check-only)
+    required: true
+  digest:
+    description: The image digest to deploy (empty for check-only)
+    required: true
+  commit:
+    description: The full commit SHA the release records
+    required: true
+  request-id:
+    description: An idempotency key, so a retried run never deploys twice
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Join the tailnet
+      uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4.3.0
+      with:
+        oauth-client-id: ${{ inputs.ts-client-id }}
+        audience: ${{ inputs.ts-audience }}
+        tags: ${{ inputs.ts-tags }}
+        # A new node is not accepted by its peers immediately; wait until the server answers.
+        ping: ${{ inputs.server-host }}
+    - name: Prepare the SSH identity and pinned host keys
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ inputs.ssh-private-key }}
+        KNOWN_HOSTS: ${{ inputs.ssh-known-hosts }}
+        DEPLOY_USER: ${{ inputs.deploy-user }}
+        SERVER_HOST: ${{ inputs.server-host }}
+        SSH_PORT: ${{ inputs.ssh-port }}
+      run: |
+        set -euo pipefail
+        umask 077
+        printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/shiplord_key"
+        printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/shiplord_known_hosts"
+        {
+          echo "SHIPLORD_SSH_IDENTITY=$RUNNER_TEMP/shiplord_key"
+          echo "SHIPLORD_SSH_KNOWN_HOSTS_FILE=$RUNNER_TEMP/shiplord_known_hosts"
+          echo "SHIPLORD_SSH_TARGET=${DEPLOY_USER}@${SERVER_HOST}"
+          if [ -n "$SSH_PORT" ]; then echo "SHIPLORD_SSH_PORT=$SSH_PORT"; fi
+        } >> "$GITHUB_ENV"
+    - name: Check access only
+      if: ${{ inputs.check-only == 'true' }}
+      shell: bash
+      run: shiplord status --json
+    - name: Deploy
+      if: ${{ inputs.check-only != 'true' }}
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        DIGEST: ${{ inputs.digest }}
+        COMMIT: ${{ inputs.commit }}
+        REQUEST_ID: ${{ inputs.request-id }}
+      run: |
+        set -euo pipefail
+        shiplord deploy --image "${IMAGE}@${DIGEST}" --commit "$COMMIT" \
+          --request-id "$REQUEST_ID" --require-public --json | tee "$RUNNER_TEMP/shiplord-result.json"
+    - name: Summary
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        python - <<'PY'
+        import json, os
+        path = os.path.join(os.environ["RUNNER_TEMP"], "shiplord-result.json")
+        if os.path.exists(path):
+            result = json.load(open(path))
+            release = result.get("release") or {}
+            lines = [f"- status: {result.get('status')}", f"- commit: {release.get('commit')}",
+                     f"- public check: {(result.get('public') or {}).get('ok')}"]
+            open(os.environ["GITHUB_STEP_SUMMARY"], "a").write("### Shiplord deployment\n" + "\n".join(lines) + "\n")
+        PY
+    - name: Remove the SSH identity
+      if: ${{ always() }}
+      shell: bash
+      run: rm -f "$RUNNER_TEMP/shiplord_key" "$RUNNER_TEMP/shiplord_known_hosts" "$RUNNER_TEMP/shiplord-result.json"

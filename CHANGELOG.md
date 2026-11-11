@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add a `QueryPlanner/shiplord/deploy` composite action and make the generated
+  workflow call it instead of inlining the tailnet, SSH, deploy and summary steps.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the
