@@ -54,7 +54,7 @@ runs bootstrap. It rejects `--server`, `--local`, and `--deep` before contacting
 | Caddy rejects the route | The previous file is restored and Caddy reloaded; exit 5. | Check the hostname and Caddy logs. |
 | Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover`. |
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
-| Client disconnects | The job continues. | `shiplord status`. |
+| Client disconnects | The job continues. | `shiplord status <app> --server <alias> --job-id <id>`. |
 
 Storage: the application volume is never removed by deploy, rollback, recover, retirement or retention. If a deploy is
 refused with phase `storage`, the volume has another driver, driver options, another application's label, or no retained
@@ -90,6 +90,8 @@ units are enabled, but behavior after a power loss has not been verified.
 
 - `access denied`: the application is not provisioned for your key, or `provision` has not run.
 - `recovery_required`: an earlier job was interrupted; run `shiplord recover`.
+- `restart_failed`: the restart did not come back with the new environment and the journal was kept; fix the value,
+  then run `shiplord recover`. This is never reported as a rollback.
 - `stale_release`: a newer release is already deployed. Use `rollback` or `--allow-older` deliberately.
 - Public HTTPS check fails but the deploy succeeded: DNS or certificate issuance has not settled; `doctor` shows
   which. The server-side result separates local readiness, proxy routing, HTTPS, and DNS.

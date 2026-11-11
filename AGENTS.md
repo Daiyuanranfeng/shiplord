@@ -34,6 +34,19 @@ To retry the same deployment safely, repeat the command with the same `--request
 `shiplord rollback`. To report what is deployed: `shiplord status --json` gives the commit, artifact, running state,
 and any unfinished transaction. Never claim a release is live unless `deploy` exited 0.
 
+If an application's process ignores its stop signal and its release uses `shutdown_timeout_action = "fail"`, deploy,
+recover, and retire stay blocked: the policy never force-kills, and killing it by hand on the server is forbidden.
+The escape hatch is explicit:
+
+```sh
+shiplord recover --force-stop --json   # only when the fail policy is blocking every operation
+```
+
+It sends `SIGKILL` to the process that outlived its deadline, removes it, removes the public route, and leaves the
+application stopped. The job result records what was killed under `forced_stop` (the overridden policy, `SIGKILL`,
+the stages, and the elapsed time). A plain `shiplord recover` keeps the `fail` policy and still waits. Deploy or
+retire afterwards to bring the application back; do not expect the forced stop to restart it.
+
 Secrets: set runtime environment with `shiplord env set --from-file <file>` (use `-` for stdin). Values are never
 printed or logged; do not put them in `ship.toml`, commits, or command-line arguments.
 

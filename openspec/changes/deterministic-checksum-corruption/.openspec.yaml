@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-10
+goal: "Fix issue #82: the corrupted-upload checksum test must never upload an
+  unchanged payload"

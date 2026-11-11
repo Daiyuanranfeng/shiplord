@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import re
+import shlex
 import socket
 import ssl
 import subprocess
@@ -14,12 +15,13 @@ from typing import Callable
 
 from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
+from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
 from .servers import ServerError
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import IncompatibleProtocol, PROTOCOL_VERSION
 from .transport import TransportError, probe_capabilities
@@ -101,9 +103,9 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
                "next": "Point DNS for the API hostname at the server, then run `shiplord deploy`."}
 
 
-def deprovision_application(manifest: dict, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
+def deprovision_application(application_id: str, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
     """Remove the application's server-side access; with ``retire``, first stop it and take down its route."""
-    result = admin.call("deprovision", manifest["name"], {"retire": True} if retire else {})
+    result = admin.call("deprovision", application_id, {"retire": True} if retire else {})
     return 0, {"ok": True, **result, "note": "Application data is never deleted; remove it by hand when you are sure."}
 
 
@@ -118,7 +120,8 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
             raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
         arguments["text"] = text
     result = admin.call("environment", manifest["name"], arguments)
-    note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
+    note = ("Takes effect when the application next starts; run `shiplord restart` to apply it to the running release."
+            if operation in ("set", "clear") else None)
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
 
 
@@ -274,7 +277,8 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     request_id = request_id or new_request_id("deploy")
     timeout = timeout or job_timeout(manifest)
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
-                              timeout=timeout, on_progress=on_progress, payload=binary)
+                              timeout=timeout, on_progress=on_progress, payload=binary,
+                              lookup_command=status_lookup_command(manifest, request_id))
     result = {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
               "exit_code": outcome["exit_code"], **outcome["detail"]}
     code = outcome["exit_code"]
@@ -299,8 +303,18 @@ def plan_application(manifest: dict, client: HelperClient, *, image: str | None 
     return 0, {"ok": True, "scope": "server plan; nothing was changed", **response["result"]}
 
 
+def status_lookup_command(manifest: dict, job_id: str) -> str | None:
+    """A copyable command that reads one job back, when the application and registered alias are known."""
+    name, server = manifest.get("name"), manifest.get("server")
+    if not isinstance(name, str) or not isinstance(server, str):
+        return None
+    return f"shiplord status {name} --server {server} --job-id {shlex.quote(job_id)}"
+
+
 def application_status(client: HelperClient, job_id: str | None = None) -> tuple[int, dict]:
-    response = client.call("status", arguments={"job_id": job_id} if job_id else {})
+    if job_id is not None and not valid_job_id(job_id):
+        raise CommandError("--job-id must start with a letter or digit and contain only letters, digits, '-' and '_'")
+    response = client.call("status", arguments={"job_id": job_id} if job_id is not None else {})
     return 0, {"ok": True, **response["result"]}
 
 
@@ -311,10 +325,20 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
 
 
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+                    force_stop: bool = False,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress)
+    arguments = {"force_stop": True} if force_stop else {}
+    if action == "restart" and "restart" not in client.call("capabilities")["actions"]:
+        # An older helper answers a bare "invalid action" with exit 2, which would blame the operator's input.
+        raise CommandError("the server helper does not support restart; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    if force_stop and FORCE_STOP_FEATURE not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    outcome = submit_and_wait(client, action, request_id=request_id, arguments=arguments,
+                              timeout=job_timeout(manifest), on_progress=on_progress,
+                              lookup_command=status_lookup_command(manifest, request_id))
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 
