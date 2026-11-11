@@ -208,6 +208,45 @@ class RegistryTests(unittest.TestCase):
                 self.register("../escape")
         self.assertEqual(os.listdir(self.directory), [])
 
+    def test_check_reports_the_identical_registration_and_writes_nothing(self):
+        with self.lock.acquire():
+            self.assertIsNone(self.registry.check("orders", **request()))
+            created = self.register()
+            self.assertEqual(self.registry.check("orders", **request()), created)
+        self.assertEqual(os.listdir(self.directory), ["orders.json"])
+
+    def test_check_refuses_every_conflict_the_write_refuses(self):
+        with self.lock.acquire():
+            created = self.register()
+            for change in ({"api_domain": "other.example.com"}, {"runtime": "native", "image_repository": None},
+                           {"image_repository": "ghcr.io/example/other"}, {"deployment_uid": 2000},
+                           {"deployment_user": "someone"}):
+                with self.subTest(change=change), self.assertRaisesRegex(RegistryError, "differs"):
+                    self.registry.check("orders", **request(**change))
+            with self.assertRaisesRegex(RegistryError, "hostname"):
+                self.registry.check("billing", **request("billing", api_domain="orders.example.com",
+                                                         deployment_uid=1002, deployment_user="ship-billing"))
+            with self.assertRaisesRegex(RegistryError, "account"):
+                self.registry.check("billing", **request("billing"))
+            with self.assertRaisesRegex(RegistryError, "account"):
+                self.registry.check("billing", **request("billing", deployment_uid=1002))
+        self.assertEqual(os.listdir(self.directory), ["orders.json"])
+        self.assertEqual(self.registry.read("orders"), created)
+
+    def test_check_requires_the_host_lock(self):
+        with self.assertRaisesRegex(RegistryError, "lock"):
+            self.registry.check("orders", **request())
+        self.assertEqual(os.listdir(self.directory), [])
+
+    def test_check_accepts_an_unknown_uid_only_for_an_unregistered_application(self):
+        """A first provision has no account yet, so its UID is unknown; a registered one is never identical."""
+        with self.lock.acquire():
+            self.assertIsNone(self.registry.check("orders", **request(deployment_uid=None)))
+            self.register()
+            with self.assertRaisesRegex(RegistryError, "differs"):
+                self.registry.check("orders", **request(deployment_uid=None))
+        self.assertEqual(os.listdir(self.directory), ["orders.json"])
+
     def test_exhausted_port_range_fails_clearly(self):
         with self.lock.acquire():
             with self.assertRaisesRegex(RegistryError, "no loopback port"):

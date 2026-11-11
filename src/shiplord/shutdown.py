@@ -7,6 +7,7 @@ stored records, so legacy records keep their exact shape.
 from __future__ import annotations
 
 FEATURE = "docker_shutdown_v1"  # capability a helper advertises when it can honour the shutdown policy
+FORCE_STOP_FEATURE = "recover_force_stop_v1"  # capability a helper advertises when it can force-stop a fail policy
 DEFAULT_TIMEOUT_SECONDS = 10  # what every container had before the policy existed (`--stop-timeout 10`)
 DEFAULT_ACTION = "force"
 MAX_TIMEOUT_SECONDS = 300

@@ -7,8 +7,9 @@ import shutil
 from http.client import HTTPException
 from pathlib import Path
 
-from .installer import SSHD_DROPIN
+from .installer import DEPLOY_GROUP, SSHD_DROPIN, sshd_dropin_included, sshd_units
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .probes import http_get
 from .registry import Registry
 from .release_state import HostLock, ReleaseState, StateError
@@ -80,7 +81,7 @@ def application_inventory(layout: Layout, lock: HostLock) -> dict:
 
 
 def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
-    checks: dict[str, dict] = {}
+    checks: dict[str, dict] = {"os": check_os(layout.path(OS_RELEASE))}
     current = layout.lib / "current"
     checks["helper"] = {"ok": current.is_symlink() and layout.host.exists() and layout.worker.exists()
                         and layout.dispatch.exists(), "version": os.readlink(current) if current.is_symlink() else None}
@@ -92,18 +93,27 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
     active, _ = _run(system, ["/usr/bin/systemctl", "is-active", "--quiet", "caddy"])
     checks["caddy"] = {"ok": wired and active, "import_present": wired, "service_active": active,
                        "admin_api": _admin_api_reachable()}  # informational: deploys cannot verify routing without it
-    dropin_ok = layout.sshd_dropin.is_file() and layout.sshd_dropin.read_text() == SSHD_DROPIN.format(keys=layout.authorized_keys)
+    dropin_ok = layout.sshd_dropin.is_file() and layout.sshd_dropin.read_text() == SSHD_DROPIN.format(
+        keys=layout.authorized_keys, group=DEPLOY_GROUP)
     valid, _ = _run(system, ["/usr/sbin/sshd", "-t"])
-    checks["sshd"] = {"ok": dropin_ok and valid, "dropin_current": dropin_ok, "config_valid": valid}
+    try:
+        unit, _socket = sshd_units(system)
+    except CommandError:
+        unit = None
+    included = sshd_dropin_included(layout)
+    checks["sshd"] = {"ok": dropin_ok and valid and included and unit is not None, "dropin_current": dropin_ok,
+                      "config_valid": valid, "dropin_included": included, "unit": unit}
     docker, version = _run(system, ["/usr/bin/docker", "info", "--format", "{{.ServerVersion}}"])
     checks["docker"] = {"ok": docker, "version": version if docker else None}
     paths = [layout.var, layout.releases] + ([DOCKER_ROOT] if layout.prefix == Path("/") and DOCKER_ROOT.exists() else [])
     checks["disk"] = {"ok": all(entry["ok"] for entry in map(_free, paths)), "paths": [_free(path) for path in paths]}
-    applications, problems = [], 0
+    applications, problems, ignored = [], 0, []
     try:
         descriptor = os.open(layout.registrations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            registrations = Registry(descriptor, lock).list()
+            registry = Registry(descriptor, lock)
+            registrations = registry.list()
+            ignored = list(registry.stray)
         finally:
             os.close(descriptor)
     except (OSError, StateError):
@@ -124,5 +134,5 @@ def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
             entry.update(ok=False, error="state is unreadable")
         problems += 0 if entry["ok"] else 1
         applications.append(entry)
-    checks["applications"] = {"ok": problems == 0, "applications": applications}
+    checks["applications"] = {"ok": problems == 0, "applications": applications, "ignored_files": ignored}
     return {"ok": all(check["ok"] for check in checks.values()), "checks": checks}

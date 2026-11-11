@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import re
+import shlex
 import socket
 import ssl
 import subprocess
@@ -14,17 +15,26 @@ from typing import Callable
 
 from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
+from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
-from .manifest import GENERIC_DOCKER_FEATURE
+from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS
 from .runtime import RuntimeFailure
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .servers import ServerError
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
-from .protocol import PROTOCOL_VERSION
+from .protocol import IncompatibleProtocol, PROTOCOL_VERSION
+from .transport import TransportError, probe_capabilities
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z")
 DEFAULT_KEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
+MINIMUM_INVENTORY_HELPER_VERSION = "0.2.0"
+FLEET_PROBE_TIMEOUT_SECONDS = 5.0
+# Only stable SemVer releases have an unambiguous compatibility ordering.
+_STABLE_RELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                             r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+_MINIMUM_INVENTORY = tuple(int(part) for part in MINIMUM_INVENTORY_HELPER_VERSION.split("."))
 
 
 class CommandError(Exception):
@@ -107,9 +117,9 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
                "next": next_step}
 
 
-def deprovision_application(manifest: dict, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
+def deprovision_application(application_id: str, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
     """Remove the application's server-side access; with ``retire``, first stop it and take down its route."""
-    result = admin.call("deprovision", manifest["name"], {"retire": True} if retire else {})
+    result = admin.call("deprovision", application_id, {"retire": True} if retire else {})
     return 0, {"ok": True, **result, "note": "Application data is never deleted; remove it by hand when you are sure."}
 
 
@@ -124,8 +134,24 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
             raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
         arguments["text"] = text
     result = admin.call("environment", manifest["name"], arguments)
-    note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
+    note = ("Takes effect when the application next starts; run `shiplord restart` to apply it to the running release."
+            if operation in ("set", "clear") else None)
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
+
+
+def diff_environment(manifest: dict, admin: AdminClient, text: str) -> tuple[int, dict]:
+    """Preview the key-name changes ``env set`` would make; only the read-only key list is requested."""
+    try:  # validated here too, so a bad file is caught before any SSH connection is made
+        values = parse_environment(text)
+    except EnvironmentError_ as error:
+        raise CommandError(str(error)) from None
+    if not values:
+        raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
+    _code, listing = set_environment(manifest, admin, "keys")
+    current, proposed = set(listing.get("keys") or []), set(values)
+    return 0, {"ok": True, "operation": "diff", "added": sorted(proposed - current),
+               "removed": sorted(current - proposed),
+               "note": "Key names only; a name present in both files may still have a different value."}
 
 
 def native_artifact(binary: Path) -> dict:
@@ -268,6 +294,13 @@ def job_timeout(manifest: dict) -> float:
     return manifest["deploy"]["readiness_timeout_seconds"] + 900
 
 
+def explicit_job_timeout() -> float:
+    """Wait bound for a named target with no local manifest: cover the larger of both supported runtimes."""
+    docker = job_timeout({"runtime": "docker"})
+    native = job_timeout({"runtime": "native", "deploy": {"readiness_timeout_seconds": MAX_READINESS_SECONDS}})
+    return max(docker, native)
+
+
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
                        commit: str, sequence: int, request_id: str | None = None, timeout: float | None = None, allow_older: bool = False,
                        on_progress: Callable[[str], None] = lambda phase: None, verify_public: bool = True,
@@ -280,7 +313,8 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     request_id = request_id or new_request_id("deploy")
     timeout = timeout or job_timeout(manifest)
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
-                              timeout=timeout, on_progress=on_progress, payload=binary)
+                              timeout=timeout, on_progress=on_progress, payload=binary,
+                              lookup_command=status_lookup_command(manifest, request_id))
     result = {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
               "exit_code": outcome["exit_code"], **outcome["detail"]}
     code = outcome["exit_code"]
@@ -305,8 +339,18 @@ def plan_application(manifest: dict, client: HelperClient, *, image: str | None 
     return 0, {"ok": True, "scope": "server plan; nothing was changed", **response["result"]}
 
 
+def status_lookup_command(manifest: dict, job_id: str) -> str | None:
+    """A copyable command that reads one job back, when the application and registered alias are known."""
+    name, server = manifest.get("name"), manifest.get("server")
+    if not isinstance(name, str) or not isinstance(server, str):
+        return None
+    return f"shiplord status {name} --server {server} --job-id {shlex.quote(job_id)}"
+
+
 def application_status(client: HelperClient, job_id: str | None = None) -> tuple[int, dict]:
-    response = client.call("status", arguments={"job_id": job_id} if job_id else {})
+    if job_id is not None and not valid_job_id(job_id):
+        raise CommandError("--job-id must start with a letter or digit and contain only letters, digits, '-' and '_'")
+    response = client.call("status", arguments={"job_id": job_id} if job_id is not None else {})
     return 0, {"ok": True, **response["result"]}
 
 
@@ -316,11 +360,27 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
     return 0, {"ok": True, "logs": client.call("logs", arguments={"tail": tail})["result"]["logs"]}
 
 
-def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+def run_job_command(manifest: dict | None, client: HelperClient, action: str, *, request_id: str | None = None,
+                    force_stop: bool = False,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Submit one job and wait for it.
+
+    ``manifest`` is None for a named target resolved without a local manifest; the wait bound then has to cover
+    every runtime the server may report for that application.
+    """
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress)
+    timeout = explicit_job_timeout() if manifest is None else job_timeout(manifest)
+    arguments = {"force_stop": True} if force_stop else {}
+    if action == "restart" and "restart" not in client.call("capabilities")["actions"]:
+        # An older helper answers a bare "invalid action" with exit 2, which would blame the operator's input.
+        raise CommandError("the server helper does not support restart; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    if force_stop and FORCE_STOP_FEATURE not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    outcome = submit_and_wait(client, action, request_id=request_id, arguments=arguments,
+                              timeout=timeout, on_progress=on_progress,
+                              lookup_command=status_lookup_command(manifest, request_id) if manifest else None)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 
@@ -365,3 +425,63 @@ def server_applications(admin: AdminClient) -> tuple[int, dict]:
     """Read the registered applications from the server's root-only inventory."""
     result = admin.call("apps", None, {})
     return (0 if result["ok"] else 3), result
+
+
+def inventory_support(version: object) -> str:
+    """Classify a helper version against the app-inventory minimum.
+
+    A version without an unambiguous ordering (a pre-release, or anything that is not stable
+    SemVer) is ``unknown``: it is never reported as a confirmed lack of inventory support.
+    """
+    match = _STABLE_RELEASE.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        return "unknown"
+    return "supported" if tuple(map(int, match.groups())) >= _MINIMUM_INVENTORY else "unsupported"
+
+
+def inventory_upgrade(alias: str, version: object) -> dict | None:
+    """Upgrade guidance only when a stable helper release is confirmed too old for app inventory."""
+    if inventory_support(version) != "unsupported":
+        return None
+    return {"error": f"App inventory requires helper {MINIMUM_INVENTORY_HELPER_VERSION} or later.",
+            "error_code": "helper_upgrade_required", "helper_version": version,
+            "minimum_helper_version": MINIMUM_INVENTORY_HELPER_VERSION,
+            "upgrade_command": f"shiplord server bootstrap {alias}"}
+
+
+def doctor_all_servers(servers: list[dict[str, str]], probe: Callable[..., dict] | None = None,
+                       timeout: float = FLEET_PROBE_TIMEOUT_SECONDS) -> tuple[int, dict]:
+    """Probe every registered server read-only; one failed probe never stops the sweep.
+
+    Reachability and inventory support are reported separately, so an unreachable server is
+    never mistaken for a confirmed old helper. Nothing here asks for sudo or runs bootstrap.
+    """
+    probe = probe or probe_capabilities
+    results = []
+    for entry in servers:
+        alias = entry["alias"]
+        try:
+            response = probe(entry["ssh"], timeout=timeout)
+        except IncompatibleProtocol:
+            results.append({"server": alias, "ok": False, "reachable": True, "helper_version": None,
+                            "inventory_support": "unknown", "error": "incompatible helper protocol version",
+                            "error_code": "incompatible_protocol"})
+            continue
+        except (TransportError, ServerError):
+            results.append({"server": alias, "ok": False, "reachable": False, "helper_version": None,
+                            "inventory_support": "unknown",
+                            "error": "server capabilities check failed; verify the alias, SSH trust, login, and dispatcher"})
+            continue
+        version = response.get("helper_version")
+        upgrade = inventory_upgrade(alias, version)
+        item = {"server": alias, "ok": upgrade is None, "reachable": True,
+                "helper_version": version if isinstance(version, str) else None,
+                "inventory_support": inventory_support(version)}
+        if upgrade is not None:
+            item.update(upgrade)
+        results.append(item)
+    partial = any(not item["ok"] for item in results)
+    return (3 if partial else 0), {
+        "ok": not partial, "partial": partial,
+        "scope": "protocol capabilities only; server readiness and deployment access were not checked",
+        "servers": results}

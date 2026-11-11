@@ -31,10 +31,17 @@ class HostSystem(AccountSystem):
     def __init__(self):
         super().__init__()
         self.failing: set[str] = set()
+        self.units = {"ssh.service"}
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         tool = argv[0].rsplit("/", 1)[-1]
-        if tool in ("systemctl", "sshd", "docker"):
+        if tool == "systemctl":
+            self.calls.append(list(argv))
+            if argv[1] == "list-unit-files":
+                listed = [unit for unit in argv[2:] if unit in self.units]
+                return CommandResult(0 if listed else 1, "".join(f"{unit} enabled enabled\n" for unit in listed))
+            return CommandResult(1 if tool in self.failing else 0, "")
+        if tool in ("sshd", "docker"):
             self.calls.append(list(argv))
             return CommandResult(1 if tool in self.failing else 0, "27.3.1" if tool == "docker" else "")
         return super().run(argv, input=input, timeout=timeout)
@@ -122,6 +129,55 @@ class ServerDoctorTests(DoctorTestCase):
         response, code = run(request, self.layout, self.system, {})
         self.assertEqual((code, response["result"]["ignored_files"]), (0, ["orders.json~"]))
 
+    def test_doctor_reports_stray_registry_files_without_failing(self):
+        self.provision()
+        (self.layout.registrations / "orders.json~").write_text("x")
+        report = self.report()
+        self.assertEqual(report["checks"]["applications"]["ignored_files"], ["orders.json~"])
+        self.assertEqual([entry["application"] for entry in report["checks"]["applications"]["applications"]],
+                         ["orders"])
+        self.assertEqual((report["ok"], report["checks"]["applications"]["ok"]), (True, True))
+        request = {"version": 1, "request_id": "doctor-stray", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["applications"]["ignored_files"]),
+                         (0, ["orders.json~"]))
+        healthy = FakeSsh((ok(report), b"", 0))
+        self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=healthy))[0], 0)
+
+    def test_the_os_baseline_is_reported(self):
+        os_check = self.report()["checks"]["os"]
+        self.assertEqual((os_check["ok"], os_check["id"], os_check["version_id"]), (True, "ubuntu", "24.04"))
+
+    def test_an_unsupported_os_is_reported_by_the_os_check(self):
+        (self.layout.prefix / "etc" / "os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        report = self.report()
+        self.assertEqual((report["ok"], report["checks"]["os"]["ok"]), (False, False))
+        self.assertEqual(self.failing(report), ["os"])
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", report["checks"]["os"]["message"])
+        self.assertIn("ubuntu 22.04", report["checks"]["os"]["message"])
+        request = {"version": 1, "request_id": "doctor-os", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["os"]["ok"]), (0, False))
+
+    def test_a_clean_registry_reports_no_ignored_files(self):
+        self.provision()
+        report = self.report()
+        self.assertEqual(report["checks"]["applications"]["ignored_files"], [])
+
+    def test_a_corrupt_registration_still_fails_the_applications_check(self):
+        self.provision()
+        (self.layout.registrations / "orders.json").write_text("{not json")
+        report = self.report()
+        self.assertEqual((report["checks"]["applications"]["ok"], report["ok"]), (False, False))
+        request = {"version": 1, "request_id": "doctor-corrupt", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["applications"]["ok"]), (0, False))
+        broken = FakeSsh((ok(report), b"", 0))
+        self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=broken))[0], 3)
+
     def test_admin_apps_action_rejects_application_identity_and_arguments(self):
         request = {"version": 1, "request_id": "apps-1", "action": "apps", "application_id": None,
                    "commit": None, "arguments": {}}
@@ -148,6 +204,22 @@ class ServerDoctorTests(DoctorTestCase):
     def test_a_stopped_service_or_an_invalid_sshd_or_a_dead_docker_is_reported(self):
         self.system.failing = {"systemctl"}
         self.assertEqual(self.report()["checks"]["caddy"]["service_active"], False)
+
+    def test_the_sshd_check_reports_the_discovered_unit_and_include(self):
+        self.system.units = {"sshd.service"}
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["unit"], sshd["dropin_included"]), (True, "sshd.service", True))
+
+    def test_the_sshd_check_fails_when_the_dropin_is_not_included(self):
+        self.sshd_config.write_text("Port 22\n")
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["dropin_current"], sshd["dropin_included"]), (False, True, False))
+        self.assertIn("sshd", self.failing(self.report()))
+
+    def test_the_sshd_check_fails_when_no_unit_is_installed(self):
+        self.system.units = set()
+        sshd = self.report()["checks"]["sshd"]
+        self.assertEqual((sshd["ok"], sshd["unit"]), (False, None))
 
     def test_caddy_admin_api_reachability_is_reported_without_failing_the_check(self):
         with patch("shiplord.serverdoctor.http_get", side_effect=OSError):
@@ -184,6 +256,59 @@ class ServerDoctorTests(DoctorTestCase):
         text = str(self.report())
         for forbidden in ("AAAA", "ssh-ed25519", "PRIVATE KEY"):
             self.assertNotIn(forbidden, text)
+
+
+class AdminLockTests(DoctorTestCase):
+    """The host-wide lock is taken for an action that changes host state, and never for a read-only one."""
+
+    def short_wait(self):
+        """A lock that gives up quickly, so a busy-lock assertion does not wait for the production timeout."""
+        class ShortWait(HostLock):
+            def acquire(lock, timeout=0.05):
+                return super(ShortWait, lock).acquire(timeout)
+        return ShortWait
+
+    def call(self, action):
+        hostwide = action in ("doctor", "apps")
+        return run(envelope(action, application_id=None if hostwide else "orders", arguments={}),
+                   self.layout, self.system, {})
+
+    def hold_lock(self):
+        descriptor = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        return HostLock(descriptor).acquire()
+
+    def test_read_only_actions_answer_while_another_operation_holds_the_lock(self):
+        self.provision()
+        with self.hold_lock():
+            for action in ("doctor", "apps"):
+                with self.subTest(action):
+                    response, code = self.call(action)
+                    self.assertEqual((code, response["status"]), (0, "ok"), response)
+
+    def test_mutating_actions_take_the_lock_and_report_it_busy(self):
+        self.provision()
+        with patch("shiplord.admin.HostLock", self.short_wait()), self.hold_lock():
+            for action in ("provision", "keys", "environment", "registry", "deprovision"):
+                with self.subTest(action):
+                    response, code = self.call(action)
+                    self.assertEqual((code, response["message"]), (1, "host lock is busy"))
+
+    def test_the_read_only_set_is_enumerated_and_covers_every_admin_action(self):
+        from shiplord.admin import READ_ONLY_ACTIONS
+        from shiplord.protocol import ADMIN_ACTIONS
+        self.assertEqual(READ_ONLY_ACTIONS, frozenset({"doctor", "apps"}))
+        self.assertEqual(READ_ONLY_ACTIONS | frozenset({"provision", "keys", "environment", "registry", "deprovision"}),
+                         ADMIN_ACTIONS)
+
+    def test_a_registered_deployment_account_is_denied_a_read_only_action_too(self):
+        self.provision()
+        uid = self.system.users["ship-orders"]["uid"]
+        for action in ("doctor", "apps"):
+            with self.subTest(action):
+                response, code = run(envelope(action, application_id=None, arguments={}), self.layout, self.system,
+                                     {"SUDO_UID": str(uid)})
+                self.assertEqual((code, response["error"]), (3, "denied"))
 
 
 class DoctorProtocolTests(DoctorTestCase):

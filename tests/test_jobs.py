@@ -10,7 +10,8 @@ import time
 import unittest
 from pathlib import Path
 
-from shiplord.jobs import (KEEP_JOBS, DetachedLauncher, JobError, JobStore, SystemdLauncher, unit_name)
+from shiplord.jobs import (KEEP_JOBS, MAX_RUNTIME_SECONDS, DetachedLauncher, JobError, JobStore, SystemdLauncher,
+                           unit_name)
 from shiplord.system import CommandError, CommandResult
 
 
@@ -99,6 +100,24 @@ class StoreTests(StoreTestCase):
         self.assertNotIn("job-0", names)
         self.assertIn(f"job-{KEEP_JOBS + 4}", names)
 
+    def test_an_interrupted_record_is_pruned_and_its_request_id_is_reusable(self):
+        self.store.create("req-1", "deploy", {})
+        self.store.start("req-1")
+        self.now += MAX_RUNTIME_SECONDS + 3600  # well past the launcher's runtime bound: no worker can still be running
+        self.store.create("req-2", "deploy", {})
+        self.assertIsNone(self.store.get("req-1"))
+        again, created = self.store.create("req-1", "deploy", {})
+        self.assertTrue(created)
+        self.assertEqual(again["state"], "queued")
+
+    def test_a_recent_unfinished_record_is_kept(self):
+        self.store.create("req-1", "deploy", {})
+        self.store.start("req-1")
+        self.now += MAX_RUNTIME_SECONDS - 1
+        self.store.create("req-2", "deploy", {})
+        self.assertIsNotNone(self.store.get("req-1"))
+        self.assertEqual(sorted(self.store.unfinished()), ["req-1", "req-2"])
+
     def test_untrusted_directory_is_refused(self):
         self.directory.chmod(0o777)
         self.addCleanup(self.directory.chmod, 0o700)
@@ -138,6 +157,11 @@ class LauncherTests(unittest.TestCase):
         for app in ("orders", "job-x"):  # and no job unit can equal a native application's service unit
             self.assertFalse(unit_name(app, "r") + ".service" == f"shiplord-{app}.service")
         self.assertEqual(unit_name("job-x", "R").split(":")[0], "shiplord-job-job-x")
+
+    def test_request_ids_that_share_a_prefix_get_distinct_unit_names(self):
+        shared = "r" * 24  # the old name truncated every ID to this length, so these two used to be identical
+        self.assertNotEqual(unit_name("orders", shared + "a"), unit_name("orders", shared + "b"))
+        self.assertEqual(unit_name("orders", "req-1"), "shiplord-job-orders:req-1")
 
     def test_launch_failures_are_reported(self):
         failing = FakeSystem(CommandResult(1, "Failed to connect to bus"))
