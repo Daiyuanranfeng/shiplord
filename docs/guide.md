@@ -440,7 +440,7 @@ reach the run page or the calling job.
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
-| `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, Docker, disk, each application); every registered server read-only; access, helper, DNS. |
+| `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, ports once deployed, Docker when needed, disk, each application's state and consistency); every registered server read-only; access, helper, DNS. |
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete
 environments.

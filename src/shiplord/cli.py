@@ -216,7 +216,7 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
            all_servers: bool = typer.Option(False, "--all-servers",
                                             help="Probe every registered server (read-only, no sudo)."),
-           deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, Docker, disk, and applications (sudo)."),
+           deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, ports, Docker, disk, and applications (sudo)."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
     """Check local prerequisites or a server's protocol capabilities; without a manifest, check local only."""
     if all_servers:

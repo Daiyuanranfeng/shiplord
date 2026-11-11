@@ -33,9 +33,14 @@ and never rewrites anything else in it.
 ## Checking a server
 
 `shiplord doctor --server production --deep` (asks for the sudo password if needed) reports, read-only: the helper
-installation, whether Caddy imports the managed routes and is running, whether the sshd drop-in is current and sshd
-accepts its configuration, whether Docker answers, free disk on the Shiplord paths and Docker's, and each
-application's state including any unfinished transaction.
+installation, whether Caddy imports the managed routes and is running, whether sshd accepts its configuration and
+the drop-in is in effect for a `ship-*` account (without confining other accounts), whether Caddy is listening on
+TCP 80 and 443 beyond loopback once an application is deployed, whether Docker answers when a Docker application
+needs it, free disk on the Shiplord paths and Docker's, and each application's state including any unfinished
+transaction. It also compares every application's registration, committed release, running container or unit,
+Caddy route, and environment file, and names a next step for each mismatch. A native-only host passes without
+Docker installed. The port check proves the local bind; a cloud firewall or NAT can still block the ports from
+outside.
 
 `shiplord doctor --all-servers` probes every registered alias with the same read-only capabilities exchange, five
 seconds per server, and keeps going when one is unreachable. It reports each alias's reachability, helper version,

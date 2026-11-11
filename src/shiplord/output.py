@@ -611,8 +611,8 @@ def render_doctor(result: dict, target: str, say: Say | None = None) -> None:
         ("Local tools", ("ssh", "git", "gh")),
         ("Server baseline", ("os",)),
         ("Server access", ("server_access", "helper_actions", "helper")),
-        ("Application", ("application", "applications")),
-        ("Network", ("dns",)),
+        ("Application", ("application", "applications", "consistency")),
+        ("Network", ("dns", "ports")),
         ("Server services", ("caddy", "sshd", "docker")),
         ("Storage", ("disk",)),
     )
@@ -625,6 +625,8 @@ def render_doctor(result: dict, target: str, say: Say | None = None) -> None:
         for name, value in present:
             shown.add(name)
             say(f"  {name.replace('_', ' ')}: {_doctor_value(value)}")
+            if isinstance(value, dict) and value.get("ok") is False and value.get("next_step"):
+                say(f"    next: {value['next_step']}")
             if name == "applications" and isinstance(value, dict):
                 for application in value.get("applications", []):
                     label = application.get("application", "application")
@@ -632,6 +634,21 @@ def render_doctor(result: dict, target: str, say: Say | None = None) -> None:
                     state = application.get("unfinished_transaction") or "none"
                     say(f"    {label}: release {release}; unfinished transaction {state}")
                 render_ignored_files(value.get("ignored_files", []), say)
+            if name == "ports" and isinstance(value, dict):
+                for port in value.get("ports", []):
+                    state = "listening" if port["listening"] else "not listening"
+                    scope = ("reachable from outside" if port["external"]
+                             else "loopback only" if port["listening"] else "nothing bound")
+                    say(f"    port {port['port']}: {state}; {scope}")
+            if name == "consistency" and isinstance(value, dict):
+                for application in value.get("applications", []):
+                    label = application.get("application", "application")
+                    if application.get("ok"):
+                        say(f"    {label}: consistent")
+                        continue
+                    say(f"    {label}: {', '.join(application.get('mismatches', []))}")
+                    if application.get("next_step"):
+                        say(f"      next: {application['next_step']}")
     for name, value in checks.items():
         if name not in shown:
             say(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
