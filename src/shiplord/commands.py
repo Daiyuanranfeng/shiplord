@@ -18,7 +18,7 @@ from .client import AdminClient, ClientError, HelperClient, new_request_id, subm
 from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
-from .manifest import GENERIC_DOCKER_FEATURE
+from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS
 from .runtime import RuntimeFailure
 from .servers import ServerError
 from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
@@ -265,6 +265,13 @@ def job_timeout(manifest: dict) -> float:
     return manifest["deploy"]["readiness_timeout_seconds"] + 900
 
 
+def explicit_job_timeout() -> float:
+    """Wait bound for a named target with no local manifest: cover the larger of both supported runtimes."""
+    docker = job_timeout({"runtime": "docker"})
+    native = job_timeout({"runtime": "native", "deploy": {"readiness_timeout_seconds": MAX_READINESS_SECONDS}})
+    return max(docker, native)
+
+
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
                        commit: str, sequence: int, request_id: str | None = None, timeout: float | None = None, allow_older: bool = False,
                        on_progress: Callable[[str], None] = lambda phase: None, verify_public: bool = True,
@@ -324,10 +331,16 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
     return 0, {"ok": True, "logs": client.call("logs", arguments={"tail": tail})["result"]["logs"]}
 
 
-def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+def run_job_command(manifest: dict | None, client: HelperClient, action: str, *, request_id: str | None = None,
                     force_stop: bool = False,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Submit one job and wait for it.
+
+    ``manifest`` is None for a named target resolved without a local manifest; the wait bound then has to cover
+    every runtime the server may report for that application.
+    """
     request_id = request_id or new_request_id(action)
+    timeout = explicit_job_timeout() if manifest is None else job_timeout(manifest)
     arguments = {"force_stop": True} if force_stop else {}
     if action == "restart" and "restart" not in client.call("capabilities")["actions"]:
         # An older helper answers a bare "invalid action" with exit 2, which would blame the operator's input.
@@ -337,8 +350,8 @@ def run_job_command(manifest: dict, client: HelperClient, action: str, *, reques
         raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
                            "to upgrade it, then retry", 4)
     outcome = submit_and_wait(client, action, request_id=request_id, arguments=arguments,
-                              timeout=job_timeout(manifest), on_progress=on_progress,
-                              lookup_command=status_lookup_command(manifest, request_id))
+                              timeout=timeout, on_progress=on_progress,
+                              lookup_command=status_lookup_command(manifest, request_id) if manifest else None)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 

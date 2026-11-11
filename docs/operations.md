@@ -52,7 +52,7 @@ runs bootstrap. It rejects `--server`, `--local`, and `--deep` before contacting
 | New release never becomes ready or exits | Previous release restored; exit 5. | Read `status`, `logs`. |
 | First release fails | No runtime, no route; exit 1. | Fix and redeploy. |
 | Caddy rejects the route | The previous file is restored and Caddy reloaded; exit 5. | Check the hostname and Caddy logs. |
-| Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover`. |
+| Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover` (or `shiplord recover <app> --server <alias>` from anywhere). |
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
 | Client disconnects | The job continues. | `shiplord status <app> --server <alias> --job-id <id>`. |
 

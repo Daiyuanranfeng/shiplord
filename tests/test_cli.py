@@ -972,7 +972,29 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Outcome: recovery required", result.output)
         self.assertIn("unfinished deployment transaction", result.output)
-        self.assertIn("shiplord recover", result.output)
+        self.assertIn("shiplord recover orders --server hetzner-vm", result.output)
+
+    def test_status_hint_from_a_manifest_names_the_resolved_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("production", "admin@host.example.com"))
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "ship.toml").write_text(MANIFEST)
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": {"request_id": "req-1", "phase": "prepared"}, "running": None,
+            }}
+            current = Path.cwd()
+            try:
+                os.chdir(project)
+                with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)), \
+                        patch("shiplord.cli._helper"):
+                    result = CliRunner().invoke(cli.app, ["status"], env=self.env(config))
+            finally:
+                os.chdir(current)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("shiplord recover orders --server production", result.output)
 
     @staticmethod
     def empty_application() -> dict:
@@ -1204,6 +1226,115 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(server_data["client"]["version"], "0.2.0")
 
 
+class CLIRecoveryTests(unittest.TestCase):
+    """`recover` keeps manifest mode and adds a named target that works without a checkout."""
+
+    OUTCOMES = (
+        (0, {"ok": True, "status": "recovered", "exit_code": 0}),
+        (0, {"ok": True, "status": "nothing_to_recover", "exit_code": 0}),
+        (6, {"ok": False, "status": "intervention_required", "exit_code": 6, "error": "recovery_failed"}),
+    )
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.config = root / "config"
+        self.project = root / "project"
+        self.project.mkdir()
+        self.write_servers(("hetzner-vm", "admin@host.example.com"))
+
+    def write_servers(self, *servers: tuple[str, str]) -> None:
+        directory = self.config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (self.config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            record = directory / f"{alias}.json"
+            record.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            record.chmod(0o600)
+
+    def invoke(self, *arguments: str, cwd: Path | None = None):
+        """Invoke from a directory with no ship.toml unless the test writes one."""
+        env = {key: value for key, value in os.environ.items() if not key.startswith("SHIPLORD_")}
+        env["XDG_CONFIG_HOME"] = str(self.config)
+        current = Path.cwd()
+        os.chdir(cwd or self.project)
+        try:
+            return CliRunner().invoke(cli.app, list(arguments), env=env)
+        finally:
+            os.chdir(current)
+
+    def test_explicit_recovery_needs_no_manifest_and_uses_the_app_scoped_login(self):
+        self.assertFalse((self.project / "ship.toml").exists())
+        outcome = {"ok": True, "request_id": "rc-1", "status": "recovered", "exit_code": 0}
+        with patch("shiplord.cli.commands.run_job_command", return_value=(0, outcome)) as run:
+            result = self.invoke("recover", "orders", "--server", "hetzner-vm")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIsNone(run.call_args.args[0])  # no local manifest was invented for the wait bound
+        client = run.call_args.args[1]
+        self.assertEqual((client.application_id, client.target), ("orders", "ship-orders@host.example.com"))
+        self.assertEqual(run.call_args.args[2], "recover")
+        self.assertIn("Target: orders on hetzner-vm", result.stderr)
+        self.assertIn("Outcome: recovered", result.stderr)
+        self.assertIn("status: recovered", result.stdout)
+
+    def test_explicit_recovery_json_is_the_existing_result_shape(self):
+        outcome = {"ok": True, "request_id": "rc-1", "status": "nothing_to_recover", "exit_code": 0}
+        with patch("shiplord.cli.commands.run_job_command", return_value=(0, outcome)):
+            result = self.invoke("recover", "orders", "--server", "hetzner-vm", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.stdout), outcome)
+        self.assertEqual(result.stderr, "")
+
+    def test_explicit_recovery_requires_both_selectors_before_any_connection(self):
+        for arguments in (("recover", "orders"), ("recover", "--server", "hetzner-vm")):
+            with self.subTest(arguments=arguments), \
+                    patch("shiplord.cli.commands.run_job_command") as run, \
+                    patch("shiplord.cli.HelperClient") as helper:
+                result = self.invoke(*arguments)
+            self.assertEqual(result.exit_code, 2, result.output)
+            self.assertIn("both an application and a server alias", result.stdout)
+            self.assertIn("shiplord recover <app> --server <alias>", result.stdout)
+            run.assert_not_called()
+            helper.assert_not_called()
+
+    def test_explicit_recovery_rejects_invalid_selectors_before_any_connection(self):
+        cases = ((("recover", "Orders", "--server", "hetzner-vm"), 2),
+                 (("recover", "orders", "--server", "unknown"), 3))
+        for arguments, code in cases:
+            with self.subTest(arguments=arguments), \
+                    patch("shiplord.cli.commands.run_job_command") as run, \
+                    patch("shiplord.cli.HelperClient") as helper:
+                result = self.invoke(*arguments, "--json")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertFalse(json.loads(result.stdout)["ok"])
+            run.assert_not_called()
+            helper.assert_not_called()
+
+    def test_recovery_outcomes_keep_their_exit_codes_in_explicit_mode(self):
+        for code, outcome in self.OUTCOMES:
+            with self.subTest(status=outcome["status"]), \
+                    patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)):
+                result = self.invoke("recover", "orders", "--server", "hetzner-vm")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertIn(f"status: {outcome['status']}", result.stdout)
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stderr)
+            if outcome.get("error"):
+                self.assertIn(f"error: {outcome['error']}", result.stdout)
+
+    def test_recovery_outcomes_keep_their_exit_codes_in_manifest_mode(self):
+        (self.project / "ship.toml").write_text(MANIFEST)
+        for code, outcome in self.OUTCOMES:
+            with self.subTest(status=outcome["status"]), \
+                    patch("shiplord.cli._helper") as helper, \
+                    patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)) as run:
+                result = self.invoke("recover")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertEqual(run.call_args.args[0]["name"], "orders")
+            self.assertEqual(run.call_args.args[1], helper.return_value)
+            self.assertIn(f"status: {outcome['status']}", result.stdout)
+            self.assertEqual(result.stderr, "")
 class RecordingAdminClient:
     """A stand-in for the sudo client that records the resolved target and each request."""
 

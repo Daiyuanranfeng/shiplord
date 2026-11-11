@@ -309,6 +309,14 @@ else: sys.exit("unsupported: " + " ".join(args))
 
     def test_13_recover_with_nothing_to_recover_succeeds(self):
         self.assertEqual(self.cli_json("recover")["status"], "nothing_to_recover")
+        # The named form reconciles the same application from a directory with no checkout.
+        empty = ROOT / "empty"
+        empty.mkdir(exist_ok=True)
+        named = json.loads(self.cli("recover", self.app, "--server", "production", "--json", cwd=empty, check=0).stdout)
+        self.assertEqual(named["status"], "nothing_to_recover")
+        human = self.cli("recover", self.app, "--server", "production", cwd=empty, check=0)
+        self.assertIn(f"Target: {self.app} on production", human.stderr)
+        self.assertEqual(list(empty.iterdir()), [])
 
     def test_14_a_password_protected_sudo_is_supported_without_the_password_leaving_stdin(self):
         client = AdminClient("adminpw@127.0.0.1", prompt=lambda text: ADMIN_PASSWORD)

@@ -273,6 +273,19 @@ class DeployCommandTests(ClientTestCase):
                           status["job"]["outcome"]["exit_code"]), (0, "finished", "rolled_back", 5))
 
 
+def begin_unfinished_transaction(case):
+    """Leave the journal of an interrupted deployment behind, as a killed worker would."""
+    from fakes import record
+    from shiplord.release_state import HostLock, ReleaseState
+    var_fd = os.open(case.layout.var, os.O_RDONLY | os.O_DIRECTORY)
+    state_fd = os.open(case.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
+    case.addCleanup(os.close, var_fd)
+    case.addCleanup(os.close, state_fd)
+    lock = HostLock(var_fd)
+    with lock.acquire():
+        ReleaseState("orders", state_fd, lock).begin("req-x", record())
+
+
 class QueryCommandTests(ClientTestCase):
     def test_plan_status_and_logs_use_read_only_actions(self):
         code, plan = commands.plan_application(manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000)
@@ -324,8 +337,55 @@ class QueryCommandTests(ClientTestCase):
         self.assertEqual((code, result["ok"], result["error"]), (1, False, "no_previous_release"))
         self.assertEqual(calls, ["rc-1", "rb-1"])
 
+    def recover_job(self, manifest_value, request_id):
+        """Run the real recovery job through the helper, as a polling client would."""
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        return commands.run_job_command(manifest_value, self.client, "recover", request_id=request_id)
+
+    def test_an_interrupted_deployment_recovers_without_a_local_manifest(self):
+        begin_unfinished_transaction(self)
+        code, result = self.recover_job(None, "rc-explicit")
+        self.assertEqual((code, result["ok"], result["status"]), (0, True, "recovered"))
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.runtime.calls, [("stop",)])
+
+    def test_a_recovery_that_cannot_reconcile_keeps_its_exit_code_and_journal(self):
+        begin_unfinished_transaction(self)
+        self.routes_reload_failure()
+        code, result = self.recover_job(None, "rc-failed")
+        self.assertEqual((code, result["ok"], result["status"]), (6, False, "intervention_required"))
+        self.assertIsNotNone(self.state.read_journal())
+
+    def routes_reload_failure(self):
+        self.caddy.fail_reload.add(self.caddy.reload_calls + 1)
+
+    def test_a_named_recovery_without_a_manifest_waits_for_every_runtime(self):
+        native_max = commands.job_timeout({"runtime": "native", "deploy": {"readiness_timeout_seconds": 900}})
+        self.assertGreaterEqual(commands.explicit_job_timeout(), commands.job_timeout({"runtime": "docker"}))
+        self.assertGreaterEqual(commands.explicit_job_timeout(), native_max)
+        outcome = {"status": "recovered", "exit_code": 0, "detail": {}}
+        with patch("shiplord.commands.submit_and_wait", return_value=outcome) as submit:
+            code, result = commands.run_job_command(None, self.client, "recover", request_id="rc-explicit")
+        self.assertEqual((code, result["ok"], result["status"]), (0, True, "recovered"))
+        self.assertEqual(submit.call_args.kwargs["timeout"], commands.explicit_job_timeout())
+
+    def test_a_manifest_recovery_keeps_the_manifest_wait_bound(self):
+        outcome = {"status": "nothing_to_recover", "exit_code": 0, "detail": {}}
+        with patch("shiplord.commands.submit_and_wait", return_value=outcome) as submit:
+            code, result = commands.run_job_command(manifest(), self.client, "recover", request_id="rc-manifest")
+        self.assertEqual((code, result["status"]), (0, "nothing_to_recover"))
+        self.assertEqual(submit.call_args.kwargs["timeout"], commands.job_timeout(manifest()))
+
     def test_a_restart_runs_as_a_job_and_reports_the_unchanged_release(self):
         import shiplord.client as client_module
+
         original = client_module.wait_for_job
 
         def wait(client, job_id, **options):
@@ -415,15 +475,7 @@ class DoctorTests(ClientTestCase):
         self.assertEqual(result["checks"]["application"]["hint"], "run `shiplord recover`")
 
     def state_begin(self):
-        from fakes import record
-        from shiplord.release_state import HostLock, ReleaseState
-        var_fd = os.open(self.layout.var, os.O_RDONLY | os.O_DIRECTORY)
-        state_fd = os.open(self.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
-        self.addCleanup(os.close, var_fd)
-        self.addCleanup(os.close, state_fd)
-        lock = HostLock(var_fd)
-        with lock.acquire():
-            ReleaseState("orders", state_fd, lock).begin("req-x", record())
+        begin_unfinished_transaction(self)
 
 
 class InventoryCompatibilityTests(unittest.TestCase):

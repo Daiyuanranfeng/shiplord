@@ -394,7 +394,7 @@ reach the run page or the calling job.
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
-| `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
+| `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
@@ -435,7 +435,9 @@ back deliberately. Database and persistent data are never
 rolled back.
 
 If a worker is killed mid-deployment the journal remains, further deployments are refused with
-`recovery_required`, and `shiplord recover` restores the last committed release.
+`recovery_required`, and `shiplord recover` restores the last committed release. `shiplord status` prints the
+named form of that command, so recovery works from any directory without a checkout:
+`shiplord recover <app> --server <alias>`.
 
 ### Applying an environment change
 
