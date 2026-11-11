@@ -13,6 +13,9 @@ import re
 from . import __version__
 
 TOOLING_REPOSITORY = "QueryPlanner/shiplord"
+# PyPI releases can predate the composite action (notably 0.2.0). Pin its reviewed source
+# independently; git installs continue to use the same commit for both CLI and action.
+PYPI_DEPLOY_ACTION_REF = "465a02fd0d76308546893d2cc37a94254e07c598"
 WORKFLOW_PATH = ".github/workflows/shiplord-release.yml"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/shiplord-deploy.yml"
 DEFAULT_QUALITY_WORKFLOW = ".github/workflows/code-quality.yml"
@@ -88,6 +91,11 @@ def render_deploy_workflow(manifest: dict, *, tooling_ref: str | None = None, to
     quote = json.dumps
     install = _tooling_install(tooling_ref, tooling_version, tooling_repository)
     qemu = f"      - uses: {ACTIONS['qemu']}\n" if "arm64" in platforms else ""
+    # The deploy job's tailnet, SSH, deploy and summary steps live in this repository's composite action,
+    # pinned to the CLI commit for git installs, or an independent reviewed commit for PyPI installs.
+    action_repository = TOOLING_REPOSITORY if tooling_version is not None else tooling_repository
+    action_ref = PYPI_DEPLOY_ACTION_REF if tooling_version is not None else tooling_ref
+    action = f"{action_repository}/deploy@{action_ref}"
     return _header() + f"""name: Shiplord deploy
 
 on:
@@ -167,62 +175,22 @@ jobs:
           python-version: "3.12"
       - name: Install the pinned Shiplord
         run: python -m pip install --disable-pip-version-check {quote(install)}
-      - name: Join the tailnet
-        uses: {ACTIONS['tailscale']}
+      - name: Deploy with Shiplord
+        uses: {action}
         with:
-          oauth-client-id: ${{{{ vars.SHIPLORD_TS_CLIENT_ID }}}}
-          audience: ${{{{ vars.SHIPLORD_TS_AUDIENCE }}}}
-          tags: ${{{{ vars.SHIPLORD_TS_TAGS || 'tag:ci' }}}}
-          # A new node is not accepted by its peers immediately; wait until the server answers.
-          ping: ${{{{ vars.SHIPLORD_SERVER_HOST }}}}
-      - name: Prepare the SSH identity and pinned host keys
-        env:
-          SSH_PRIVATE_KEY: ${{{{ secrets.SHIPLORD_SSH_PRIVATE_KEY }}}}
-          KNOWN_HOSTS: ${{{{ vars.SHIPLORD_SSH_KNOWN_HOSTS }}}}
-          DEPLOY_USER: ${{{{ vars.SHIPLORD_DEPLOY_USER }}}}
-          SERVER_HOST: ${{{{ vars.SHIPLORD_SERVER_HOST }}}}
-          SSH_PORT: ${{{{ vars.SHIPLORD_SSH_PORT }}}}
-        run: |
-          set -euo pipefail
-          umask 077
-          printf '%s\\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/shiplord_key"
-          printf '%s\\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/shiplord_known_hosts"
-          {{
-            echo "SHIPLORD_SSH_IDENTITY=$RUNNER_TEMP/shiplord_key"
-            echo "SHIPLORD_SSH_KNOWN_HOSTS_FILE=$RUNNER_TEMP/shiplord_known_hosts"
-            echo "SHIPLORD_SSH_TARGET=${{DEPLOY_USER}}@${{SERVER_HOST}}"
-            if [ -n "$SSH_PORT" ]; then echo "SHIPLORD_SSH_PORT=$SSH_PORT"; fi
-          }} >> "$GITHUB_ENV"
-      - name: Check access only
-        if: ${{{{ inputs.check_only }}}}
-        run: shiplord status --json
-      - name: Deploy
-        if: ${{{{ !inputs.check_only }}}}
-        env:
-          IMAGE: ${{{{ needs.build.outputs.image }}}}
-          DIGEST: ${{{{ needs.build.outputs.digest }}}}
-          RUN_ID: ${{{{ github.run_id }}}}
-          RUN_ATTEMPT: ${{{{ github.run_attempt }}}}
-        run: |
-          set -euo pipefail
-          shiplord deploy --image "${{IMAGE}}@${{DIGEST}}" --commit "$GITHUB_SHA" \\
-            --request-id "gh-${{RUN_ID}}-${{RUN_ATTEMPT}}" --require-public --json | tee "$RUNNER_TEMP/shiplord-result.json"
-      - name: Summary
-        if: ${{{{ always() }}}}
-        run: |
-          python - <<'PY'
-          import json, os
-          path = os.path.join(os.environ["RUNNER_TEMP"], "shiplord-result.json")
-          if os.path.exists(path):
-              result = json.load(open(path))
-              release = result.get("release") or {{}}
-              lines = [f"- status: {{result.get('status')}}", f"- commit: {{release.get('commit')}}",
-                       f"- public check: {{(result.get('public') or {{}}).get('ok')}}"]
-              open(os.environ["GITHUB_STEP_SUMMARY"], "a").write("### Shiplord deployment\\n" + "\\n".join(lines) + "\\n")
-          PY
-      - name: Remove the SSH identity
-        if: ${{{{ always() }}}}
-        run: rm -f "$RUNNER_TEMP/shiplord_key" "$RUNNER_TEMP/shiplord_known_hosts" "$RUNNER_TEMP/shiplord-result.json"
+          check-only: ${{{{ inputs.check_only }}}}
+          ssh-private-key: ${{{{ secrets.SHIPLORD_SSH_PRIVATE_KEY }}}}
+          ssh-known-hosts: ${{{{ vars.SHIPLORD_SSH_KNOWN_HOSTS }}}}
+          deploy-user: ${{{{ vars.SHIPLORD_DEPLOY_USER }}}}
+          server-host: ${{{{ vars.SHIPLORD_SERVER_HOST }}}}
+          ssh-port: ${{{{ vars.SHIPLORD_SSH_PORT }}}}
+          ts-client-id: ${{{{ vars.SHIPLORD_TS_CLIENT_ID }}}}
+          ts-audience: ${{{{ vars.SHIPLORD_TS_AUDIENCE }}}}
+          ts-tags: ${{{{ vars.SHIPLORD_TS_TAGS || 'tag:ci' }}}}
+          image: ${{{{ needs.build.outputs.image }}}}
+          digest: ${{{{ needs.build.outputs.digest }}}}
+          commit: ${{{{ github.sha }}}}
+          request-id: gh-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}
 """
 
 

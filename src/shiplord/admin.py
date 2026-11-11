@@ -21,7 +21,7 @@ from .provision import ProvisionError, deprovision, manage_environment, manage_k
 from .registry import Registry
 from .retire import make_retirer
 from .release_state import HostLock, StateError
-from .routing import SubprocessCaddy
+from .routing import RouteManager, RoutingError, SubprocessCaddy
 from .system import HostSystem, System
 
 
@@ -66,18 +66,29 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         if args:
             raise ProtocolError("unknown arguments")
         return application_inventory(layout, lock)
-    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb"},
+    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb",
+                             "update"},
                "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text"}, "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]
     if set(args) - allowed:
         raise ProtocolError("unknown arguments")
     if action == "provision":
-        if set(args) - {"max_memory_mb"} != allowed - {"max_memory_mb"}:
+        required = {"runtime", "api_domain", "image_repository", "public_key", "key_label"}
+        if not required <= set(args) or set(args) - required - {"max_memory_mb", "update"}:
             raise ProtocolError("missing arguments")
-        extra = {"max_memory_mb": args["max_memory_mb"]} if "max_memory_mb" in args else {}
+        if "update" in args and args["update"] is not True:
+            raise ProtocolError("update must be true")
+        extra = {key: args[key] for key in ("max_memory_mb", "update") if key in args}
+        apply_route = None
+        if extra.get("update") is True:
+            def apply_route(registration: dict):
+                try:
+                    return RouteManager(layout.caddy_root, lock, SubprocessCaddy()).apply(registration)
+                except RoutingError as error:
+                    raise ProvisionError(f"could not change the public route: {error}") from None
         return provision(layout, system, lock, application_id=app, runtime=args["runtime"], **extra,
                          api_domain=args["api_domain"], image_repository=args["image_repository"],
-                         public_key=args["public_key"], key_label=args["key_label"])
+                         public_key=args["public_key"], key_label=args["key_label"], apply_route=apply_route)
     if action == "keys":
         return manage_key(layout, app, args.get("operation"), label=args.get("label"),
                           public_key=args.get("public_key"))

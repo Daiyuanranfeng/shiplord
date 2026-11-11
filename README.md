@@ -7,7 +7,10 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## What you need
 
 - A computer with Python 3.11 or newer, Git, and OpenSSH.
-- A Linux server with systemd, SSH, administrator access, and Caddy.
+- A Linux server running **Ubuntu 24.04 or later, or Debian 12 or later**, with systemd, SSH, administrator
+  access, and Caddy from its package repository (`/usr/bin/caddy`). The helper needs **Python 3.11 or later at
+  `/usr/bin/python3`**; `shiplord server bootstrap` reads `/etc/os-release` and refuses any other distribution or
+  an older version with a message naming what is supported.
 - Docker on the server if you deploy Docker images.
 - A DNS record that points your app's domain to the server. Shiplord checks DNS but does not change it.
 
@@ -21,6 +24,9 @@ shiplord doctor --local
 
 `shiplord github setup` pins the same version in the generated workflow (`shiplord==<version>`). When you run
 Shiplord from a git checkout, pass `--tooling-ref <commit>` instead.
+For a PyPI install, the composite deploy action is pinned separately to commit `465a02fd0d76308546893d2cc37a94254e07c598` in `QueryPlanner/shiplord`, which contains
+`deploy/action.yml`; it is not inferred from a PyPI version tag (the `v0.2.0` tag predates the action).
+With `--tooling-ref`, both the installed CLI and the action use that commit in the tooling repository.
 
 ## Set up once
 
@@ -73,7 +79,7 @@ shiplord deploy \
 
 `plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
 
-If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data.
+If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data. For app data, the supported path is one SQLite database on the app's volume (or data directory); see [Application data](docs/guide.md#application-data).
 
 ## Check or undo a deployment
 
@@ -84,7 +90,10 @@ shiplord rollback
 shiplord recover
 ```
 
-Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
+From any directory, `shiplord recover <app> --server <alias>` reconciles a named application without a checkout;
+`shiplord status` prints that exact command when it finds unfinished work.
+
+Use `shiplord env set --from-file .env.production` to set app secrets. Preview the key names it would add or remove with `shiplord env diff --from-file .env.production`. Shiplord does not print or log secret values.
 Run `shiplord restart` to apply the current environment to the running release without a new commit.
 
 ## Learn more

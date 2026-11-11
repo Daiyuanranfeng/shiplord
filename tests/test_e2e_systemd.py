@@ -170,8 +170,8 @@ class NativeSystemdTests(unittest.TestCase):
         sh("systemctl", "disable", "--now", f"shiplord-{cls.app}.service", check=False)
 
     # helpers ------------------------------------------------------------------
-    def cli(self, *args, check=None, **kwargs):
-        result = subprocess.run([self.executable, *args], cwd=self.project, env=self.environment, capture_output=True,
+    def cli(self, *args, check=None, cwd=None, **kwargs):
+        result = subprocess.run([self.executable, *args], cwd=cwd or self.project, env=self.environment, capture_output=True,
                                 text=True, timeout=900, **kwargs)
         if check is not None and result.returncode != check:
             self.fail(f"shiplord {' '.join(args)} exited {result.returncode}, expected {check}\n{result.stdout}\n{result.stderr}")
@@ -318,10 +318,14 @@ class NativeSystemdTests(unittest.TestCase):
         self.assertIsNotNone(self.cli_json("status")["application"]["unfinished_transaction"])
         blocked = self.deploy("v3", 4001, check=1)
         self.assertEqual(blocked["error"], "recovery_required")
-        recovered = self.cli_json("recover")
+        # Recover by named target from a directory with no checkout; the app-scoped login is enough.
+        empty = ROOT / "empty"
+        empty.mkdir(exist_ok=True)
+        recovered = json.loads(self.cli("recover", self.app, "--server", "production", "--json", cwd=empty, check=0).stdout)
         self.assertEqual(recovered["status"], "recovered")
         self.assertIsNone(self.cli_json("status")["application"]["unfinished_transaction"])
         self.assertEqual(self.get("/version"), "slow")  # the last committed release is serving again
+        self.assertEqual(self.cli_json("recover")["status"], "nothing_to_recover")
 
     def test_11_rollback_restores_the_previous_release(self):
         result = self.cli_json("rollback")

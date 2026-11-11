@@ -435,6 +435,9 @@ class SetupTests(GitHubTestCase):
         with patch("shiplord.github.detect_tooling_ref", return_value=None):
             result = self.setup_call(tooling_ref=None)
         self.assertIn(f"shiplord=={__version__}", (self.project / DEPLOY_WORKFLOW_PATH).read_text())
+        self.assertIn("uses: QueryPlanner/shiplord/deploy@465a02fd0d76308546893d2cc37a94254e07c598",
+                      (self.project / DEPLOY_WORKFLOW_PATH).read_text())
+        self.assertNotIn("@None", (self.project / DEPLOY_WORKFLOW_PATH).read_text())
         self.assertIn(f"pinned at {__version__}", result["steps"]["workflow"])
         with patch("shiplord.github.detect_tooling_ref", return_value="ef" * 20):
             self.assertIn("efefefefefef", self.setup_call(tooling_ref=None)["steps"]["workflow"])
