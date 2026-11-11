@@ -315,7 +315,8 @@ else: sys.exit("unsupported: " + " ".join(args))
         named = json.loads(self.cli("recover", self.app, "--server", "production", "--json", cwd=empty, check=0).stdout)
         self.assertEqual(named["status"], "nothing_to_recover")
         human = self.cli("recover", self.app, "--server", "production", cwd=empty, check=0)
-        self.assertIn(f"Target: {self.app} on production", human.stderr)
+        self.assertIn(f"Target: {self.app} on production", human.stdout)
+        self.assertIn("Outcome: nothing to recover", human.stdout)
         self.assertEqual(list(empty.iterdir()), [])
 
     def test_14_a_password_protected_sudo_is_supported_without_the_password_leaving_stdin(self):
