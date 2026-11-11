@@ -117,8 +117,20 @@ class ReleaseStateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 self.store.clear_after_reconciliation()
 
+    def test_docker_hub_images_are_stored_pinned_in_their_one_spelling(self):
+        for given, stored in (("docker.io/example/orders@sha256:" + "b" * 64, "docker.io/example/orders@sha256:" + "b" * 64),
+                              ("docker.io/library/nginx@sha256:" + "c" * 64, "docker.io/library/nginx@sha256:" + "c" * 64),
+                              ("nginx@sha256:" + "d" * 64, "docker.io/library/nginx@sha256:" + "d" * 64)):
+            with self.subTest(image=given), self.lock.acquire():
+                item = release()
+                item["artifact"] = {"kind": "docker", "image": given}
+                self.assertEqual(self.commit("request-hub-" + stored[-8:], item)["current"]["artifact"]["image"], stored)
+
     def test_invalid_artifacts_and_configuration_are_rejected_before_journal(self):
         examples = [dict(release(), commit="bad"), dict(release(), artifact={"kind": "docker", "image": "latest"}),
+                    dict(release(), artifact={"kind": "docker", "image": "quay.io/example/orders@sha256:" + "a" * 64}),
+                    dict(release(), artifact={"kind": "docker", "image": "example/orders@sha256:" + "a" * 64}),
+                    dict(release(), artifact={"kind": "docker", "image": "docker.io/nginx@sha256:" + "a" * 64}),
                     dict(release(), artifact={"kind": "native", "sha256": "bad", "size": 1, "architecture": "linux-amd64"}),
                     dict(release(), artifact={"kind": "other"}), dict(release(), configuration={}),
                     dict(release(), extra="secretvalue")]

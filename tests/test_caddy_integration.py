@@ -292,6 +292,70 @@ class RealCaddyTests(unittest.TestCase):
         self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"still served")
         self.assertEqual([p.name for p in self.root.rglob(".*")], [])
 
+    def test_a_symlinked_sites_enabled_file_is_inspected(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "orders.conf"
+        target.write_text("orders.example.com {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "orders.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(self.registration(managed_port(set())))
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(list((self.root / "ship").iterdir()), [])
+
+    def test_a_symlinked_sites_enabled_file_for_another_site_still_applies(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "legacy.conf"
+        target.write_text("legacy.example.net {\n\trespond \"legacy\"\n}\n")
+        target.chmod(0o644)
+        (enabled / "legacy.conf").symlink_to(target)
+        with open(self.caddyfile, "a") as file:
+            file.write(f"import {enabled}/*.conf\n")
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
+    def test_a_directive_only_snippet_imported_with_an_argument_applies(self):
+        # Caddy accepts a directive-only snippet imported with an argument, so a route change must still work.
+        # A top-level directive snippet must be the last thing in the file, so the import closes the file.
+        with open(self.caddyfile, "a") as file:
+            file.write("(site_headers) {\n\tencode gzip\n}\n"
+                       "legacy.example.net {\n\timport site_headers 5s\n\trespond \"legacy\"\n}\n"
+                       "(global_debug) {\n\tdebug\n}\n"
+                       "import global_debug 5s\n")
+        self.assertEqual(run_command([shutil.which("caddy"), "validate", "--config", str(self.caddyfile),
+                                      "--adapter", "caddyfile"],
+                                     env=dict(os.environ, HOME=str(self.data_home))).code, 0)
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
+    def test_a_snippet_that_declares_the_managed_hostname_from_an_argument_is_a_conflict(self):
+        with open(self.caddyfile, "a") as file:
+            file.write("(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                       "import sites orders.example.com\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(self.registration(managed_port(set())))
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(list((self.root / "ship").iterdir()), [])
+
+    def test_a_snippet_argument_for_another_site_still_applies(self):
+        with open(self.caddyfile, "a") as file:
+            file.write("(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                       "import sites legacy.example.net\n")
+        port = self.start_upstream(b"orders")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(self.registration(port)).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"orders")
+
     def test_a_caddyfile_that_reads_a_service_variable_validates(self):
         # A container without systemd cannot report the unit, so this exercises the packaged-defaults path: the
         # variable the Caddyfile reads has to reach `caddy validate`, or the file is judged broken for no reason.

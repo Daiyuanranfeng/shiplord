@@ -24,6 +24,30 @@
 Bootstrap adds exactly one line to the main Caddyfile (`import /etc/caddy/ship/*.caddy`) after validating it,
 and never rewrites anything else in it.
 
+Each successful bootstrap also collects old helper versions. It keeps the version that is running, every version a
+symlink in `/usr/local/lib/shiplord` points at (including `current`), and the newest other finished version as the
+rollback target, and removes older ones. A directory whose name bootstrap did not generate, or that never finished
+installing, is left for the next run.
+
+## Removing Shiplord from a server
+
+`shiplord server uninstall <alias>` removes exactly what bootstrap installed: the four launchers, the helper code
+and its `current` link, the sshd drop-in, and the managed Caddy import and placeholder route. Each removal is
+proven by ownership, not by path alone. A launcher is removed only when its bytes are the ones bootstrap writes;
+the sshd drop-in and Caddy placeholder only when they still start with Shiplord's managed marker; a version
+directory only when its name is one bootstrap generates and it holds the `.complete` marker; and a directory only
+when it is empty and Shiplord owns it. Anything else is left in place and named in the report.
+
+Application artifacts are never deleted, with or without `--force`: registrations, keys, sudoers rules, routes,
+accounts, `/var/lib/shiplord` state, `/opt/shiplord` releases, and native application data under
+`/var/lib/shiplord/data` stay. The command prints what it left behind and the one thing it always keeps, the state
+directory that holds the host lock.
+
+The command refuses while any application is still provisioned, before it changes anything. Deprovision the
+applications first, or pass `--force` to remove the host and leave every application artifact in place; a later
+`shiplord server bootstrap <alias>` restores service. Uninstall is idempotent: a second run removes nothing and
+reports that the host was already uninstalled. Run `shiplord server bootstrap <alias>` to install the helper again.
+
 ## Accounts
 
 - `ship-<app>`: the deployment account (for long names, a shortened name with a hash). Its shell is only ever
@@ -33,9 +57,21 @@ and never rewrites anything else in it.
 ## Checking a server
 
 `shiplord doctor --server production --deep` (asks for the sudo password if needed) reports, read-only: the helper
-installation, whether Caddy imports the managed routes and is running, whether the sshd drop-in is current and sshd
-accepts its configuration, whether Docker answers, free disk on the Shiplord paths and Docker's, and each
-application's state including any unfinished transaction.
+installation, whether Caddy imports the managed routes and is running, whether sshd accepts its configuration and
+the drop-in is in effect for a `ship-*` account (without confining other accounts), whether Caddy is listening on
+TCP 80 and 443 beyond loopback once an application is deployed, whether Docker answers when a Docker application
+needs it, free disk on the Shiplord paths and Docker's, and each application's state including any unfinished
+transaction. It also compares every application's registration, committed release, running container or unit,
+Caddy route, and environment file, and names a next step for each mismatch. A native-only host passes without
+Docker installed. The port check proves the local bind; a cloud firewall or NAT can still block the ports from
+outside.
+
+`shiplord doctor --all-servers` probes every registered alias with the same read-only capabilities exchange, five
+seconds per server, and keeps going when one is unreachable. It reports each alias's reachability, helper version,
+and inventory support separately: only a stable helper older than 0.2.0 is a confirmed lack of inventory support and
+gets the `shiplord server bootstrap <alias>` hint. The aggregate exits 0 only when every registered server answered
+with a compatible helper; anything unreachable, incompatible, or unreadable exits 3. It never asks for sudo and never
+runs bootstrap. It rejects `--server`, `--local`, and `--deep` before contacting anything.
 
 ## Failure and recovery
 
@@ -45,9 +81,9 @@ application's state including any unfinished transaction.
 | New release never becomes ready or exits | Previous release restored; exit 5. | Read `status`, `logs`. |
 | First release fails | No runtime, no route; exit 1. | Fix and redeploy. |
 | Caddy rejects the route | The previous file is restored and Caddy reloaded; exit 5. | Check the hostname and Caddy logs. |
-| Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover`. |
+| Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover` (or `shiplord recover <app> --server <alias>` from anywhere). |
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
-| Client disconnects | The job continues. | `shiplord status`. |
+| Client disconnects | The job continues. | `shiplord status <app> --server <alias> --job-id <id>`. |
 
 Storage: the application volume is never removed by deploy, rollback, recover, retirement or retention. If a deploy is
 refused with phase `storage`, the volume has another driver, driver options, another application's label, or no retained
@@ -83,6 +119,8 @@ units are enabled, but behavior after a power loss has not been verified.
 
 - `access denied`: the application is not provisioned for your key, or `provision` has not run.
 - `recovery_required`: an earlier job was interrupted; run `shiplord recover`.
+- `restart_failed`: the restart did not come back with the new environment and the journal was kept; fix the value,
+  then run `shiplord recover`. This is never reported as a rollback.
 - `stale_release`: a newer release is already deployed. Use `rollback` or `--allow-older` deliberately.
 - Public HTTPS check fails but the deploy succeeded: DNS or certificate issuance has not settled; `doctor` shows
   which. The server-side result separates local readiness, proxy routing, HTTPS, and DNS.
