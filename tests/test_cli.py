@@ -1012,3 +1012,124 @@ class CLIInventoryTests(unittest.TestCase):
         server_data = json.loads(server.stdout)
         self.assertEqual(server_data["helper_version"], "0.2.0")
         self.assertEqual(server_data["client"]["version"], "0.2.0")
+
+
+class RecordingAdminClient:
+    """A stand-in for the sudo client that records the resolved target and each request."""
+
+    instances: list["RecordingAdminClient"] = []
+
+    def __init__(self, target, prompt=None):
+        self.target, self.prompt, self.calls = target, prompt, []
+        RecordingAdminClient.instances.append(self)
+
+    def call(self, action, application_id, arguments, **kwargs):
+        self.calls.append((action, application_id, arguments))
+        return {"removed": {"registration": True}}
+
+
+class CLIDeprovisionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = Path(self.temp.name) / "config"
+        self.write_servers(self.config, ("hetzner-vm", "admin@host.example.com"),
+                           ("production", "admin@production.example.com"))
+        self.env = dict(os.environ, XDG_CONFIG_HOME=str(self.config))
+        RecordingAdminClient.instances.clear()
+        patcher = patch("shiplord.cli.AdminClient", RecordingAdminClient)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.directory = Path(self.temp.name) / "work"
+        self.directory.mkdir()
+        current = os.getcwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, current)
+
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def invoke(self, *args: str):
+        return CliRunner().invoke(cli.app, list(args), env=self.env)
+
+    def admin_calls(self) -> list[tuple]:
+        return [call for instance in RecordingAdminClient.instances for call in instance.calls]
+
+    def test_explicit_selectors_work_from_a_directory_without_a_manifest(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual([instance.target for instance in RecordingAdminClient.instances],
+                         ["admin@host.example.com"])
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_explicit_selectors_win_over_a_manifest_for_another_application(self):
+        (self.directory / "ship.toml").write_text(MANIFEST.replace('name = "orders"', 'name = "billing"'))
+        with patch("shiplord.cli.load_manifest", side_effect=AssertionError("explicit mode read ship.toml")):
+            result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual(RecordingAdminClient.instances[0].target, "admin@host.example.com")
+
+    def test_either_selector_alone_is_refused_before_any_request(self):
+        for args in (("orders", "--yes"), ("--server", "hetzner-vm", "--yes")):
+            with self.subTest(args=args):
+                result = self.invoke("deprovision", *args, "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("both", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_invalid_application_name_is_refused_before_any_request(self):
+        for name in ("Orders", "orders_app", "a" * 49):
+            with self.subTest(name=name):
+                result = self.invoke("deprovision", name, "--server", "hetzner-vm", "--yes", "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("lowercase application name", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_unknown_server_alias_is_refused_before_any_request(self):
+        result = self.invoke("deprovision", "orders", "--server", "nowhere", "--yes", "--json")
+        self.assertEqual(result.exit_code, 3, result.output)
+        error = json.loads(result.stdout)["error"]
+        self.assertIn("not registered", error)
+        self.assertIn("hetzner-vm", error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_missing_confirmation_names_the_resolved_target_and_sends_nothing(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "hetzner-vm", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_manifest_mode_keeps_the_existing_request_and_json(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                RecordingAdminClient.instances.clear()
+                args = ["deprovision", "--yes", "--json"] + (["--retire"] if retire else [])
+                result = self.invoke(*args)
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(self.admin_calls(), [("deprovision", "orders", arguments)])
+                self.assertEqual(RecordingAdminClient.instances[0].target, "admin@production.example.com")
+                output = json.loads(result.stdout)
+                self.assertEqual(output["removed"], {"registration": True})
+                self.assertIn("data", output["note"])
+
+    def test_manifest_mode_requires_confirmation_and_names_the_target(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        result = self.invoke("deprovision", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "production", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])

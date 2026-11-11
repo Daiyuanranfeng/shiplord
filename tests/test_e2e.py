@@ -521,6 +521,33 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.assertTrue(config_routes_to(configuration, "second.example.test", f"127.0.0.1:{self.port2}"))
         self.assertFalse(config_routes_to(configuration, "second.example.test", f"127.0.0.1:{self.port}"))  # no crossed routes
 
+    def test_25_deprovision_by_name_and_alias_retires_a_live_app_and_keeps_its_data(self):
+        # No ship.toml here: the application and its server are named explicitly.
+        elsewhere = ROOT / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        route = Path(f"/etc/caddy/ship/{self.app}.caddy")
+        volume = f"shiplord-{self.app}-artifacts"
+        self.assertTrue(self.containers_of(self.app))
+        self.assertTrue(route.exists())
+
+        refused = self.cli("deprovision", self.app, "--server", "production", "--yes", "--json", cwd=elsewhere, check=1)
+        self.assertIn("retire it before removing the application", refused.stdout)
+        self.assertTrue(self.containers_of(self.app))  # a refused removal stops and removes nothing
+        self.assertTrue(route.exists())
+
+        result = json.loads(self.cli("deprovision", self.app, "--server", "production", "--retire", "--yes", "--json",
+                                     cwd=elsewhere, check=0).stdout)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("public route", result["retired"]["removed"])
+        self.assertEqual(self.containers_of(self.app), [])
+        self.assertFalse(route.exists())
+        configuration = json.loads(urllib.request.urlopen("http://127.0.0.1:2019/config/apps/http/servers", timeout=5).read())
+        from shiplord.probes import config_routes_to
+        self.assertFalse(config_routes_to(configuration, "fixture.example.test", f"127.0.0.1:{self.port}"))
+        self.assertIn("application data", " ".join(result["retained"]))
+        self.assertEqual(fixtures.docker("volume", "inspect", volume, check=False).returncode, 0)  # data is kept
+        self.assertNotEqual(sh("getent", "passwd", f"ship-{self.app}", check=False).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

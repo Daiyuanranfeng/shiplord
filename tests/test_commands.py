@@ -132,6 +132,17 @@ class AdminCommandTests(unittest.TestCase):
                 commands.set_environment(manifest(), client, "set", text)
         self.assertEqual(ssh.calls, [])
 
+    def test_deprovision_sends_the_application_and_only_the_retire_flag_when_asked(self):
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                ssh = FakeSsh((ok({"removed": {"registration": True}}), b"", 0))
+                code, output = commands.deprovision_application("orders", AdminClient("a@h", runner=ssh), retire=retire)
+                sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+                self.assertEqual((sent["action"], sent["application_id"], sent["arguments"]),
+                                 ("deprovision", "orders", arguments))
+                self.assertEqual((code, output["ok"]), (0, True))
+                self.assertIn("data", output["note"])
+
     def test_environment_values_travel_in_the_frame_and_never_come_back(self):
         secret = "postgres://u:s3cr3t@db/x"
         ssh = FakeSsh((ok({"keys": ["DATABASE_URL"], "changed": True}), b"", 0))

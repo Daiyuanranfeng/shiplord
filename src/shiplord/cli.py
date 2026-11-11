@@ -999,14 +999,36 @@ def env_keys(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command("deprovision", rich_help_panel="Administration")
-def deprovision(retire: bool = typer.Option(False, "--retire", help="Stop the running release and remove its route first."),
+def deprovision(app_name: Optional[str] = typer.Argument(None, metavar="APP",
+                                                       help="Application name; pass with --server to work outside its checkout."),
+                server_alias: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
+                retire: bool = typer.Option(False, "--retire", help="Stop the running release and remove its route first."),
                 yes: bool = typer.Option(False, "--yes", help="Confirm that this application's access is removed."),
                 json_output: bool = typer.Option(False, "--json")) -> None:
-    """Remove this application's server-side account, keys, registration and state. Data is kept."""
-    manifest = _manifest(json_output)
+    """Remove an application's server-side account, keys, registration and state. Data is kept.
+
+    Run it from the application's directory, or name the application and its server from anywhere.
+    """
+    if (app_name is None) != (server_alias is None):
+        _fail("pass both the application name and --server <alias>, or neither to use ship.toml", 2, json_output)
+    manifest = None
+    if app_name is None:
+        manifest = _manifest(json_output)
+        application_id, alias = manifest["name"], manifest["server"]
+    else:
+        try:
+            application_id = validate_target_application(app_name)
+        except ManifestError as error:
+            _fail(str(error), 2, json_output)
+        alias, target = _select_server(server_alias, None, json_output)
     if not yes:
-        _fail(f"this removes {manifest['name']}'s deployment access from the server; rerun with --yes to confirm", 2, json_output)
-    _execute(lambda: commands.deprovision_application(manifest, _admin(manifest, json_output), retire=retire), json_output)
+        _fail(f"this removes the deployment access of {application_id} on {alias}; rerun with --yes to confirm",
+              2, json_output)
+
+    def action() -> tuple[int, dict]:
+        admin = _admin(manifest, json_output) if manifest is not None else _admin_target(target, json_output)
+        return commands.deprovision_application(application_id, admin, retire=retire)
+    _execute(action, json_output)
 
 
 @env_app.command("clear")
