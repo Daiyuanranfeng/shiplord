@@ -204,6 +204,15 @@ class WorkflowTests(unittest.TestCase):
         install = next(s for s in self.steps("deploy", self.deploy_jobs) if s.get("name") == "Install the pinned Shiplord")
         self.assertIn(f"git+https://github.com/QueryPlanner/shiplord.git@{REF}", install["run"])
 
+    def test_the_installed_version_can_pin_the_deploy_workflow(self):
+        data = parse(render_deploy_workflow(manifest(), tooling_version="0.2.0"))
+        install = next(s for s in data["jobs"]["deploy"]["steps"] if s.get("name") == "Install the pinned Shiplord")
+        self.assertIn("shiplord==0.2.0", install["run"])
+        with self.assertRaises(WorkflowError):
+            render_deploy_workflow(manifest())
+        with self.assertRaises(WorkflowError):
+            render_deploy_workflow(manifest(), tooling_ref=REF, tooling_version="0.2.0")
+
     def test_the_ssh_identity_is_removed_even_when_the_deploy_fails(self):
         cleanup = self.steps("deploy", self.deploy_jobs)[-1]
         self.assertEqual(cleanup["if"], "${{ always() }}")

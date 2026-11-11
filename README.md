@@ -14,10 +14,13 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## Install
 
 ```sh
-python -m pip install git+https://github.com/QueryPlanner/shiplord.git
+python -m pip install shiplord
 shiplord --version
 shiplord doctor --local
 ```
+
+`shiplord github setup` pins the same version in the generated workflow (`shiplord==<version>`). When you run
+Shiplord from a git checkout, pass `--tooling-ref <commit>` instead.
 
 ## Set up once
 

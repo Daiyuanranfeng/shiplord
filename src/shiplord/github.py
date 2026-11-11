@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from . import __version__
 from . import tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
@@ -434,14 +435,18 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     if manifest["runtime"] != "docker":
         return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
     ref = tooling_ref or detect_tooling_ref()
+    version = None
     if ref is None:
-        raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
-                          "pushed to GitHub)", 2, "workflow")
+        # A PyPI install has no git checkout to pin, so pin the installed release instead.
+        version = __version__
+    pin = version if version is not None else ref[:12]
     quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
     merged = dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})})
     try:
-        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, platforms=platforms),
-                 WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, platforms=platforms, quality_workflow=quality)}
+        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                              platforms=platforms),
+                 WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                platforms=platforms, quality_workflow=quality)}
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
     digests = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()}
@@ -470,7 +475,7 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     _save_state(directory, state)
     if not changed:
         return f"unchanged ({', '.join(texts)})"
-    return f"written ({', '.join(changed)}, Shiplord pinned at {ref[:12]})"
+    return f"written ({', '.join(changed)}, Shiplord pinned at {pin})"
 
 
 def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:

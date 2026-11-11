@@ -17,6 +17,7 @@ WORKFLOW_PATH = ".github/workflows/shiplord-release.yml"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/shiplord-deploy.yml"
 DEFAULT_QUALITY_WORKFLOW = ".github/workflows/code-quality.yml"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_VERSION = re.compile(r"[0-9]+(\.[0-9]+)*([._+-]?[0-9A-Za-z]+)*\Z")
 _PLATFORMS = re.compile(r"linux/(amd64|arm64)(,linux/(amd64|arm64))?\Z")
 _QUALITY_WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml\Z")
 
@@ -49,16 +50,27 @@ def validate_quality_workflow(path: object) -> str:
     return path
 
 
-def _validate(manifest: dict, tooling_ref: str, platforms: str, tooling_repository: str) -> None:
+def _validate(manifest: dict, tooling_ref: str | None, tooling_version: str | None, platforms: str,
+              tooling_repository: str) -> None:
     if manifest["runtime"] != "docker":
         raise WorkflowError("workflow generation is available for Docker applications; for a native binary, call "
                             "`shiplord deploy --binary` from your own build job")
-    if not _COMMIT.fullmatch(tooling_ref):
+    if (tooling_ref is None) == (tooling_version is None):
+        raise WorkflowError("pin Shiplord by exactly one of a commit or a PyPI version")
+    if tooling_ref is not None and not _COMMIT.fullmatch(tooling_ref):
         raise WorkflowError("the tooling reference must be a full 40-character commit SHA")
+    if tooling_version is not None and not _VERSION.fullmatch(tooling_version):
+        raise WorkflowError("the tooling version must be a PyPI version such as 0.2.0")
     if not _PLATFORMS.fullmatch(platforms):
         raise WorkflowError("platforms must be linux/amd64, linux/arm64, or both separated by a comma")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", tooling_repository):
         raise WorkflowError("invalid tooling repository")
+
+
+def _tooling_install(tooling_ref: str | None, tooling_version: str | None, tooling_repository: str) -> str:
+    if tooling_version is not None:
+        return f"shiplord=={tooling_version}"
+    return f"git+https://github.com/{tooling_repository}.git@{tooling_ref}"
 
 
 def _header() -> str:
@@ -66,13 +78,15 @@ def _header() -> str:
             "review changes in a pull request.\n")
 
 
-def render_deploy_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str = TOOLING_REPOSITORY,
+def render_deploy_workflow(manifest: dict, *, tooling_ref: str | None = None, tooling_version: str | None = None,
+                           tooling_repository: str = TOOLING_REPOSITORY,
                            platforms: str = "linux/amd64") -> str:
     """Return the reusable deploy workflow. Deterministic: the same inputs always produce the same bytes."""
-    _validate(manifest, tooling_ref, platforms, tooling_repository)
+    _validate(manifest, tooling_ref, tooling_version, platforms, tooling_repository)
     branch = manifest.get("github", {}).get("deployment_branch", "main")
     branch_ref = ("refs/heads/" + branch).replace("'", "''")
     quote = json.dumps
+    install = _tooling_install(tooling_ref, tooling_version, tooling_repository)
     qemu = f"      - uses: {ACTIONS['qemu']}\n" if "arm64" in platforms else ""
     return _header() + f"""name: Shiplord deploy
 
@@ -152,7 +166,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install the pinned Shiplord
-        run: python -m pip install --disable-pip-version-check {quote(f"git+https://github.com/{tooling_repository}.git@{tooling_ref}")}
+        run: python -m pip install --disable-pip-version-check {quote(install)}
       - name: Join the tailnet
         uses: {ACTIONS['tailscale']}
         with:
@@ -212,14 +226,15 @@ jobs:
 """
 
 
-def render_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str = TOOLING_REPOSITORY,
+def render_workflow(manifest: dict, *, tooling_ref: str | None = None, tooling_version: str | None = None,
+                    tooling_repository: str = TOOLING_REPOSITORY,
                     platforms: str = "linux/amd64", quality_workflow: str | None = None) -> str:
     """Return the trigger workflow text. Deterministic: the same inputs always produce the same bytes.
 
     ``quality_workflow`` is a reusable workflow in this repository to run before deploy, or ``None`` for a
     pipeline with no quality job. It is never guessed here: the caller decides from the project.
     """
-    _validate(manifest, tooling_ref, platforms, tooling_repository)
+    _validate(manifest, tooling_ref, tooling_version, platforms, tooling_repository)
     quality = None if quality_workflow is None else validate_quality_workflow(quality_workflow)
     branch = manifest.get("github", {}).get("deployment_branch", "main")
     app = manifest["name"]

@@ -1145,7 +1145,7 @@ def keys_remove_command(label: str = typer.Option(..., "--label", help="The labe
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
-                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
+                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI (default: the installed PyPI version)."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),

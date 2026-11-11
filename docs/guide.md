@@ -45,9 +45,12 @@ verified: the plan's controlled install on *your* production server (§12E). See
 Install the CLI on the machine you work from:
 
 ```sh
-python -m pip install .
+python -m pip install shiplord
 shiplord --help
 ```
+
+The generated workflow pins the installed version (`shiplord==<version>`). From a git checkout, pass
+`--tooling-ref <commit>` to pin that commit instead.
 
 ## How it fits together
 
