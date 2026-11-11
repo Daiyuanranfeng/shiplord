@@ -17,7 +17,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .environment import EnvironmentError_, load_environment_file, parse_environment
+from .environment import (EnvironmentError_, edit_environment, load_environment_file, load_environment_text,
+                          parse_environment, render_environment, validate_key, validate_value)
 from .installer import DEPLOY_GROUP, DEPLOY_MARKER
 from .keys import KeyError_, KeyStore, PublicKey, parse_public_key, validate_label
 from .layout import Layout, deployment_user, runtime_user
@@ -378,13 +379,42 @@ def manage_key(layout: Layout, application_id: str, operation: str, *, label: st
     raise ProvisionError("unknown key operation")
 
 
-def manage_environment(layout: Layout, application_id: str, operation: str, *, text: str | None = None) -> dict:
-    """Set, clear, or list the key names of an application's runtime environment file.
+def _write_environment_file(path: Path, text: str) -> None:
+    """Replace an environment file atomically with a private, owner-only temporary file."""
+    temporary = path.with_name(f".app.env.tmp-{secrets.token_hex(6)}")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fchmod(file.fileno(), 0o600)
+            if os.geteuid() == 0:
+                os.fchown(file.fileno(), 0, 0)
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    except OSError:
+        raise ProvisionError("could not write the environment file") from None
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    Values are never returned. They take effect the next time a release is started. A file that cannot
-    be read is still replaced or removed, so a corrupt file never needs a manual root shell to repair.
+
+def manage_environment(layout: Layout, application_id: str, operation: str, *, text: str | None = None,
+                       key: str | None = None, value: str | None = None) -> dict:
+    """Set, clear, list, or edit the key names of an application's runtime environment file.
+
+    Values are never returned. They take effect the next time a release is started. ``set-key`` and
+    ``unset`` change one line and leave every other line byte-identical; they refuse a file they cannot
+    rewrite safely, because discarding it would also discard variables this command was not asked about.
+    A whole-file ``set`` or a ``clear`` still repairs an unreadable file, so it never needs a manual root shell.
     """
     app = validate_app_name(application_id)
+    if operation in ("set-key", "unset"):  # reject bad input before the directory check or any file read
+        try:
+            key = validate_key(key)
+            if operation == "set-key":
+                validate_value(value)
+        except EnvironmentError_ as error:
+            raise ProvisionError(str(error)) from None
     _require_provisioned(layout, app)
     path = layout.environments / app / "app.env"
     if operation == "clear":
@@ -404,6 +434,19 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
             return {"keys": sorted(load_environment_file(path) or {})}
         except EnvironmentError_ as error:
             raise ProvisionError(f"{error}; use `shiplord env clear` to replace it") from None
+    if operation in ("set-key", "unset"):
+        try:
+            current = load_environment_text(path)
+        except EnvironmentError_ as error:
+            raise ProvisionError(f"{error}; use `shiplord env clear` to replace it") from None
+        try:
+            updated = edit_environment(current or "", key, value if operation == "set-key" else None)
+        except EnvironmentError_ as error:
+            raise ProvisionError(str(error)) from None
+        changed = updated != (current or "")
+        if changed:
+            _write_environment_file(path, updated)
+        return {"keys": sorted(parse_environment(updated)), "changed": changed}
     if operation != "set":
         raise ProvisionError("unknown environment operation")
     if not isinstance(text, str):
@@ -419,21 +462,7 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
         current, discarded = None, True
     if not discarded and values == current and path.exists():
         return {"keys": sorted(values), "changed": False}
-    temporary = path.with_name(f".app.env.tmp-{secrets.token_hex(6)}")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            file.write("".join(f"{key}={values[key]}\n" for key in sorted(values)))
-            file.flush()
-            os.fchmod(file.fileno(), 0o600)
-            if os.geteuid() == 0:
-                os.fchown(file.fileno(), 0, 0)
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        raise ProvisionError("could not write the environment file") from None
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_environment_file(path, render_environment(values))
     notice = ({"warnings": ["the previous environment file was unreadable; its contents were discarded"]}
               if discarded else {})
     return {"keys": sorted(values), "changed": True, **notice}

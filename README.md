@@ -94,8 +94,11 @@ shiplord recover
 From any directory, `shiplord recover <app> --server <alias>` reconciles a named application without a checkout;
 `shiplord status` prints that exact command when it finds unfinished work.
 
-Use `shiplord env set --from-file .env.production` to set app secrets. Preview the key names it would add or remove with `shiplord env diff --from-file .env.production`. Shiplord does not print or log secret values.
-Run `shiplord restart` to apply the current environment to the running release without a new commit.
+Use `shiplord env set --from-file .env.production` to set app secrets, or `shiplord env set KEY=VALUE` to change
+one variable without rewriting the rest. Preview the key names it would add or remove with `shiplord env diff
+--from-file .env.production`. Shiplord does not print or log secret values; a value passed on the command line does
+appear in your shell history and local process list, so prefer `--from-file` for secrets. Run `shiplord restart` to
+apply the current environment to the running release without a new commit.
 
 ## Learn more
 

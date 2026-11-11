@@ -332,6 +332,14 @@ class CommandOutputTests(unittest.TestCase):
                                          patches=self.admin_patches(
                                              "shiplord.cli.commands.set_environment", (0, ENVIRONMENT)))),
                 ENVIRONMENT, ("Outcome: environment saved", "Variables: 1 (TOKEN)")),
+            Case("env unset", lambda as_json: self.invoke(
+                ["env", "unset", "OLD"], as_json,
+                patches=self.admin_patches("shiplord.cli.commands.edit_environment",
+                                           (0, {"ok": True, "keys": ["KEEP"], "changed": True,
+                                                "note": "Takes effect the next time a release starts."}))),
+                {"ok": True, "keys": ["KEEP"], "changed": True,
+                 "note": "Takes effect the next time a release starts."},
+                ("Outcome: variable removed", "Variables: 1 (KEEP)", "Note: Takes effect")),
             Case("env keys", lambda as_json: self.invoke(
                 ["env", "keys"], as_json,
                 patches=self.admin_patches("shiplord.cli.commands.set_environment",

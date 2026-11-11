@@ -187,6 +187,42 @@ class AdminCommandTests(unittest.TestCase):
         _, listing = commands.set_environment(manifest(), AdminClient("a@h", runner=FakeSsh((ok({"keys": ["A"]}), b"", 0))), "keys")
         self.assertNotIn("note", listing)
 
+    def test_one_key_edits_send_the_value_only_in_the_frame_and_never_return_it(self):
+        secret = "postgres://u:s3cr3t@db/x"
+        ssh = FakeSsh((ok({"keys": ["DATABASE_URL"], "changed": True}), b"", 0))
+        code, output = commands.edit_environment(manifest(), AdminClient("a@h", runner=ssh), "set-key",
+                                                 assignment=f"DATABASE_URL={secret}")
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["arguments"], {"operation": "set-key", "key": "DATABASE_URL", "value": secret})
+        self.assertIn(secret.encode(), ssh.calls[0][1])
+        self.assertNotIn("s3cr3t", str(ssh.calls[0][0]) + str(output))
+        self.assertEqual((code, output["keys"]), (0, ["DATABASE_URL"]))
+        self.assertIn("next time a release starts", output["note"])
+
+        ssh = FakeSsh((ok({"keys": [], "changed": True}), b"", 0))
+        code, output = commands.edit_environment(manifest(), AdminClient("a@h", runner=ssh), "unset", key="OLD")
+        self.assertEqual(read_frame(io.BytesIO(ssh.calls[0][1]))["arguments"], {"operation": "unset", "key": "OLD"})
+        self.assertEqual((code, output["changed"]), (0, True))
+        self.assertIn("next time a release starts", output["note"])
+
+    def test_invalid_one_key_edits_are_refused_before_any_connection(self):
+        ssh = FakeSsh()
+        client = AdminClient("a@h", runner=ssh)
+        cases = ((("set-key",), {"assignment": "PORT=1"}, "managed by Shiplord"),
+                 (("set-key",), {"assignment": "BAD LINE s3cr3t"}, "KEY=VALUE"),
+                 (("set-key",), {"assignment": "A=1\nB=2"}, "invalid"),
+                 (("set-key",), {"assignment": "A-B=1"}, "variable name"),
+                 (("set-key",), {"assignment": None}, "assignment is required"),
+                 (("unset",), {"key": "A B"}, "variable name"),
+                 (("unset",), {"key": "PORT"}, "managed by Shiplord"),
+                 (("unset",), {"key": None}, "variable name"),
+                 (("merge",), {"key": "A"}, "unknown environment operation"))
+        for operation, arguments, expected in cases:
+            with self.subTest(operation=operation, arguments=str(arguments)[:20]), \
+                    self.assertRaisesRegex(CommandError, expected) as caught:
+                commands.edit_environment(manifest(), client, *operation, **arguments)
+            self.assertNotIn("s3cr3t", str(caught.exception))
+
     def test_environment_diff_reports_only_key_name_changes(self):
         secret, other = "postgres://u:first-secret@db/x", "postgres://u:second-secret@db/y"
         ssh = FakeSsh((ok({"keys": ["KEEP", "REMOVE"]}), b"", 0))

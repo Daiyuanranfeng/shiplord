@@ -68,7 +68,8 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         return application_inventory(layout, lock)
     allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb",
                              "update"},
-               "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text"}, "registry": {"operation", "registry", "username", "token"},
+               "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text", "key", "value"},
+               "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]
     if set(args) - allowed:
         raise ProtocolError("unknown arguments")
@@ -96,7 +97,8 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         return manage_registry(layout, app, args.get("operation"), registry=args.get("registry"),
                                username=args.get("username"), token=args.get("token"))
     if action == "environment":
-        return manage_environment(layout, app, args.get("operation"), text=args.get("text"))
+        return manage_environment(layout, app, args.get("operation"), text=args.get("text"),
+                                  key=args.get("key"), value=args.get("value"))
     retire = None
     if args.get("retire") is True:
         retire = make_retirer(layout, system, lock, SubprocessCaddy())

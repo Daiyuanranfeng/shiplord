@@ -289,6 +289,8 @@ def render_environment(result: dict, target: str, operation: str, say: Say | Non
         return
     if operation == "clear":
         say("Outcome: environment removed" if result.get("changed", True) else "Outcome: no environment to remove")
+    elif operation == "unset":
+        say("Outcome: variable removed" if result.get("changed", True) else "Outcome: variable not present")
     else:
         say("Outcome: environment saved" if result.get("changed", True) else "Outcome: environment unchanged")
     say(f"Variables: {len(keys)}" + (f" ({', '.join(keys)})" if keys else ""))
