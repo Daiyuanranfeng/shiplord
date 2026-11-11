@@ -670,7 +670,8 @@ def _doctor_value(value: object) -> str:
         if "ok" in value:
             state = "passed" if value["ok"] else "failed"
             details = []
-            for key in ("helper_version", "version", "protocol", "current", "running", "unfinished_transaction", "hint"):
+            for key in ("helper_version", "version", "protocol", "id", "version_id", "current", "running",
+                        "unfinished_transaction", "hint", "message"):
                 if value.get(key) is not None:
                     details.append(f"{key.replace('_', ' ')}: {value[key]}")
             return state + (" (" + "; ".join(details) + ")" if details else "")
@@ -689,6 +690,7 @@ def _render_doctor(result: dict, target: str) -> None:
     checks = result.get("checks", {})
     groups = (
         ("Local tools", ("ssh", "git", "gh")),
+        ("Server baseline", ("os",)),
         ("Server access", ("server_access", "helper_actions", "helper")),
         ("Application", ("application", "applications")),
         ("Network", ("dns",)),

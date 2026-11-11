@@ -7,7 +7,10 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## What you need
 
 - A computer with Python 3.11 or newer, Git, and OpenSSH.
-- A Linux server with systemd, SSH, administrator access, and Caddy.
+- A Linux server running **Ubuntu 24.04 or later, or Debian 12 or later**, with systemd, SSH, administrator
+  access, and Caddy from its package repository (`/usr/bin/caddy`). The helper needs **Python 3.11 or later at
+  `/usr/bin/python3`**; `shiplord server bootstrap` reads `/etc/os-release` and refuses any other distribution or
+  an older version with a message naming what is supported.
 - Docker on the server if you deploy Docker images.
 - A DNS record that points your app's domain to the server. Shiplord checks DNS but does not change it.
 

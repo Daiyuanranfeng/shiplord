@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .installer import DEPLOY_GROUP, SSHD_DROPIN, sshd_dropin_included, sshd_units
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .probes import http_get
 from .registry import Registry
 from .release_state import HostLock, ReleaseState, StateError
@@ -80,7 +81,7 @@ def application_inventory(layout: Layout, lock: HostLock) -> dict:
 
 
 def server_doctor(layout: Layout, system: System, lock: HostLock) -> dict:
-    checks: dict[str, dict] = {}
+    checks: dict[str, dict] = {"os": check_os(layout.path(OS_RELEASE))}
     current = layout.lib / "current"
     checks["helper"] = {"ok": current.is_symlink() and layout.host.exists() and layout.worker.exists()
                         and layout.dispatch.exists(), "version": os.readlink(current) if current.is_symlink() else None}

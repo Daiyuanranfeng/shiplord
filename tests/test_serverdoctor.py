@@ -145,6 +145,22 @@ class ServerDoctorTests(DoctorTestCase):
         healthy = FakeSsh((ok(report), b"", 0))
         self.assertEqual(commands.server_doctor(AdminClient("a@h", runner=healthy))[0], 0)
 
+    def test_the_os_baseline_is_reported(self):
+        os_check = self.report()["checks"]["os"]
+        self.assertEqual((os_check["ok"], os_check["id"], os_check["version_id"]), (True, "ubuntu", "24.04"))
+
+    def test_an_unsupported_os_is_reported_by_the_os_check(self):
+        (self.layout.prefix / "etc" / "os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        report = self.report()
+        self.assertEqual((report["ok"], report["checks"]["os"]["ok"]), (False, False))
+        self.assertEqual(self.failing(report), ["os"])
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", report["checks"]["os"]["message"])
+        self.assertIn("ubuntu 22.04", report["checks"]["os"]["message"])
+        request = {"version": 1, "request_id": "doctor-os", "action": "doctor", "application_id": None,
+                   "commit": None, "arguments": {}}
+        response, code = run(request, self.layout, self.system, {})
+        self.assertEqual((code, response["result"]["checks"]["os"]["ok"]), (0, False))
+
     def test_a_clean_registry_reports_no_ignored_files(self):
         self.provision()
         report = self.report()
