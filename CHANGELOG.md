@@ -16,6 +16,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   command in human-readable `status` output.
 - Add `shiplord server remove` and `shiplord server rename`, both with `--json`.
   Removal refuses while the current directory's `ship.toml` names the alias.
+- Add `shiplord provision --update` to apply a changed hostname or memory
+  ceiling without removing the application's state, environment, or keys.
 
 ### Fixed
 

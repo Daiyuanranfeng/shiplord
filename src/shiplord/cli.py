@@ -972,12 +972,18 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
 def provision(public_key: Optional[Path] = typer.Option(None, "--public-key", help="Public key to register."),
               image_repository: Optional[str] = typer.Option(None, "--image-repository"),
               max_memory_mb: Optional[int] = typer.Option(None, "--max-memory-mb", help="Ceiling for memory_mb (default 4096)."),
+              update: bool = typer.Option(False, "--update", help="Apply a changed hostname or memory ceiling to an "
+                                                                  "existing application; keep its state and keys."),
               json_output: bool = typer.Option(False, "--json")) -> None:
-    """Create the application's account, route-ready port, state, and key access on the server."""
+    """Create the application's account, route-ready port, state, and key access on the server.
+
+    With --update, apply a changed hostname or memory ceiling without removing the application's state, environment,
+    or keys. Changing the runtime or image repository is refused before anything is touched.
+    """
     manifest = _manifest(json_output)
     _execute(lambda: commands.provision_application(manifest, _admin(manifest, json_output), public_key=public_key,
                                                     image_repository=image_repository,
-                                                    max_memory_mb=max_memory_mb), json_output)
+                                                    max_memory_mb=max_memory_mb, update=update), json_output)
 
 
 def _head_commit() -> str:
