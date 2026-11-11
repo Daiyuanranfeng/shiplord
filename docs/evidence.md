@@ -3,7 +3,25 @@
 This is an audit of `ship-cli-plan.md` §13 against what was actually run. "Verified" names the test or suite that
 exercised the behavior. Anything not run is listed as not verified; nothing here is inferred.
 
-State of the tree when this was written: the working tree on `main`, uncommitted. All numbers are from the runs described below.
+State of the tree when this audit was written: the working tree on `main`, uncommitted. All numbers in this
+section are from the runs described below; they are historical. The current release decision is
+[`docs/release-gate.md`](release-gate.md).
+
+## 1.0 release gate (issue #76)
+
+[`docs/release-gate.md`](release-gate.md) is the authoritative, criterion-by-criterion record for the seven 1.0
+gate criteria. It names the exact run or test behind each status and what is missing; this table is only the index
+into it. A row here is not a pass.
+
+| Gate criterion | Status | Where it is mapped |
+| --- | --- | --- |
+| 1. `tests/linux/run.sh all` is green in CI on every pull request | Partly verified | `release-gate.md` criterion 1; `.github/workflows/test.yml` |
+| 2. Fresh-VM journey from `server add` to public HTTPS for three app types, each released by GitHub Actions | Not verified | `release-gate.md` criterion 2; the one native app in *Real server run* below |
+| 3. Rollback with crash output, reboot recovery, and `env set` then `restart` for each app | Partly verified | `release-gate.md` criterion 3; `test_deploy_integration`, `test_deploy`, `test_e2e_systemd` |
+| 4. A second machine can run `status`, `logs`, `rollback`, and `github rotate-key` | Partly verified | `release-gate.md` criterion 4; `test_cli`, `test_github`, e2e 17 |
+| 5. Every command has readable output and `--json`; the `AGENTS.md` exit-code table is true | Partly verified | `release-gate.md` criterion 5; `test_cli`, `test_client` |
+| 6. `README.md` covers PyPI install, the three application types, and supported server operating systems | Partly verified | `release-gate.md` criterion 6; `README.md` |
+| 7. `docs/evidence.md` maps each criterion to the run or test that proves it | Not verified | This pull request adds the map; `release-gate.md` criterion 7 |
 
 ## How it was verified
 
@@ -18,8 +36,13 @@ State of the tree when this was written: the working tree on `main`, uncommitted
 | The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy` | `tests/linux/run.sh systemd` | 13/13 passed |
 | The generated project, against the template's own 1,200-test suite | `uv run pytest tests` in a project made by `shiplord init` | 1,196 passed; 5 failed, of which 2 also fail on the untouched template on this machine and 3 passed when rerun alone (load flakes) |
 
-The Linux suites run in containers on Docker Desktop (a Linux VM on arm64). GitHub-hosted Ubuntu 24.04 x86-64
-runners were **not** used; `.github/workflows/test.yml` defines the corresponding jobs but they have not run.
+These counts are from that audit. The unit baseline on `main` at `97047f1` is 1126 tests, 94 skipped
+(macOS arm64, Python 3.14.3, 2026-11-11).
+
+The Linux suites above ran in containers on Docker Desktop (a Linux VM on arm64). GitHub-hosted Ubuntu 24.04
+x86-64 runners were not used for those runs. The `Tests` workflow now runs the real-host suites on ubuntu-24.04;
+the latest completed `main` run (42913399156, `97047f1`) had all 12 jobs green. Those CI jobs are not a
+`tests/linux/run.sh all` run; see [`release-gate.md`](release-gate.md) criterion 1.
 
 ## Definition of Done (§13)
 
@@ -31,6 +54,7 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Existing Caddy routes and running applications survive integration | Verified | Bootstrap only appends one validated import line (`test_routing`, `test_caddy_integration`); the default Caddyfile site survives in e2e and systemd runs; unrelated route files are byte-identical after every outcome; a second application is undisturbed by the first's failed deploy (e2e 23). |
 | A new ADK application can be generated from the pinned template | Verified | `shiplord init` against the real pinned commit; the template's own tests on the result. The overlay adds one file (`SHIPLORD.md`). |
 | Provisioning sets up a unique port, route, runtime, data, deployment account, key access | Verified | `test_provision`, `test_registry`, e2e 03 and 23 (distinct port/account/volume/route), systemd 01 (runtime account, private data). The route is created at first deploy, by design. |
+| Application data has one documented location, survives every release, rollback and removal, and can be copied and restored | Partly: persistence verified, copy/restore not implemented | `test_storage` and `test_deploy_integration` (`test_storage_path_changes_keep_one_volume_and_its_files`, real Docker) keep SQLite rows and files across a path change, a failed candidate and a rollback; `test_retire` and `test_provision` show the volume and data directory are kept on removal. `shiplord backup`/`restore` do not exist (#62), so a verified copy and restore is **not** evidenced. |
 | Frontend origins reach ALLOW_ORIGINS correctly | Partly verified | Serialization verified in a real container and a real systemd service (`/env/ALLOW_ORIGINS`). The real ADK server's CORS behavior (plan §12B scenario 6) was **not** exercised. |
 | Docker deployment uses a tested immutable image built outside the VM | Verified | `test_deploy_integration` and e2e: pull by digest from a registry, platform and revision-label checks. |
 | Native Linux binary deployment through the same lifecycle | Verified | systemd suite 01-13: upload, verification, confined unit, env quoting through systemd's parser, journald logs, restart, limits, rollback. |
@@ -38,12 +62,14 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Logs, status, explicit rollback, interrupted-job recovery | Verified | e2e 07/12/13, systemd 09-11 (client dies; worker is `SIGKILL`ed; `recover` restores). |
 | Failed releases return nonzero and preserve or restore the last good release | Verified | Docker lifecycle and e2e 09 (exit 5); systemd 06/07 (including a kernel OOM kill). |
 | CI key creation, repository configuration, safe rotation | Setup verified with the real `gh` and GitHub; rotation against a stand-in `gh` | Real server run below: `github setup` against a private repository (secret, variables, key proven over Tailscale SSH). `test_github`; e2e 16-20 for wrong host keys and rotation. |
+| Tailscale trust credential created by `github setup` | Request shape verified against a fake transport; no real Tailscale call | `test_tailscale`, `test_github`, `test_cli` assert the federated-key payload, the owner-wide subject, and that the token never reaches output or an error. A real run needs a token that may create federated identities. |
+| The owner-wide subject covers a second repository | **Unverified against Tailscale** | `test_tailscale` records the documented `*` semantics only. A `github check-ci` run from a second repository is still needed; the pattern is unchanged until then. |
 | A real GitHub push completes the full path through Tailscale/OpenSSH | Verified on a real server | Real server run below: a merge to `main` built the binary on a GitHub-hosted runner, joined the tailnet through OIDC, and deployed with the CI key (`gh-40839230420-2`). |
 | No personal private key is uploaded; host trust is pinned | Verified | `test_github` (the secret is the dedicated key; no key material in results, state, or arguments); CI mode ignores `~/.ssh/config` (found and fixed by e2e 19); host keys come over the trusted connection. |
 | Deployment privileges scoped to the registered application and helper | Verified | Real sudo/sshd: `test_host_integration` (account cannot write its own access, cannot use admin), e2e 15 and 24 (each login refused for the other application). |
 | Secret values absent from repository files, normal output, artifacts | Verified for the paths tested | Env, registry token, CI key, sudo password: never in argv, results, state, or errors (`test_provision`, `test_commands`, `test_github`, `test_client`). The generated workflow passes secrets only through `env:`. |
 | Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; `--cpus`/`--init` and configurable readiness status/interval covered by unit tests (not real Docker); readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
-| Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | All but the live workflow, as above. |
+| Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | CI now runs the real-host suites and the latest observed `main` run is green; the live workflow was one native app. This is not a `tests/linux/run.sh all` run; see `release-gate.md` criterion 1. |
 | README and AGENTS.md let a fresh agent release and interpret failures | Written, not field-tested | `README.md`, `AGENTS.md`, the generated `SHIPLORD.md`; no fresh agent was run against them. |
 | No additional continuously running deployment service | Verified by construction | Only jobs run, as transient units that exit; there is no daemon. |
 
@@ -70,7 +96,8 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Private-key upload to GitHub fails | `test_github` (setup resumes; rotation leaves the old key working) |
 | Rollback itself fails | `test_deploy` (exit 5, previous restored; exit 6 when restoration fails) |
 
-A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is unverified.
+A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is
+unverified. This is still true on `main`; see [`release-gate.md`](release-gate.md) criterion 3.
 
 ## What running it for real found
 
@@ -200,6 +227,55 @@ What it found:
   real Docker SIGKILL crash gap, shutdown timeout/interruption during rollback or failed-first-deploy cleanup
   against real Docker, and a seeded-baseline demonstration of the regression.
 
+## Fleet doctor (issue #20)
+
+- Unit: `tests/test_commands.py` classifies stable helper releases against the 0.2.0 inventory minimum (pre-releases
+  and unparseable versions stay `unknown`), and sweeps a mixed fleet where the middle probe fails: all three aliases
+  are reported, the sweep continues, every probe gets the bounded five-second deadline, and only the confirmed old
+  helper carries `helper_upgrade_required` and the bootstrap hint.
+- CLI unit: `tests/test_cli.py` checks the JSON aggregate shape and `partial` flag, exit 0 for a complete compatible
+  fleet and 3 otherwise, human output hinting only the old helper, unreadable registrations counted as partial, and
+  rejection of `--server`, `--local`, and `--deep` before any connection. Fleet mode is asserted never to ask for
+  sudo, prompt for a password, or run bootstrap. Single-server `doctor --server` still uses its default probe and
+  keeps its exit statuses.
+- End to end through the real transport: `tests/test_transport.py` registers a current, an unreachable, and an old
+  alias against a fake `ssh`, and checks that the last two are distinguished.
+
+## Supported server OS baseline (issue #66)
+
+Decision: Shiplord supports **Ubuntu 24.04 or later and Debian 12 or later**, with Caddy installed from its
+package repository (`/usr/bin/caddy`) and Python 3.11 or later at `/usr/bin/python3`. Anything else is refused
+instead of failing later in sshd, Caddy, or apt handling. This narrows the roadmap's H1, H3, and D5 items to
+the supported set instead of leaving an open compatibility matrix.
+
+Closed:
+
+- `installer.bootstrap` reads `/etc/os-release` as its first host check (after the root check) and refuses any
+  other distribution or an older version with a message naming the supported set and the detected
+  `ID`/`VERSION_ID`. The refusal happens before Caddy, sshd, accounts, directories, and packages: nothing is
+  written and no command runs. Unit: `tests/test_installer.py::OsBaselineTests` (Ubuntu 22.04, Debian 11, an
+  unknown distribution, a missing file, a malformed file, and proof the Caddy probe is not reached).
+  Parsing and the version decision: `tests/test_osbaseline.py` (accepted releases, refusals, malformed and
+  non-numeric versions, unsafe fields, an undecodable file).
+- `shiplord doctor --server --deep` reports an `os` check (`ok`, `id`, `version_id`, and the refusal message),
+  so a host outside the set is visible without attempting a bootstrap. Unit: `tests/test_serverdoctor.py`.
+- `docs/guide.md` and `README.md` state the supported operating systems and the Python 3.11 requirement.
+- `tests/linux/run.sh host` runs the existing host suite on Ubuntu 24.04 and now also runs
+  `UnsupportedOsTests` in a container whose `/etc/os-release` reports Ubuntu 22.04, asserting the refusal and
+  that no command, Caddy call, or Shiplord path was touched. Ran locally in Docker on arm64: 19 tests OK
+  (1 skipped, the unsupported-OS class) and then 1 test OK.
+
+Still open:
+
+- Debian 12 was not run on a real host or container; only the unit fixture covers it.
+- The refusal was exercised on the supported image with an `os-release` mounted over `/etc/os-release`, not on
+  an actual Ubuntu 22.04 base: that image ships Python 3.10 and cannot import the helper at all, so the
+  server-side check cannot run there. Such a host is refused earlier by the client's interpreter check.
+- The Linux suites for this change ran on arm64 containers, not on x86-64.
+- Caddy is still assumed to be the apt package at `/usr/bin/caddy`; its version is not checked, only that it
+  can run a fixed minimal configuration.
+- The real Hetzner server run recorded above did not record its Ubuntu version, and is not evidence for Debian.
+
 ## Not verified, and why
 
 - The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.
@@ -208,7 +284,7 @@ What it found:
 - Private registry authentication end to end (the login file is accepted by the real `docker --config`; a registry that
   demands credentials was not run).
 - The real ADK application's CORS, readiness under load, and memory needs: the 512 MiB default is an example, not a measurement.
-- x86-64 for the real-host container suites: they ran on arm64 VMs; GitHub's x86-64 runners run them in this repository's CI.
+- x86-64 for the real-host container suites: the recorded runs above were on arm64 VMs. GitHub's x86-64 runners now run them in this repository's CI (latest completed main run 42913399156, all 12 jobs green).
 - CI installs Shiplord's own dependencies unpinned (`pip install -e .`); a new release of one could change CI results.
 - Native services can still connect to other loopback services (only binding is restricted), and Docker applications share
   the default bridge network; see the README's *Limits of the confinement*.

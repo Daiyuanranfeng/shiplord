@@ -11,10 +11,11 @@ import hashlib
 import json
 import math
 import platform
+import re
 import shutil
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .environment import EnvironmentError_, load_environment_file
 from .layout import Layout
@@ -27,9 +28,21 @@ PULL_TIMEOUT_SECONDS = 900
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_LOG_BYTES = 262144
 MAX_LOG_LINES = 1000
+DEFAULT_FOLLOW_SECONDS = 300
+MAX_FOLLOW_SECONDS = 3600
 MIN_FREE_BYTES = 1024 * 1024 * 1024  # refuse to pull when less than this is free: a full disk fails a deploy halfway
 DOCKER_ROOT = Path("/var/lib/docker")
 REVISION_LABEL = "org.opencontainers.image.revision"
+# Everything `docker run` sets that is not derived from the release record. The start and the running check both use
+# these, so a change here can never make the check disagree with what was started.
+PIDS_LIMIT = 512
+RESTART_POLICY = "unless-stopped"
+LOG_DRIVER = "json-file"
+LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}
+SECURITY_OPTIONS = ("no-new-privileges",)
+CAP_DROP = ("ALL",)
+
+_SINCE = re.compile(r"[0-9]{1,5}[smh]\Z")
 _MACHINE_PLATFORMS = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
 
 
@@ -91,13 +104,82 @@ def cpu_limit_arg(cpus: float) -> str:
     return str(int(cpus)) if float(cpus).is_integer() else repr(float(cpus))
 
 
+def _registry(image: str) -> str:
+    """The registry host an image reference names, so a message can say where an image has to come from."""
+    return image.split("/", 1)[0]
+
+
+def _managed_environment(registration: dict, configuration: dict) -> dict[str, str]:
+    """The environment Shiplord sets on every release; the start and the running check share this one definition."""
+    http = configuration["http"]
+    managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "LOG_LEVEL": "INFO"}
+    if configuration["template"] == "google-adk":
+        managed.update(AGENT_DIR="/app/src", AGENT_NAME=registration["application_id"], RELOAD_AGENTS="false",
+                       SERVE_WEB_INTERFACE="false", ALLOW_ORIGINS=json.dumps(http["frontend_origins"]))
+    return managed
+
+
+def _environment_dict(encoded: str) -> dict[str, str]:
+    """Parse the JSON list of ``KEY=VALUE`` entries Docker records; raises ``ValueError`` on anything unexpected."""
+    entries = json.loads(encoded)
+    if not isinstance(entries, list):
+        raise ValueError("environment is not a list")
+    values = {}
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError("environment entry is not a string")
+        key, separator, value = entry.partition("=")
+        if not separator:
+            raise ValueError("environment entry is not KEY=VALUE")
+        values[key] = value
+    return values
+
+
+def _environment_matches(actual: dict[str, str], expected: dict[str, str]) -> bool:
+    """Every value the start sets must be exactly what the container was created with.
+
+    Extra keys are tolerated: ``.Config.Env`` also carries the image's own ``ENV`` and the base image's ``PATH``,
+    which the start neither sets nor can distinguish from a custom key the operator removed. Values never leave here.
+    """
+    return all(actual.get(key) == value for key, value in expected.items())
+
+
+def _security_options(values: list) -> set:
+    """Docker writes ``no-new-privileges`` or, on some versions, ``no-new-privileges:true``."""
+    return {value[:-len(":true")] if isinstance(value, str) and value.endswith(":true") else value for value in values}
+
+
+def _integer(text: str) -> int | None:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 class Runtime(Protocol):
     def prepare(self, registration: dict, release: dict) -> dict: ...
     def start(self, registration: dict, release: dict) -> None: ...
     def stop(self, registration: dict) -> None: ...
     def is_running(self, registration: dict, release: dict) -> bool: ...
-    def logs(self, registration: dict, tail: int) -> str: ...
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str: ...
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str: ...
     def discard(self, registration: dict, release: dict) -> list[str]: ...
+
+
+def validate_since(value: str) -> str:
+    """Only relative durations both Docker and journalctl read the same way are accepted."""
+    if not isinstance(value, str) or not _SINCE.fullmatch(value):
+        raise ValueError("--since must be a duration such as 30s, 15m or 2h")
+    return value
+
+
+def validate_follow_timeout(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= MAX_FOLLOW_SECONDS:
+        raise ValueError(f"--timeout must be between 1 and {MAX_FOLLOW_SECONDS} seconds")
+    return value
 
 
 class DockerRuntime:
@@ -128,7 +210,7 @@ class DockerRuntime:
             raise RuntimeFailure(f"docker could not complete ({error.kind})", phase, error.output) from None
 
     # operations -----------------------------------------------------------
-    def _require_free_disk(self) -> None:
+    def _require_free_disk(self, phase: str = "prepare") -> None:
         """Refuse to work when the disk is nearly full: a full disk fails a deploy halfway."""
         probe = DOCKER_ROOT if self.layout.prefix == Path("/") and DOCKER_ROOT.exists() else self.layout.var
         try:
@@ -137,7 +219,7 @@ class DockerRuntime:
             free = MIN_FREE_BYTES  # cannot measure: let docker report its own failure
         if free < MIN_FREE_BYTES:
             raise RuntimeFailure(f"not enough free disk space to pull an image ({free // 2**20} MiB free, "
-                                 f"{MIN_FREE_BYTES // 2**20} MiB needed); nothing was changed", "prepare")
+                                 f"{MIN_FREE_BYTES // 2**20} MiB needed); nothing was changed", phase)
 
     def _inspect_image(self, image: str):
         """Read the platform, revision label, and stop signal of a local image; non-zero means it is absent."""
@@ -146,6 +228,23 @@ class DockerRuntime:
                              '{{.Config.StopSignal}}', image],
                             "prepare")
 
+    def _pull(self, registration: dict, image: str, phase: str = "prepare", failure: str = "") -> None:
+        """Fetch one pinned image with this application's own read-only login.
+
+        This is the one place a pull happens: ``pull`` runs it before the host-wide lock, ``prepare`` reuses it when
+        the verified image is absent, and a start reuses it when a restore finds the image pruned. ``failure`` is the
+        message to raise instead of the generic one, for a caller that must not repeat the pull's raw output.
+        """
+        self._require_free_disk(phase)
+        login = self.layout.registry_logins / registration["application_id"]
+        config = ["--config", str(login)] if (login / "config.json").is_file() else []  # this app's read-only login
+        pulled = self._docker([*config, "pull", "--quiet", image], phase, timeout=PULL_TIMEOUT_SECONDS)
+        if pulled.code == 0:
+            return
+        if failure:  # a pull can echo what it was given, so this caller shows no output at all
+            raise RuntimeFailure(failure, phase)
+        raise RuntimeFailure("the image could not be pulled", phase, pulled.output)
+
     def pull(self, registration: dict, release: dict) -> None:
         """Fetch the pinned image with this application's own read-only login.
 
@@ -153,13 +252,23 @@ class DockerRuntime:
         registry may delay this job, never every other application and every admin command. ``prepare`` verifies
         the result under the lock and only fetches again when the image is not there at all.
         """
-        self._require_free_disk()
-        image = release["artifact"]["image"]
-        login = self.layout.registry_logins / registration["application_id"]
-        config = ["--config", str(login)] if (login / "config.json").is_file() else []  # this app's read-only login
-        pulled = self._docker([*config, "pull", "--quiet", image], "prepare", timeout=PULL_TIMEOUT_SECONDS)
-        if pulled.code != 0:
-            raise RuntimeFailure("the image could not be pulled", "prepare", pulled.output)
+        self._pull(registration, release["artifact"]["image"])
+
+    def _ensure_image(self, registration: dict, image: str) -> None:
+        """Make the release's image available on this host before anything is stopped.
+
+        A deploy has already fetched the candidate in ``prepare``, so a local image is the usual case and costs one
+        ``docker image inspect``, never a registry round trip. A restore - or any start after ``docker image prune -a``
+        - fetches the pinned digest with this application's own login while the previous release keeps serving. The
+        fetch's raw output is dropped: it can echo what it was given, and the message already says where the image
+        has to come from.
+        """
+        present = self._docker(["image", "inspect", "--format", "{{.Id}}", image], "start")
+        if present.code == 0:
+            return
+        self._pull(registration, image, "start",
+                   f"the release's image could not be fetched from {_registry(image)}; "
+                   "the previous release is still running")
 
     def prepare(self, registration: dict, release: dict) -> dict:
         """Verify the image on this host, its platform, revision, and stop signal before anything is stopped.
@@ -325,7 +434,7 @@ class DockerRuntime:
                 return True
         return False
 
-    def _remove_containers(self, registration: dict, state=None) -> None:
+    def _remove_containers(self, registration: dict, state=None, *, force: bool = False) -> None:
         """Gracefully stop whatever runs for the application (under its own recorded policy), then remove it."""
         self.stop_report = []
         journal = state.read_journal() if state is not None else None
@@ -336,7 +445,7 @@ class DockerRuntime:
                 state.clear_stop(identifier)
             else:
                 container = self._outgoing(identifier)
-                self._stop_gracefully(container, state, pending)
+                self._stop_gracefully(container, state, pending, force=force)
                 self._remove(identifier)
                 state.clear_stop(identifier)
 
@@ -348,7 +457,7 @@ class DockerRuntime:
                                  intervention_required=True, kind="ambiguous")
         for container in outgoing:
             if container["status"] in ("running", "paused", "restarting"):
-                self._stop_gracefully(container, state)
+                self._stop_gracefully(container, state, force=force)
             self._remove(container["id"])
             if state is not None:
                 journal = state.read_journal()
@@ -356,7 +465,7 @@ class DockerRuntime:
                 if record is not None and record["container_id"] == container["id"]:
                     state.clear_stop(container["id"])
 
-    def _stop_gracefully(self, container: dict, state=None, record: dict | None = None) -> None:
+    def _stop_gracefully(self, container: dict, state=None, record: dict | None = None, *, force: bool = False) -> None:
         identifier, started = container["id"], self.clock()
         signal = stop_signal(container["signal"])  # validate before changing restart policy or signalling
         if container["status"] == "paused":
@@ -370,17 +479,19 @@ class DockerRuntime:
                     or record["action"] != container["action"] or record["signal"] != signal):
                 raise RuntimeFailure("the saved shutdown intent does not match the container", "stop",
                                      intervention_required=True, kind="shutdown_record_mismatch")
-        elif container["restart_policy"] == "no" and state is not None:
+        elif container["restart_policy"] == "no" and state is not None and not force:
             # A prior helper may have disabled restart before this version added durable stop intent.
             raise RuntimeFailure("the container has a shutdown in progress without a saved intent; manual recovery is required",
                                  "stop", intervention_required=True, kind="shutdown_in_progress")
         elif container["restart_policy"] == "no":
             # Preserve the standalone runtime behavior for callers without a transaction store. Deployer uses the
-            # durable path above, so production recovery always has a saved deadline and phase.
+            # durable path above, so production recovery always has a saved deadline and phase. A forced stop may
+            # reach this legacy state: its intent is in memory only, because a record cannot say restart policy "no".
             deadline = self.wall_clock() if container["action"] == "fail" else self.wall_clock() + container["timeout"]
             record = {"container_id": identifier, "restart_policy": "no", "timeout_seconds": container["timeout"],
                       "action": container["action"], "signal": signal, "deadline_epoch": math.ceil(deadline),
                       "phase": "signalled"}
+            state = None  # nothing to advance or clear: this intent is never persisted
         else:
             record = {"container_id": identifier, "restart_policy": container["restart_policy"],
                       "timeout_seconds": container["timeout"], "action": container["action"], "signal": signal,
@@ -412,13 +523,15 @@ class DockerRuntime:
             phase = record["phase"]
             report["stages"].append("signalled")
         report["stages"].append("waiting")
-        remaining = max(0, min(record["timeout_seconds"], record["deadline_epoch"] - self.wall_clock()))
+        remaining = 0 if force else max(0, min(record["timeout_seconds"], record["deadline_epoch"] - self.wall_clock()))
         if self._wait_exit(identifier, remaining):
             report["stages"].append("exited")
             report["elapsed_seconds"] = round(self.clock() - started, 1)
             return
-        if record["action"] == "fail":
+        if record["action"] == "fail" and not force:
             self._expired(record, report, started)
+        if force:
+            report["stages"].append("force_requested")
         if phase in ("signalled", "kill_pending"):
             if phase != "kill_pending":
                 record = self._advance_stop(state, record, "kill_pending")
@@ -459,7 +572,8 @@ class DockerRuntime:
         report["stages"].append("deadline_expired")
         report["elapsed_seconds"] = round(self.clock() - started, 1)
         raise RuntimeFailure(f"the application did not stop within {record['timeout_seconds']} seconds and its policy is not "
-                             "to force it; it was signalled and may still exit. Run `shiplord recover` once it has",
+                             "to force it; it was signalled and may still exit. Run `shiplord recover` once it has, or "
+                             "`shiplord recover --force-stop` to kill it",
                              "stop", intervention_required=True, kind="shutdown_timeout")
 
 
@@ -470,6 +584,15 @@ class DockerRuntime:
     def stop_with_state(self, registration: dict, state) -> None:
         """Resume or begin a journaled graceful stop for a locked deployment transaction."""
         self._remove_containers(registration, state)
+
+    def force_stop(self, registration: dict, state=None) -> None:
+        """Kill and remove whatever runs for the application, overriding a ``fail`` shutdown deadline.
+
+        This is the explicit escape hatch behind ``shiplord recover --force-stop``: the graceful signal is still
+        sent first, but the wait is zero and the deadline refusal is skipped, so the existing ``kill_pending`` ->
+        ``killed`` path sends ``SIGKILL`` and confirms the exit before the stop record is cleared.
+        """
+        self._remove_containers(registration, state, force=True)
 
     def start(self, registration: dict, release: dict) -> None:
         self._start(registration, release)
@@ -490,6 +613,8 @@ class DockerRuntime:
             custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
         except EnvironmentError_ as error:
             raise RuntimeFailure(f"the environment file is unusable: {error}", "start") from None
+        # Before the running release is touched: a restore must fetch a pruned image while the old one still serves.
+        self._ensure_image(registration, release["artifact"]["image"])
         self.check_volume(registration, create=True, provenance=provenance)  # before the running release is touched
         self._remove_containers(registration, state)
         timeout, action = policy(config)
@@ -499,48 +624,71 @@ class DockerRuntime:
                 "--label", f"shiplord.release={release_id(release)}",
                 "--label", f"shiplord.template={config['template']}",
                 "--label", f"shiplord.shutdown_timeout={timeout}", "--label", f"shiplord.shutdown_action={action}",
-                "--restart", "unless-stopped", "--memory", memory, "--memory-swap", memory, "--pids-limit", "512",
-                "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-                "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--stop-timeout", str(timeout),
-                "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
-                "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
+                "--restart", RESTART_POLICY, "--memory", memory, "--memory-swap", memory,
+                "--pids-limit", str(PIDS_LIMIT), "--log-driver", LOG_DRIVER]
+        for key, value in LOG_OPTIONS.items():
+            argv += ["--log-opt", f"{key}={value}"]
+        for option in SECURITY_OPTIONS:
+            argv += ["--security-opt", option]
+        for capability in CAP_DROP:
+            argv += ["--cap-drop", capability]
+        argv += ["--stop-timeout", str(timeout),
+                 "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
+                 "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
         if "cpu_limit" in config["resources"]:
             argv += ["--cpus", cpu_limit_arg(config["resources"]["cpu_limit"])]
         if config["deploy"].get("init"):  # a manifest that does not ask for it keeps the old container behavior
             argv.append("--init")
         if custom is not None:
             argv += ["--env-file", str(self.layout.environments / registration["application_id"] / "app.env")]
-        managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "LOG_LEVEL": "INFO"}
-        if config["template"] == "google-adk":
-            managed.update(AGENT_DIR="/app/src", AGENT_NAME=registration["application_id"], RELOAD_AGENTS="false",
-                           SERVE_WEB_INTERFACE="false", ALLOW_ORIGINS=json.dumps(http["frontend_origins"]))
-        for key, value in managed.items():  # after --env-file, so the managed values win
+        for key, value in _managed_environment(registration, config).items():  # after --env-file, so they win
             argv += ["--env", f"{key}={value}"]
         argv.append(release["artifact"]["image"])
         result = self._docker(argv, "start")
         if result.code != 0:
             raise RuntimeFailure("the container could not be started", "start", result.output)
 
-    def is_running(self, registration: dict, release: dict) -> bool:
-        """Is the container running with this release's image, profile, shutdown policy, and storage mount?
+    _RUNNING_INSPECT = (
+        "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}"
+        "|{{index .Config.Labels \"shiplord.shutdown_timeout\"}}"
+        "|{{index .Config.Labels \"shiplord.shutdown_action\"}}"
+        "|{{index .Config.Labels \"shiplord.template\"}}"
+        "|{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}"
+        "|{{.HostConfig.Memory}}"
+        "|{{.HostConfig.MemorySwap}}"
+        "|{{if .HostConfig.PidsLimit}}{{.HostConfig.PidsLimit}}{{else}}0{{end}}"
+        "|{{.HostConfig.RestartPolicy.Name}}"
+        "|{{json .HostConfig.SecurityOpt}}"
+        "|{{json .HostConfig.CapDrop}}"
+        "|{{.HostConfig.LogConfig.Type}}"
+        "|{{json .HostConfig.LogConfig.Config}}"
+        "|{{json .HostConfig.PortBindings}}"
+        "|{{json .Config.Env}}"
+    )
+    _RUNNING_FIELDS = 14  # separators before the JSON environment, which is last so a value may contain "|"
 
-        The container name does not encode configuration, so a name and a readiness answer alone could
-        accept a container that still has the previous mount path. A crash-looping container reports
-        Running=true while Docker waits to restart it; that is not "running" either.
+    def is_running(self, registration: dict, release: dict) -> bool:
+        """Is the container running with every value this release's start consumes?
+
+        The container name does not encode configuration, so a name and a readiness answer alone could accept a
+        container that still runs the previous memory limit, port, origins, or environment. A crash-looping container
+        reports Running=true while Docker waits to restart it; that is not "running" either. Anything absent or
+        unreadable is a mismatch: restarting is always safe and writes the committed configuration.
+
+        The one exception is the operator's own environment file: when it cannot be read there is nothing to compare
+        against, and a start would fail on that same file. The record-derived values above still decide, so a
+        candidate that already replaced them is caught; a running release is not reported down for a file a restart
+        could not fix.
         """
-        result = self._docker(["inspect", "--format",
-                               "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}|"
-                               "{{index .Config.Labels \"shiplord.shutdown_timeout\"}}|"
-                               "{{index .Config.Labels \"shiplord.shutdown_action\"}}|"
-                               "{{index .Config.Labels \"shiplord.template\"}}|"
-                               "{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}",
+        result = self._docker(["inspect", "--format", self._RUNNING_INSPECT,
                                self.container_name(registration, release)], "inspect")
         if result.code != 0:
             return False
-        try:
-            head, timeout_label, action_label, template, mount_list = result.output.strip().split("|")
-        except ValueError:
+        parts = result.output.strip().split("|", self._RUNNING_FIELDS)
+        if len(parts) != self._RUNNING_FIELDS + 1:
             return False
+        (head, timeout_label, action_label, template, mount_list, memory, memory_swap, pids_limit, restart_policy,
+         security_opt, cap_drop, log_driver, log_options, ports, environment) = parts
         fields = head.split()
         if len(fields) != 3:
             return False
@@ -554,24 +702,108 @@ class DockerRuntime:
             return False
         # Containers from helpers predating profiles have no label and use the ADK contract.
         template = "google-adk" if template in absent else template
-        expected = f"volume:{self.volume_name(registration)}:{container_path(release['configuration'])}"
+        configuration = release["configuration"]
+        expected = f"volume:{self.volume_name(registration)}:{container_path(configuration)}"
         # Docker adds one anonymous mount for every VOLUME instruction in an image. Those are compatible when the
         # Shiplord-managed volume is still present exactly once at the configured path.
+        try:
+            custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
+        except EnvironmentError_:
+            custom = None  # unreadable: only the record-derived values can decide; the next start reports the file
+        expected_environment = {**(custom or {}), **_managed_environment(registration, configuration)}
+        try:
+            security = json.loads(security_opt) or []
+            capabilities = json.loads(cap_drop) or []
+            log_config = json.loads(log_options) or {}
+            bindings = json.loads(ports)
+            actual_environment = _environment_dict(environment)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(security, list) or not isinstance(capabilities, list) or not isinstance(log_config, dict):
+            return False
+        memory_mb = configuration["resources"]["memory_mb"]
         return ((running, restarting) == ("true", "false")
                 and _digest(image) == _digest(release["artifact"]["image"])
-                and actual_policy == policy(release["configuration"])
-                and template == release["configuration"]["template"]
-                and mount_list.split().count(expected) == 1)
+                and actual_policy == policy(configuration)
+                and template == configuration["template"]
+                and mount_list.split().count(expected) == 1
+                and _integer(memory) == memory_mb * 1024 * 1024
+                and _integer(memory_swap) == memory_mb * 1024 * 1024
+                and _integer(pids_limit) == PIDS_LIMIT
+                and restart_policy == RESTART_POLICY
+                and _security_options(security) == set(SECURITY_OPTIONS)
+                and set(capabilities) == set(CAP_DROP)
+                and log_driver == LOG_DRIVER
+                and log_config == LOG_OPTIONS
+                and bindings == {f"{configuration['http']['container_port']}/tcp": [
+                    {"HostIp": "127.0.0.1", "HostPort": str(registration["host_port"])}]}
+                and _environment_matches(actual_environment, expected_environment))
 
-    def logs(self, registration: dict, tail: int) -> str:
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str:
+        """The current release's container only: a stopped container of an older release is never read."""
         tail = max(1, min(int(tail), MAX_LOG_LINES))
-        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter", f"label=shiplord.app={registration['application_id']}"],
-                               "logs")
+        identifier = self._current_container(registration, release)
+        if identifier is None:
+            return ""
+        argv = ["logs", "--tail", str(tail)]
+        if since is not None:
+            argv += ["--since", since]
+        if timestamps:
+            argv += ["--timestamps"]
+        argv.append(identifier)
+        result = self._docker(argv, "logs", max_output=MAX_LOG_BYTES)
+        return result.output
+
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str:
+        """Stream the current release's container until ``duration`` expires; returns the stop reason."""
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        identifier = self._current_container(registration, release)
+        if identifier is None:
+            return "unavailable"
+        argv = ["logs", "--follow", "--tail", str(tail)]
+        if since is not None:
+            argv += ["--since", since]
+        if timestamps:
+            argv += ["--timestamps"]
+        argv.append(identifier)
+        try:
+            return self.system.stream([DOCKER, *argv], timeout=duration, on_chunk=emit)
+        except CommandError as error:
+            raise RuntimeFailure(f"docker could not complete ({error.kind})", "logs") from None
+
+    def _current_container(self, registration: dict, release: dict | None, phase: str = "logs") -> str | None:
+        """Select exactly the current release's container by label; None means there is nothing to read."""
+        if release is None:
+            return None
+        listing = self._docker(["ps", "-aq", "--no-trunc",
+                                "--filter", f"label=shiplord.app={registration['application_id']}",
+                                "--filter", f"label=shiplord.release={release_id(release)}"], phase)
         identifiers = listing.output.split()
         if listing.code != 0 or not identifiers:
-            return ""
-        result = self._docker(["logs", "--tail", str(tail), identifiers[0]], "logs", max_output=MAX_LOG_BYTES)
-        return result.output
+            return None
+        if any(len(identifier) != 64 or any(char not in "0123456789abcdef" for char in identifier)
+               for identifier in identifiers):
+            return None
+        return identifiers[0]
+
+
+    def release_logs(self, registration: dict, release: dict, tail: int, *, max_bytes: int = MAX_LOG_BYTES) -> str | None:
+        """Read this release's own container's last ``tail`` lines; ``None`` means it has no container.
+
+        ``logs`` reports whichever container is listed first, which after a rollback is the restored release. A failed
+        candidate's container is removed by the restore, so its output is only readable by name, before that happens.
+        """
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        result = self._docker(["logs", "--tail", str(tail), self.container_name(registration, release)], "logs",
+                              max_output=max_bytes)
+        if result.code == 0:
+            return result.output
+        if "no such" in result.output.lower():
+            return None
+        raise RuntimeFailure("the release's container logs could not be read", "logs")
 
     def discard(self, registration: dict, release: dict) -> list[str]:
         """Best-effort removal of a release's image after it left the retained set; returns warnings."""

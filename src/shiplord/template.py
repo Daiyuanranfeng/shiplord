@@ -108,11 +108,13 @@ shiplord github setup --repo <owner>/<repository> --tooling-ref <shiplord commit
 ```
 
 Create the DNS record for the API hostname yourself. Finish the Tailscale federation described in the output of
-`shiplord github setup`, then push to `main`.
+`shiplord github setup`, then push to the deployment branch (`main` unless `[github] deployment_branch` names
+another).
 
 ## Releasing
 
-Merging to `main` runs `.github/workflows/shiplord-release.yml`: the template's quality checks, an image build, and
+Merging to the deployment branch (`main` unless `[github] deployment_branch` names another) runs
+`.github/workflows/shiplord-release.yml`: the template's quality checks, an image build, and
 `shiplord deploy` by digest. To release by hand: `shiplord deploy --image <registry/name@sha256:digest> --commit <sha>`.
 
 ## Reading results (exit codes)

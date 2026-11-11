@@ -15,12 +15,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import shiplord
 from shiplord.admin import run as admin_run
+from shiplord.client import ClientError, require_server_python
 from shiplord.framing import read_frame, write_frame
-from shiplord.installer import DEPLOY_GROUP, bootstrap
+from shiplord.installer import DEPLOY_GROUP, BootstrapError, bootstrap
 from shiplord.layout import Layout, deployment_user
+from shiplord.osbaseline import OS_RELEASE, check_os
 from shiplord.protocol import PROTOCOL_VERSION
 from shiplord.routing import SubprocessCaddy
 from shiplord.system import CommandResult, HostSystem
@@ -28,6 +31,7 @@ from shiplord.system import CommandResult, HostSystem
 DISPOSABLE = os.path.exists("/.dockerenv") or os.environ.get("GITHUB_ACTIONS") == "true"
 ENABLED = (os.environ.get("SHIPLORD_TEST_HOST") == "1" and DISPOSABLE and os.geteuid() == 0
            and shutil.which("caddy") and shutil.which("sshd"))
+UNSUPPORTED = os.environ.get("SHIPLORD_TEST_UNSUPPORTED_OS") == "1"
 SOURCE = Path(shiplord.__file__).parent
 PORT = 2222
 CA_PORT = 2223  # a second sshd that trusts an SSH CA and runs an AuthorizedKeysCommand
@@ -163,6 +167,33 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertIn("import /etc/caddy/ship/*.caddy", Path("/etc/caddy/Caddyfile").read_text())
         self.assertTrue(subprocess.run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter",
                                         "caddyfile"], capture_output=True).returncode == 0)
+
+    def test_the_interpreter_probe_runs_on_the_real_host(self):
+        """The probe's exact command string must work in a shell where the helper will run."""
+        commands = []
+
+        def runner(command, payload, timeout):
+            commands.append(command)
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], input=payload, capture_output=True,
+                                    timeout=timeout)
+            return result.stdout, result.stderr, result.returncode
+
+        self.assertIsNone(require_server_python(runner, "root@127.0.0.1"))
+        self.assertEqual(len(commands), 1)
+        self.assertIn("sys.version_info", commands[0][-1])
+
+    def test_an_absent_interpreter_is_refused_before_anything_is_uploaded(self):
+        def runner(command, payload, timeout):
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], input=payload, capture_output=True,
+                                    timeout=timeout)
+            return result.stdout, result.stderr, result.returncode
+
+        with mock.patch("shiplord.client.SERVER_PYTHON", "/usr/bin/python3.9"):
+            with self.assertRaises(ClientError) as caught:
+                require_server_python(runner, "root@127.0.0.1")
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("/usr/bin/python3.9", str(caught.exception))
+        self.assertIn("Python 3.11 or later", str(caught.exception))
 
     def test_bootstrap_discovers_the_installed_sshd_unit(self):
         for unit in ("ssh.service", "sshd.service"):
@@ -363,6 +394,39 @@ class HostIntegrationTests(unittest.TestCase):
         login = self.login("/usr/local/libexec/shiplord-dispatch", stdin=capabilities_frame("orders"))
         self.assertEqual(login.returncode, 255)
         self.assertFalse(Path("/etc/sudoers.d/shiplord-orders").exists())
+
+
+@unittest.skipUnless(UNSUPPORTED, "set SHIPLORD_TEST_UNSUPPORTED_OS=1 in a host that reports an unsupported OS")
+class UnsupportedOsTests(unittest.TestCase):
+    """A host outside the supported baseline is refused before anything is created or run."""
+
+    def test_bootstrap_refuses_the_reported_os_before_any_side_effect(self):
+        reported = check_os(Path(OS_RELEASE))
+        self.assertFalse(reported["ok"], f"this container reports a supported OS: {reported}")
+
+        touched = []
+
+        class NoCommands:
+            def run(self, argv, **kwargs):
+                touched.append(list(argv))
+                raise AssertionError("bootstrap ran a command on an unsupported host")
+
+        class NoCaddy:
+            def validate(self, config):
+                touched.append(["caddy", "validate"])
+
+            def reload(self):
+                touched.append(["caddy", "reload"])
+
+        with self.assertRaises(BootstrapError) as caught:
+            bootstrap(Layout(), SOURCE, NoCommands(), NoCaddy())
+        message = str(caught.exception)
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", message)
+        self.assertIn("ubuntu 22.04", message)
+        self.assertNotIn("/", message)
+        self.assertEqual(touched, [])
+        self.assertFalse(Path("/etc/shiplord").exists())
+        self.assertFalse(Path("/usr/local/lib/shiplord").exists())
 
 
 if __name__ == "__main__":
