@@ -27,14 +27,17 @@ from . import tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
-from .manifest import ManifestError, validate_manifest
+from .manifest import (ManifestError, configured_branch, validate_binary_path, validate_build_command,
+                       validate_deployment_branch, validate_manifest)
 from .servers import SshOptions, _config_home, ssh_command
 from .workflow import (DEFAULT_QUALITY_WORKFLOW, DEPLOY_WORKFLOW_PATH, TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError,
-                       render_deploy_workflow, render_workflow, validate_quality_workflow)
+                       render_deploy_workflow, render_workflow, upgrade_action_pins, validate_platforms,
+                       validate_quality_workflow)
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
 TAILSCALE_VARIABLES = ("SHIPLORD_TS_CLIENT_ID", "SHIPLORD_TS_AUDIENCE", "SHIPLORD_TS_TAGS")
+TAILSCALE_API_TOKEN_ENV = tailscale.API_TOKEN_ENV  # the github_setup parameter shadows the module name
 WRITE_PERMISSIONS = ("ADMIN", "MAINTAIN")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}\Z")
@@ -159,6 +162,15 @@ def ci_directory(application_id: str, server: str, home: Path | None = None) -> 
         os.chmod(path, 0o700)
     _migrate_legacy_state(root / application_id, directory)
     return directory
+
+
+def _ci_base(home: Path | None = None) -> Path:
+    return (home / "shiplord") if home else (_config_home() / "shiplord")
+
+
+def ci_state(application_id: str, server: str, home: Path | None = None) -> dict:
+    """The recorded CI setup state for an application, without creating anything."""
+    return _load_state(_ci_base(home) / "ci" / server / application_id)
 
 
 def _migrate_legacy_state(legacy: Path, directory: Path) -> None:
@@ -289,6 +301,53 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
+def _native_build_settings(manifest: dict, build_command: str | None,
+                           binary_path: str | None) -> tuple[str | None, str | None]:
+    """Resolve how CI builds a native binary, refusing before any account, key, or GitHub change.
+
+    The values live in ``[github]`` so a later run needs no flags. A section that predates this feature has no
+    place to write them without rewriting the user's file, so it is refused with the two lines to add.
+    """
+    if manifest["runtime"] != "native":
+        if build_command is not None or binary_path is not None:
+            raise GitHubError("--build-command and --binary-path apply only to native applications", 2, "configuration")
+        return None, None
+    section = manifest.get("github") or {}
+    if section and not (section.get("build_command") and section.get("binary_path")):
+        raise GitHubError("ship.toml already has a [github] section without github.build_command and "
+                          "github.binary_path; add both to that section", 2, "configuration")
+    resolved: dict[str, str | None] = {}
+    for name, given, existing, validate in (
+        ("build_command", build_command, section.get("build_command"), validate_build_command),
+        ("binary_path", binary_path, section.get("binary_path"), validate_binary_path),
+    ):
+        if given is not None:
+            try:
+                given = validate(given)
+            except ManifestError as error:
+                raise GitHubError(str(error), 2, "configuration") from None
+            if existing is not None and existing != given:
+                raise GitHubError(f"ship.toml already names github.{name}; edit it first to change it", 2,
+                                  "configuration")
+        resolved[name] = given if given is not None else existing
+    if not resolved["build_command"] or not resolved["binary_path"]:
+        raise GitHubError("a native application needs the command that builds its binary and the path it writes: "
+                          "pass --build-command and --binary-path, or add github.build_command and "
+                          "github.binary_path to ship.toml", 2, "configuration")
+    return resolved["build_command"], resolved["binary_path"]
+
+
+def validate_setup_profile(manifest: dict, *, build_command: str | None = None, binary_path: str | None = None,
+                           platforms: str | None = None) -> tuple[str | None, str | None]:
+    """Reject an unsupported workflow request before callers collect settings or credentials."""
+    if platforms is not None:
+        try:
+            validate_platforms(manifest["runtime"], platforms)
+        except WorkflowError as error:
+            raise GitHubError(str(error), 2, "configuration") from None
+    return _native_build_settings(manifest, build_command, binary_path)
+
+
 def validate_setup_request(manifest: dict, repository: str) -> None:
     """Reject an unusable setup request before callers collect settings, credentials, or change anything.
 
@@ -299,6 +358,35 @@ def validate_setup_request(manifest: dict, repository: str) -> None:
         raise GitHubError("--repo must be owner/repository", 2)
     if "github" in manifest and manifest["github"]["repository"] != repository:
         raise GitHubError(f"ship.toml already names {manifest['github']['repository']}; edit it first to change repositories", 2)
+
+
+def validate_repository(repository: str) -> str:
+    """Reject a repository that is not an ``owner/repository`` pair before anything is changed."""
+    if not _REPOSITORY.fullmatch(repository):
+        raise GitHubError("--repo must be owner/repository", 2)
+    return repository
+
+
+def setup_complete(manifest: dict, *, project: Path, repository: str, home: Path | None = None) -> bool:
+    """Local evidence that ``github setup`` finished for this repository.
+
+    It reads the manifest, the generated workflow, and the local CI state; it does not query GitHub, so a secret
+    deleted in the repository is not noticed here (``shiplord github status`` and the final check do notice it).
+    """
+    if manifest.get("github", {}).get("repository") != repository:
+        return False
+    if not (project / WORKFLOW_PATH).is_file():
+        return False
+    state = ci_state(manifest["name"], manifest["server"], home)
+    return bool(state.get("secret_set")) and state.get("repository") == repository
+
+
+def resolve_deployment_branch(manifest: dict, requested: str | None = None) -> str:
+    """The branch CI deploys from: the requested one, else the manifest's, else main. Validated before any change."""
+    try:
+        return validate_deployment_branch(requested if requested is not None else configured_branch(manifest))
+    except ManifestError as error:
+        raise GitHubError(str(error), 2, "configuration") from None
 
 
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
@@ -320,11 +408,19 @@ def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
 
 def github_setup(manifest: dict, repository: str, *, project: Path, admin: AdminClient, gh: GitHub, admin_target: str,
                  ci_host: str | None = None, tooling_ref: str | None = None, platforms: str = "linux/amd64",
-                 tailscale: Mapping[str, str] | None = None, force_workflow: bool = False, home: Path | None = None,
+                 build_command: str | None = None, binary_path: str | None = None,
+                 tailscale: Mapping[str, str] | None = None, deployment_branch: str | None = None,
+                 force_workflow: bool = False, home: Path | None = None,
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                  resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host, quality_workflow: str | None = None,
                  include_quality: bool = True) -> dict:
+    command, path = validate_setup_profile(manifest, build_command=build_command, binary_path=binary_path,
+                                           platforms=platforms)
+    if manifest["runtime"] == "native" and quality_workflow is not None:
+        raise GitHubError("a native workflow has no quality job; run your checks in the build command", 2,
+                          "configuration")
     validate_setup_request(manifest, repository)
+    branch = resolve_deployment_branch(manifest, deployment_branch)
     app = manifest["name"]
     steps: dict[str, str] = {}
     account = gh.account()
@@ -380,18 +476,18 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         gh.set_variable(repository, name, value)
     steps["variables"] = ", ".join(sorted(variables))
 
-    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms,
-                                        force_workflow, quality_workflow, include_quality)
-    _ensure_manifest_github(project, manifest, repository)
-    steps["manifest"] = f"ship.toml names {repository}"
+    steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms, branch,
+                                        force_workflow, quality_workflow, include_quality, command, path)
+    _ensure_manifest_github(project, repository, branch, command, path)
+    steps["manifest"] = f"ship.toml names {repository} on {branch}"
     remaining = []
     extra: dict = {}
     if not (tailscale and tailscale.get("SHIPLORD_TS_CLIENT_ID")):
         steps["tailscale"] = "not configured"
-        extra["tailscale_setup"] = tailscale_guidance(gh, repository, manifest)
+        extra["tailscale_setup"] = tailscale_guidance(gh, repository, manifest, branch)
         remaining.append("Create the Tailscale trust credential as described in tailscale_setup, then rerun with "
-                         "--tailscale-client-id and --tailscale-audience (Shiplord cannot do this without Tailscale "
-                         "administrative credentials).")
+                         "--tailscale-client-id and --tailscale-audience. Shiplord creates it for you when "
+                         f"{TAILSCALE_API_TOKEN_ENV} holds a Tailscale API token that may create federated identities.")
     else:
         remaining.append("Make sure the Tailscale trust credential gives tag:ci and that tag:ci may reach the server's "
                          "SSH port; Shiplord cannot check the tailnet policy.")
@@ -403,14 +499,32 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
             **extra}
 
 
-def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
+def tailscale_guidance(gh: GitHub, repository: str, manifest: dict, branch: str | None = None) -> dict:
     """Instructions for the Tailscale trust credential, with the exact subject this repository's runs present."""
-    branch = manifest.get("github", {}).get("deployment_branch", "main")
+    branch = branch if branch is not None else configured_branch(manifest)
     prefix, custom = gh.oidc_subject_prefix(repository)
     try:
         return tailscale.guidance(prefix, branch, custom_claims=custom)
     except tailscale.TailscaleError as error:
         raise GitHubError(str(error), 3, "tailscale") from None
+
+
+def tailscale_credential(gh: GitHub, repository: str, manifest: dict, *, tags: list[str] | None = None,
+                         environ: Mapping[str, str] | None = None, transport: tailscale.Transport | None = None
+                         ) -> tuple[dict[str, str], list[str]] | None:
+    """Create the trust credential through the Tailscale API when a token is in the environment.
+
+    Returns ``(settings, warnings)`` or ``None`` when no token is set, so the caller falls back to the printed
+    instructions. The owner-wide subject is used, so a later repository of the same owner reuses this credential
+    instead of needing its own manual step. The token is never returned, stored or printed.
+    """
+    token = tailscale.api_token(environ)
+    if token is None:
+        return None
+    instructions = tailscale_guidance(gh, repository, manifest)
+    return tailscale.create_federated_identity(
+        token, subject=instructions["subject_all_repositories"], tags=tags or [instructions["tag"]],
+        description=f"shiplord: {repository}", transport=transport)
 
 
 def _resolve_quality_workflow(project: Path, requested: str | None, include: bool) -> str | None:
@@ -430,23 +544,28 @@ def _resolve_quality_workflow(project: Path, requested: str | None, include: boo
 
 
 def _write_workflow(manifest: dict, repository: str, project: Path, state: dict, directory: Path,
-                    tooling_ref: str | None, platforms: str, force: bool, quality_workflow: str | None = None,
-                    include_quality: bool = True) -> str:
-    if manifest["runtime"] != "docker":
-        return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
+                    tooling_ref: str | None, platforms: str, branch: str, force: bool,
+                    quality_workflow: str | None = None, include_quality: bool = True,
+                    build_command: str | None = None, binary_path: str | None = None) -> str:
     ref = tooling_ref or detect_tooling_ref()
     version = None
     if ref is None:
         # A PyPI install has no git checkout to pin, so pin the installed release instead.
         version = __version__
     pin = version if version is not None else ref[:12]
-    quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
-    merged = dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})})
+    merged = dict(manifest, github={"repository": repository, "deployment_branch": branch})
     try:
-        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, tooling_version=version,
-                                                              platforms=platforms),
-                 WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
-                                                platforms=platforms, quality_workflow=quality)}
+        if manifest["runtime"] == "native":
+            # A native binary needs one file: the build job and the deploy job run in the same workflow.
+            merged["github"] = {**merged["github"], "build_command": build_command, "binary_path": binary_path}
+            texts = {WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                    platforms=platforms)}
+        else:
+            quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
+            texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                                  platforms=platforms),
+                     WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                    platforms=platforms, quality_workflow=quality)}
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
     digests = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()}
@@ -478,8 +597,35 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     return f"written ({', '.join(changed)}, Shiplord pinned at {pin})"
 
 
-def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:
-    """Add the [github] section to ship.toml if the file (not just the loaded dict) lacks it."""
+_GITHUB_HEADER = re.compile(r"^[ \t]*\[github\][ \t]*(?:#.*)?$", re.MULTILINE)
+_TABLE_HEADER = re.compile(r"^[ \t]*\[", re.MULTILINE)
+_BRANCH_ASSIGNMENT = re.compile(r"^([ \t]*)deployment_branch[ \t]*=[^\n#]*(?P<comment>#[^\n]*)?$", re.MULTILINE)
+
+
+def _record_branch(text: str, branch: str) -> str:
+    """Set ``deployment_branch`` inside the existing [github] table, leaving every other line untouched."""
+    header = _GITHUB_HEADER.search(text)
+    if header is None:
+        raise GitHubError("ship.toml must declare [github] as a table to record the deployment branch", 2, "manifest")
+    following = _TABLE_HEADER.search(text, header.end())
+    end = following.start() if following else len(text)
+    table = text[header.end():end]
+    assignment = f'deployment_branch = "{branch}"'
+
+    def replace(match: re.Match) -> str:
+        comment = f"  {match.group('comment')}" if match.group("comment") else ""
+        return match.group(1) + assignment + comment
+
+    if _BRANCH_ASSIGNMENT.search(table):
+        table = _BRANCH_ASSIGNMENT.sub(replace, table, count=1)
+    else:
+        table = "\n" + assignment + table
+    return text[:header.end()] + table + text[end:]
+
+
+def _ensure_manifest_github(project: Path, repository: str, branch: str, build_command: str | None = None,
+                            binary_path: str | None = None) -> None:
+    """Record the repository, deployment branch, and native build settings, adding [github] if it is missing."""
     import tomllib
     path = project / "ship.toml"
     text = path.read_text()
@@ -490,15 +636,85 @@ def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> N
     if "github" in existing:
         if existing["github"].get("repository") != repository:
             raise GitHubError(f"ship.toml names {existing['github'].get('repository')}, not {repository}", 2, "manifest")
-        return
-    text += ("" if text.endswith("\n") else "\n") + f'\n[github]\nrepository = "{repository}"\ndeployment_branch = "main"\n'
+        if existing["github"].get("deployment_branch") == branch:
+            return
+        text = _record_branch(text, branch)
+    else:
+        lines = [f'repository = "{repository}"', f'deployment_branch = "{branch}"']
+        if build_command is not None:
+            lines += [f"build_command = {json.dumps(build_command)}", f"binary_path = {json.dumps(binary_path)}"]
+        text += ("" if text.endswith("\n") else "\n") + "\n[github]\n" + "\n".join(lines) + "\n"
     try:
-        validate_manifest(tomllib.loads(text))
+        recorded = validate_manifest(tomllib.loads(text))
     except (ManifestError, ValueError):
-        raise GitHubError("could not add the [github] section to ship.toml", 1, "manifest") from None
+        raise GitHubError("could not update the [github] section in ship.toml", 1, "manifest") from None
+    if recorded["github"]["deployment_branch"] != branch:
+        raise GitHubError("could not update the [github] section in ship.toml", 1, "manifest")
     temporary = path.with_name(f".ship.toml.tmp-{os.getpid()}")
     temporary.write_text(text)
     os.replace(temporary, path)
+
+
+def upgrade_workflow(manifest: dict, *, project: Path, home: Path | None = None) -> dict:
+    """Refresh the action pins in the workflows Shiplord generated, and change nothing else.
+
+    Every file is read and accepted before any is written, so a refusal leaves the pipeline exactly as it was.
+    Only ``uses:`` lines for actions Shiplord pins are rewritten: the deployment branch, the pinned Shiplord
+    commit, the quality job, and every local edit survive byte for byte. A hand-written workflow is refused.
+    """
+    paths = (WORKFLOW_PATH,) if manifest["runtime"] == "native" else (DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH)
+    missing = [path for path in paths if not (project / path).is_file()]
+    if missing:
+        raise GitHubError(f"there is no generated workflow at {', '.join(missing)}; run `shiplord github setup` "
+                          "to write the pipeline first", 2, "workflow")
+    before: dict[str, bytes] = {}
+    refreshed: dict[str, str] = {}
+    changes: list[dict] = []
+    for path in paths:
+        try:
+            before[path] = (project / path).read_bytes()
+            text, found = upgrade_action_pins(before[path].decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            raise GitHubError(f"could not read {path}", 1, "workflow") from None
+        except WorkflowError as error:
+            raise GitHubError(f"{path} was not rewritten: {error}", 2, "workflow") from None
+        refreshed[path] = text
+        changes.extend({"path": path, "action": change.repository, "from": change.previous, "to": change.commit,
+                        "version": change.version} for change in found)
+    written = [path for path in paths if refreshed[path].encode() != before[path]]
+    if not written:
+        return {"ok": True, "changed": [], "unchanged": list(paths), "pins": [],
+                "note": "the generated workflows already pin the current action commits"}
+    directory = ci_directory(manifest["name"], manifest["server"], home)
+    state = _load_state(directory)
+    recorded = state.get("workflows") if isinstance(state.get("workflows"), dict) else {}
+    previous = {path: hashlib.sha256(before[path]).hexdigest() for path in paths}
+    digests = {}
+    for path in paths:
+        target = project / path
+        if path in written:
+            temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+            temporary.write_text(refreshed[path])
+            os.replace(temporary, target)
+        digests[path] = hashlib.sha256((project / path).read_bytes()).hexdigest()
+    # Keep the "what Shiplord last wrote" record honest: a file the user had edited is still edited, so a
+    # later `github setup` keeps refusing to overwrite it without --force-workflow.
+    updated = dict(recorded)
+    for path in paths:
+        last_written = recorded.get(path) or (state.get("workflow_sha256") if path == WORKFLOW_PATH else None)
+        if last_written == previous[path]:
+            updated[path] = digests[path]
+    state["workflows"] = updated
+    if state.get("workflow_sha256") == previous[WORKFLOW_PATH]:
+        state["workflow_sha256"] = digests[WORKFLOW_PATH]
+    result = {"ok": True, "changed": written, "unchanged": [path for path in paths if path not in written],
+              "pins": changes}
+    try:
+        _save_state(directory, state)
+    except OSError:
+        result["warning"] = ("the workflows were refreshed, but the local record was not updated; a later "
+                             "`github setup` may ask for --force-workflow")
+    return result
 
 
 def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: str, home: Path | None = None,
@@ -631,7 +847,7 @@ def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callab
     if "github" not in manifest:
         raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
     repository = manifest["github"]["repository"]
-    branch = manifest["github"].get("deployment_branch", "main")
+    branch = configured_branch(manifest)
     before = {run["databaseId"] for run in gh.dispatch_runs(repository, branch)}
     gh.dispatch_check(repository, branch)
     deadline = clock() + timeout

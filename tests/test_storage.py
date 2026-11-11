@@ -15,7 +15,8 @@ from shiplord import commands  # noqa: E402
 from shiplord.commands import CommandError  # noqa: E402
 from shiplord.manifest import ManifestError, validate_manifest  # noqa: E402
 from shiplord.release_state import StateError, validate_release  # noqa: E402
-from shiplord.storage import DEFAULT_CONTAINER_PATH, StorageError, container_path, validate_container_path  # noqa: E402
+from shiplord.storage import (DEFAULT_CONTAINER_PATH, StorageError, container_path, validate_container_path,  # noqa: E402
+                              validate_storage)
 from test_client import ClientTestCase  # noqa: E402
 from test_commands import COMMIT, IMAGE  # noqa: E402
 from test_deploy import DeployTestCase  # noqa: E402
@@ -64,15 +65,11 @@ class ManifestTests(unittest.TestCase):
 
     def test_storage_round_trips_with_only_the_given_fields(self):
         self.assertEqual(validate_manifest(with_storage({"container_path": "/data"}))["storage"], {"container_path": "/data"})
-        both = {"container_path": "/data", "owner_uid": 10001, "owner_gid": 10002}
-        self.assertEqual(validate_manifest(with_storage(both))["storage"], both)
 
     def test_invalid_storage_tables_are_refused(self):
-        bad = [{}, {"owner_uid": 1, "owner_gid": 1}, {"container_path": "/etc"}, {"container_path": "/data", "extra": 1},
+        bad = [{}, {"container_path": "/etc"}, {"container_path": "/data", "extra": 1},
                {"container_path": "/data", "owner_uid": 10001}, {"container_path": "/data", "owner_gid": 10001},
-               *({"container_path": "/data", "owner_uid": uid, "owner_gid": 1}
-                 for uid in (0, -1, 2147483648, True, "10001", 1.0, None)),
-               *({"container_path": "/data", "owner_uid": 1, "owner_gid": gid} for gid in (0, False, "1")),
+               {"container_path": "/data", "owner_uid": 10001, "owner_gid": 10001},
                "/data", ["/data"], None]
         for storage in bad:
             with self.subTest(storage=storage), self.assertRaises(ManifestError):
@@ -84,9 +81,12 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "only to Docker"):
             validate_manifest(value)
 
-    def test_the_largest_owner_ids_are_accepted(self):
+    def test_ownership_is_refused_at_manifest_validation_with_a_clear_message(self):
         storage = {"container_path": "/data", "owner_uid": 2147483647, "owner_gid": 1}
-        self.assertEqual(validate_manifest(with_storage(storage))["storage"], storage)
+        with self.assertRaisesRegex(ManifestError, "owner_uid and storage.owner_gid are not supported"):
+            validate_manifest(with_storage(storage))
+        with self.assertRaisesRegex(StorageError, "not supported"):
+            validate_storage(storage)
 
 
 class LegacyRecordTests(unittest.TestCase):
@@ -117,11 +117,10 @@ class DeployStorageTests(DeployTestCase):
         value["configuration"] = with_storage(storage)
         return value
 
-    def test_ownership_is_refused_before_anything_changes(self):
+    def test_a_request_that_smuggles_ownership_is_refused_before_anything_changes(self):
         outcome = self.run_locked(self.deployer.deploy, self.storage_request(
             {"container_path": "/data", "owner_uid": 10001, "owner_gid": 10001}))
         self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2))
-        self.assertIn("owner_uid", outcome.detail["message"])
         self.assertEqual(self.runtime.calls, [])
         self.assertIsNone(self.state.read_journal())
 

@@ -396,6 +396,35 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertFalse(Path("/etc/sudoers.d/shiplord-orders").exists())
 
 
+    def test_zzz_uninstall_removes_the_helper_and_keeps_application_data(self):
+        second = bootstrap(self.layout, SOURCE, self.system, self.caddy)
+        self.assertFalse(any(second["changed"].values()), second)
+        self.assertEqual(second["collected"], [])
+        data = self.layout.data / "orders" / "keep"
+        data.parent.mkdir(parents=True, exist_ok=True)
+        data.write_text("application data\n")
+
+        # The admin entry point builds a systemd-backed Caddy runner; the container has no systemd, so use the
+        # live Caddy this suite started, exactly as the bootstrap tests do.
+        with mock.patch("shiplord.admin.SubprocessCaddy", return_value=self.caddy):
+            result = self.admin("uninstall", None, {})
+        self.assertEqual(result["status"], "uninstalled")
+        self.assertIn("the state directory that holds the host lock", result["retained"])
+        for path in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.dispatch):
+            self.assertFalse(path.exists(), path)
+        self.assertFalse(self.layout.lib.exists())
+        self.assertFalse(self.layout.sshd_dropin.exists())
+        self.assertFalse(Path("/etc/shiplord").exists())
+        self.assertFalse((self.layout.caddy_root / "ship").exists())
+        self.assertNotIn("ship/*.caddy", Path("/etc/caddy/Caddyfile").read_text())
+        self.assertEqual(subprocess.run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter",
+                                         "caddyfile"], capture_output=True).returncode, 0)
+        self.assertEqual(data.read_text(), "application data\n")
+        self.assertTrue(self.layout.var.is_dir())
+
+        again = self.admin("uninstall", None, {})
+        self.assertEqual(again["removed"]["wrappers"], [])
+        self.assertEqual(again["removed"]["versions"], 0)
 @unittest.skipUnless(UNSUPPORTED, "set SHIPLORD_TEST_UNSUPPORTED_OS=1 in a host that reports an unsupported OS")
 class UnsupportedOsTests(unittest.TestCase):
     """A host outside the supported baseline is refused before anything is created or run."""

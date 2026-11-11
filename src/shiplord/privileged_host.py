@@ -17,9 +17,11 @@ from .host import HostDeadline, extend_deadline, run_timed
 from .jobs import MAX_PENDING_JOBS, JobError, valid_job_id
 from .native import host_architecture
 from .payload import PayloadError, discard_upload, receive_payload
-from .manifest import GENERIC_DOCKER_FEATURE, ManifestError
+from .manifest import GENERIC_DOCKER_FEATURE, ManifestError, RUNTIME_KNOBS_FEATURE
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
 from .release_state import StateError
+from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_FOLLOW_SECONDS, MAX_LOG_LINES, release_id, validate_follow_timeout,
+                      validate_since)
 from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 
@@ -29,9 +31,10 @@ if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities
 MAX_NATIVE_BYTES = 1024 * 1024 * 1024
 UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to finish in time
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
-ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover"]
+ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover", "backup",
+           "restore"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
-FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE]
+FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE, RUNTIME_KNOBS_FEATURE]
 
 
 class _UploadRejected(Exception):
@@ -39,6 +42,8 @@ class _UploadRejected(Exception):
 
 
 _DEPLOY_ARGUMENTS = {"sequence", "artifact", "configuration", "allow_older"}
+_LOG_ARGUMENTS = {"tail", "since", "timestamps", "follow", "timeout"}
+FOLLOW_DEADLINE_GRACE_SECONDS = 30
 
 
 def _arguments(request: dict, allowed: set[str]) -> dict:
@@ -57,6 +62,26 @@ def _deploy_request(request: dict) -> dict:
         raise ProtocolError("allow_older must be a boolean")
     return {"commit": request["commit"], "sequence": arguments["sequence"], "artifact": arguments["artifact"],
             "configuration": arguments["configuration"], "allow_older": allow_older}
+
+
+_RESTORE_ARGUMENTS = {"archive", "latest"}
+
+
+def _restore_request(request: dict) -> dict:
+    """Validate a restore request before any host state is opened; returns the job payload."""
+    if request["commit"] is not None:
+        raise ProtocolError("invalid request")
+    arguments = _arguments(request, _RESTORE_ARGUMENTS)
+    if set(arguments) == {"archive"}:
+        from .backup import validate_archive_name
+        try:
+            name = validate_archive_name(arguments["archive"])
+        except ValueError:
+            raise ProtocolError("invalid archive name") from None
+        return {"archive": name}
+    if set(arguments) == {"latest"} and arguments["latest"] is True:
+        return {"latest": True}
+    raise ProtocolError("a restore needs exactly one of archive and latest")
 
 
 def job_view(session: AppSession, record: dict) -> dict:
@@ -117,10 +142,11 @@ def _submit(session: "AppSession", request: dict, action: str, payload: dict,
     return {"status": "accepted", "request_id": request_id, "job": job_view(session, record)}, 0
 
 
-def _prepare(request: dict):
+def _prepare(request: dict, destination: BinaryIO | None = None):
     """Validate every argument without touching the host.
 
-    Returns ``(work, expects_payload)``; ``work(session, source)`` does the host work.
+    Returns ``(work, expects_payload)``; ``work(session, source)`` does the host work. A work
+    function that streams returns ``(None, code)`` because it has already written its frames.
     """
     action, request_id = request["action"], request["request_id"]
 
@@ -134,11 +160,33 @@ def _prepare(request: dict):
         return (lambda session, source: ok({"application": session.deployer().status(),
                                            "job": _job(session, job_id)})), False
     if action == "logs":
-        tail = _arguments(request, {"tail"}).get("tail", 100)
-        if type(tail) is not int or not 1 <= tail <= 1000:
+        arguments = _arguments(request, _LOG_ARGUMENTS)
+        tail = arguments.get("tail", 100)
+        if type(tail) is not int or not 1 <= tail <= MAX_LOG_LINES:
             raise ProtocolError("tail must be between 1 and 1000")
-        return (lambda session, source: ok({"logs": session.services.runtime_factory(
-            session.services, session.registration).logs(session.registration, tail)})), False
+        since = arguments.get("since")
+        if since is not None:
+            try:
+                validate_since(since)
+            except ValueError:
+                raise ProtocolError("since must be a duration such as 30s, 15m or 2h") from None
+        timestamps = arguments.get("timestamps", False)
+        if type(timestamps) is not bool:
+            raise ProtocolError("timestamps must be a boolean")
+        follow = arguments.get("follow", False)
+        if type(follow) is not bool:
+            raise ProtocolError("follow must be a boolean")
+        try:
+            duration = validate_follow_timeout(arguments.get("timeout", DEFAULT_FOLLOW_SECONDS))
+        except ValueError:
+            raise ProtocolError(f"timeout must be between 1 and {MAX_FOLLOW_SECONDS} seconds") from None
+        if follow:
+            if destination is None:
+                raise ProtocolError("invalid request")
+            return (lambda session, source: _follow_logs(session, request_id, destination, tail=tail, since=since,
+                                                         timestamps=timestamps, duration=duration)), False
+        return (lambda session, source: ok({"logs": _runtime(session).logs(
+            session.registration, _current_release(session), tail, since=since, timestamps=timestamps)})), False
     if action in ("plan", "deploy"):
         payload = _deploy_request(request)
         if action == "plan":
@@ -147,6 +195,14 @@ def _prepare(request: dict):
         if isinstance(artifact, dict) and artifact.get("kind") == "native":
             return (lambda session, source: _submit_native(session, request, payload, source)), True
         return (lambda session, source: _submit(session, request, "deploy", payload)), False
+    if action == "backup":
+        _arguments(request, set())
+        if request["commit"] is not None:
+            raise ProtocolError("invalid request")
+        return (lambda session, source: _submit(session, request, "backup", {})), False
+    if action == "restore":
+        payload = _restore_request(request)
+        return (lambda session, source: _submit(session, request, "restore", payload)), False
     if action == "recover":
         arguments = _arguments(request, {"force_stop"})
         force_stop = arguments.get("force_stop", False)
@@ -166,6 +222,33 @@ def _prepare(request: dict):
     if request["commit"] is not None:
         raise ProtocolError("invalid request")
     return (lambda session, source: _submit(session, request, action, {})), False
+
+
+def _runtime(session: "AppSession"):
+    return session.services.runtime_factory(session.services, session.registration)
+
+
+def _current_release(session: "AppSession") -> dict | None:
+    return session.state.read_state()["current"]
+
+
+def _follow_logs(session: "AppSession", request_id: str, destination: BinaryIO, *, tail: int, since: str | None,
+                 timestamps: bool, duration: int) -> tuple[None, int]:
+    """Forward the current release's output as bounded frames, then say why the stream stopped."""
+    release = _current_release(session)
+    # The overall request deadline must outlive the bounded stream; the stream stops itself at ``duration``.
+    extend_deadline(duration + FOLLOW_DEADLINE_GRACE_SECONDS)
+
+    def emit(chunk: str) -> None:
+        write_frame(destination, {"status": "stream", "request_id": request_id, "chunk": chunk})
+        destination.flush()
+
+    stopped = _runtime(session).follow_logs(session.registration, release, tail=tail, since=since,
+                                            timestamps=timestamps, duration=duration, emit=emit)
+    write_frame(destination, {"status": "ok", "request_id": request_id,
+                              "result": {"stopped": stopped, "release": None if release is None else release_id(release)}})
+    destination.flush()
+    return None, 0
 
 
 def _submit_native(session: "AppSession", request: dict, payload: dict, source: BinaryIO) -> tuple[dict, int]:
@@ -201,7 +284,7 @@ def _job(session: AppSession, job_id: str | None) -> dict | None:
 
 
 def dispatch(request: dict, registration: dict, services_factory: Callable[[], HostServices],
-             source: BinaryIO | None = None) -> tuple[dict, int]:
+             source: BinaryIO | None = None, destination: BinaryIO | None = None) -> tuple[dict | None, int]:
     source = source if source is not None else io.BytesIO(b"")
     if request["action"] == "capabilities":
         if request["commit"] is not None or request["arguments"]:
@@ -210,7 +293,7 @@ def dispatch(request: dict, registration: dict, services_factory: Callable[[], H
             raise ProtocolError("unexpected trailing input")
         return {"status": "ok", "request_id": request["request_id"], "version": PROTOCOL_VERSION,
                 "helper_version": __version__, "actions": ACTIONS + FEATURES}, 0
-    work, expects_payload = _prepare(request)  # malformed requests are rejected before any host state is opened
+    work, expects_payload = _prepare(request, destination)  # malformed requests are rejected before host state is opened
     if not expects_payload and source.read(1):
         raise ProtocolError("unexpected trailing input")
     from .services import AppSession
@@ -244,7 +327,7 @@ def serve(source: BinaryIO, destination: BinaryIO, services_factory: Callable[[]
             response = {"status": "incompatible", "request_id": request_id, "supported_versions": [PROTOCOL_VERSION]}
             code = 4
         else:
-            response, code = dispatch(request, registration, services_factory, source)
+            response, code = dispatch(request, registration, services_factory, source, destination)
     except AuthorizationError:
         response, code = {"status": "error", "error": "access_denied"}, 3
     except (ProtocolError, ManifestError, OSError):
@@ -256,8 +339,9 @@ def serve(source: BinaryIO, destination: BinaryIO, services_factory: Callable[[]
     except Exception:  # noqa: BLE001 - anything unforeseen must not leak a traceback or host paths to the caller
         response, code = {"status": "error", "request_id": request_id, "error": "failed"}, 1
     try:
-        write_frame(destination, response)
-        destination.flush()
+        if response is not None:  # a streamed response was written frame by frame
+            write_frame(destination, response)
+            destination.flush()
     except (ProtocolError, OSError):
         return 1
     return code

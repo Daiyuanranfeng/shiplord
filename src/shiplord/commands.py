@@ -13,13 +13,16 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .environment import EnvironmentError_, parse_environment
+from . import build, registries
+from .environment import EnvironmentError_, parse_assignment, parse_environment, validate_key
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
-from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS
-from .runtime import RuntimeFailure
+from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS, RUNTIME_KNOBS_FEATURE
+from .probes import DEFAULT_READY_STATUS
+from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_LOG_LINES, RuntimeFailure, validate_follow_timeout,
+                      validate_since)
 from .servers import ServerError
 from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
@@ -27,7 +30,6 @@ from .protocol import IncompatibleProtocol, PROTOCOL_VERSION
 from .transport import TransportError, probe_capabilities
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-_IMAGE = re.compile(r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z")
 DEFAULT_KEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
 MINIMUM_INVENTORY_HELPER_VERSION = "0.2.0"
 FLEET_PROBE_TIMEOUT_SECONDS = 5.0
@@ -61,14 +63,20 @@ def read_public_key(path: Path | None, home: Path | None = None) -> tuple[str, s
 
 
 def image_repository_for(manifest: dict, override: str | None) -> str | None:
-    """The one image repository the server will accept, ``ghcr.io/<owner>/<repository>`` in lower case."""
+    """The one image repository the server will accept, in the registry policy's stored spelling."""
     if manifest["runtime"] != "docker":
         return None
     if override:
-        return override
+        try:
+            return registries.validate_repository(override)
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
+    if "image" in manifest:
+        return manifest["image"]["repository"]
     if "github" not in manifest:
-        raise CommandError("the image repository is unknown: add a [github] section to ship.toml or pass --image-repository")
-    return "ghcr.io/" + manifest["github"]["repository"].lower()
+        raise CommandError("the image repository is unknown: add [image] repository or a [github] section to "
+                           "ship.toml, or pass --image-repository")
+    return registries.github_repository(manifest["github"]["repository"])
 
 
 def commit_sequence(commit: str, override: int | None, directory: Path | None = None) -> int:
@@ -95,6 +103,8 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
     arguments = {"runtime": manifest["runtime"], "api_domain": manifest["http"]["api_domain"],
                  "image_repository": image_repository_for(manifest, image_repository), "public_key": text,
                  "key_label": label}
+    if manifest["http"].get("hostnames"):  # a helper older than additional hostnames refuses an unknown argument
+        arguments["hostnames"] = list(manifest["http"]["hostnames"])
     if max_memory_mb is not None:
         arguments["max_memory_mb"] = max_memory_mb  # the ceiling a deploy request may ask for (default 4096)
     if update:
@@ -104,7 +114,7 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
     if update:
         if not result.get("updated"):
             next_step = "The application already matches the manifest; nothing changed."
-        elif "api_domain" not in result.get("changes", {}):
+        elif not {"api_domain", "hostnames"} & set(result.get("changes", {})):
             next_step = "The memory ceiling is registered; it applies to the next deployment."
         elif result.get("route_changed"):
             next_step = "The hostname is registered and the public route was moved; point its DNS record at the server."
@@ -137,6 +147,27 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
     note = ("Takes effect when the application next starts; run `shiplord restart` to apply it to the running release."
             if operation in ("set", "clear") else None)
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
+
+
+def environment_edit_arguments(operation: str, *, assignment: str | None = None, key: str | None = None) -> dict:
+    """Validate a one-key edit locally, so a mistake never opens a connection or changes a file."""
+    try:
+        if operation == "set-key":
+            name, value = parse_assignment(assignment)
+            return {"operation": operation, "key": name, "value": value}
+        if operation == "unset":
+            return {"operation": operation, "key": validate_key(key)}
+    except EnvironmentError_ as error:
+        raise CommandError(str(error)) from None
+    raise CommandError("unknown environment operation")
+
+
+def edit_environment(manifest: dict, admin: AdminClient, operation: str, *, assignment: str | None = None,
+                     key: str | None = None) -> tuple[int, dict]:
+    """Change one runtime variable; its value travels only in the request frame and is never returned."""
+    arguments = environment_edit_arguments(operation, assignment=assignment, key=key)
+    result = admin.call("environment", manifest["name"], arguments)
+    return 0, {"ok": True, **result, "note": "Takes effect the next time a release starts."}
 
 
 def diff_environment(manifest: dict, admin: AdminClient, text: str) -> tuple[int, dict]:
@@ -174,18 +205,12 @@ def native_artifact(binary: Path) -> dict:
     return {"kind": "native", "sha256": digest.hexdigest(), "size": size, "architecture": architecture}
 
 
-_LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
-_LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
-
-
 def validate_registry_login(registry: str, username: str, token: str) -> None:
     """Reject bad input before any server alias is read or any connection is made."""
-    if registry != "ghcr.io":
-        raise CommandError("registry logins are supported for ghcr.io")
-    if not _LOGIN_USER.fullmatch(username):
-        raise CommandError("the username may contain letters, digits, dots, dashes, and underscores")
-    if not _LOGIN_TOKEN.fullmatch(token):
-        raise CommandError("the token must be 1-512 printable characters without spaces or line breaks")
+    try:
+        registries.validate_login(registry, username, token)
+    except registries.RegistryPolicyError as error:
+        raise CommandError(str(error)) from None
 
 
 def registry_login(manifest: dict, admin: AdminClient, *, registry: str, username: str, token: str) -> tuple[int, dict]:
@@ -199,7 +224,10 @@ def registry_login(manifest: dict, admin: AdminClient, *, registry: str, usernam
 def registry_other(manifest: dict, admin: AdminClient, operation: str, registry: str = "ghcr.io") -> tuple[int, dict]:
     arguments = {"operation": operation}
     if operation == "logout":
-        arguments["registry"] = registry
+        try:
+            arguments["registry"] = registries.validate_host(registry)
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
     return 0, {"ok": True, **admin.call("registry", manifest["name"], arguments)}
 
 
@@ -207,9 +235,10 @@ def _deploy_arguments(manifest: dict, artifact: str | dict, sequence: int, allow
     if isinstance(artifact, str):
         if manifest["runtime"] != "docker":
             raise CommandError("this manifest is for a native binary; use --binary", 2)
-        if not _IMAGE.fullmatch(artifact):
-            raise CommandError("--image must be an immutable reference: registry/name@sha256:<digest>")
-        artifact = {"kind": "docker", "image": artifact}
+        try:
+            artifact = {"kind": "docker", "image": registries.validate_pinned(artifact)}
+        except registries.RegistryPolicyError as error:
+            raise CommandError(str(error)) from None
     elif manifest["runtime"] != "native":
         raise CommandError("this manifest is for a Docker image; use --image", 2)
     arguments = {"sequence": sequence, "artifact": artifact, "configuration": manifest}
@@ -218,10 +247,10 @@ def _deploy_arguments(manifest: dict, artifact: str | dict, sequence: int, allow
     return arguments
 
 
-def check_public_https(domain: str, path: str, *, timeout: float = 60, interval: float = 5,
+def check_public_https(domain: str, path: str, *, ready_status: int = 200, timeout: float = 60, interval: float = 5,
                        sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
                        context: ssl.SSLContext | None = None, port: int = 443, host: str | None = None) -> dict:
-    """Does the public name answer 200 over verified TLS? Retries while DNS or certificates settle."""
+    """Does the public name answer the readiness status over verified TLS? Retries while DNS or certificates settle."""
     deadline, last = clock() + timeout, {"ok": False, "status": None, "error": "not_checked"}
     context = context or ssl.create_default_context()
     address = host or domain
@@ -239,7 +268,8 @@ def check_public_https(domain: str, path: str, *, timeout: float = 60, interval:
                 status = connection.getresponse().status
             finally:
                 connection.close()
-            last = {"ok": status == 200, "status": status, "error": None if status == 200 else "unexpected_status"}
+            last = {"ok": status == ready_status, "status": status,
+                    "error": None if status == ready_status else "unexpected_status"}
             if last["ok"]:
                 return last
         except ssl.SSLCertVerificationError:
@@ -268,6 +298,12 @@ def uses_shutdown_policy(manifest: dict) -> bool:
     return any(key in manifest["deploy"] for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
 
 
+def uses_runtime_knobs(manifest: dict) -> bool:
+    """A manifest asks for a knob an older helper would not apply (its validator would refuse it)."""
+    return ("cpu_limit" in manifest["resources"] or "init" in manifest["deploy"]
+            or any(key in manifest["deploy"] for key in ("readiness_status", "readiness_interval_seconds")))
+
+
 def require_feature_support(manifest: dict, client: HelperClient) -> None:
     """Refuse settings an older helper would ignore, before submitting a plan or a job."""
     required = {}
@@ -275,6 +311,8 @@ def require_feature_support(manifest: dict, client: HelperClient) -> None:
         required[STORAGE_FEATURE] = "[storage]"
     if uses_shutdown_policy(manifest):
         required[SHUTDOWN_FEATURE] = "shutdown_timeout_*"
+    if uses_runtime_knobs(manifest):
+        required[RUNTIME_KNOBS_FEATURE] = "cpu_limit, init or the readiness settings"
     if manifest["template"] == "generic":
         required[GENERIC_DOCKER_FEATURE] = "template = generic"
     if not required:
@@ -321,11 +359,35 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     if code == 0:
         result["url"] = "https://" + manifest["http"]["api_domain"]
     if code == 0 and outcome["status"] in ("succeeded", "unchanged", "already_applied") and verify_public:
-        result["public"] = public_check(manifest["http"]["api_domain"], manifest["http"]["readiness_path"])
+        result["public"] = public_check(manifest["http"]["api_domain"], manifest["http"]["readiness_path"],
+                                        ready_status=manifest["deploy"].get("readiness_status", DEFAULT_READY_STATUS))
         if require_public and not result["public"]["ok"]:
             result["ok"], code = False, 1
             result["error"] = "the deployment is live on the server, but the public HTTPS check failed"
     return code, result
+
+
+def release_application(manifest: dict, client: HelperClient, *, commit: str, image_repository: str | None = None,
+                        tag: str | None = None, platform: str | None = None, builder: build.Builder | None = None,
+                        **deploy_options) -> tuple[int, dict]:
+    """Build and push this checkout's image, then deploy the pushed digest through the normal deploy path."""
+    repository = image_repository_for(manifest, image_repository)
+    if repository is None:
+        raise CommandError("`shiplord release` builds a Docker image; use `shiplord deploy --binary` for a native "
+                           "application", 2)
+    tag = tag or commit
+    # Apply deploy's own rules to the repository and commit before anything is built or pushed.
+    validate_deploy_inputs(manifest, f"{repository}@sha256:{'0' * 64}", commit)
+    builder = builder or build.Builder()
+    try:
+        prepared = builder.plan(repository=repository, tag=tag, platform=platform or build.DEFAULT_PLATFORM,
+                                commit=commit)
+        builder.require_clean_tree()
+        artifact = builder.build_and_push(prepared)
+    except build.BuildError as error:
+        raise CommandError(str(error), error.code) from None
+    code, result = deploy_application(manifest, client, image=artifact["image"], commit=commit, **deploy_options)
+    return code, {**result, "build": artifact}
 
 
 def plan_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
@@ -354,10 +416,32 @@ def application_status(client: HelperClient, job_id: str | None = None) -> tuple
     return 0, {"ok": True, **response["result"]}
 
 
-def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
-    if not 1 <= tail <= 1000:
-        raise CommandError("--tail must be between 1 and 1000")
-    return 0, {"ok": True, "logs": client.call("logs", arguments={"tail": tail})["result"]["logs"]}
+def application_logs(client: HelperClient, tail: int, *, since: str | None = None, timestamps: bool = False,
+                     follow: bool = False, timeout: int = DEFAULT_FOLLOW_SECONDS,
+                     on_chunk: Callable[[str], None] | None = None) -> tuple[int, dict]:
+    """Read the current release's logs, or stream them for a bounded time when ``follow`` is set."""
+    if not 1 <= tail <= MAX_LOG_LINES:
+        raise CommandError(f"--tail must be between 1 and {MAX_LOG_LINES}")
+    arguments: dict = {"tail": tail}
+    if since is not None:
+        try:
+            arguments["since"] = validate_since(since)
+        except ValueError as error:
+            raise CommandError(str(error)) from None
+    if timestamps:
+        arguments["timestamps"] = True
+    if not follow:
+        return 0, {"ok": True, "logs": client.call("logs", arguments=arguments)["result"]["logs"]}
+    try:
+        duration = validate_follow_timeout(timeout)
+    except ValueError as error:
+        raise CommandError(str(error)) from None
+    if on_chunk is None:
+        raise CommandError("following logs needs an output stream")
+    arguments.update({"follow": True, "timeout": duration})
+    result = client.follow("logs", arguments=arguments, timeout=duration, on_chunk=on_chunk)
+    return 0, {"ok": True, "logs": "", "stopped": result.get("stopped", "ended"),
+               "release": result.get("release")}
 
 
 def run_job_command(manifest: dict | None, client: HelperClient, action: str, *, request_id: str | None = None,
@@ -383,6 +467,50 @@ def run_job_command(manifest: dict | None, client: HelperClient, action: str, *,
                               lookup_command=status_lookup_command(manifest, request_id) if manifest else None)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
+
+
+def require_helper_action(client: HelperClient, action: str) -> None:
+    """Refuse an action an older helper would ignore, before submitting a job."""
+    if action not in client.call("capabilities")["actions"]:
+        raise CommandError(f"the server helper does not support {action}; re-run `shiplord server bootstrap` to "
+                           "upgrade it, then retry", 4)
+
+
+def backup_application(manifest: dict, client: HelperClient, *, request_id: str | None = None,
+                       on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Ask the server to archive and verify this application's data; nothing local is uploaded."""
+    require_helper_action(client, "backup")
+    request_id = request_id or new_request_id("backup")
+    outcome = submit_and_wait(client, "backup", request_id=request_id, timeout=job_timeout(manifest),
+                              on_progress=on_progress)
+    return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id,
+                                  "status": outcome["status"], "exit_code": outcome["exit_code"], **outcome["detail"]}
+
+
+def restore_arguments(archive: str | None, latest: bool) -> dict:
+    """Exactly one source, validated before any connection is made."""
+    if archive is None and not latest:
+        raise CommandError("specify --archive or --latest")
+    if archive is not None and latest:
+        raise CommandError("specify only one of --archive and --latest")
+    if archive is None:
+        return {"latest": True}
+    from .backup import validate_archive_name  # lazy: the CLI should not import the server's archive machinery
+    try:
+        return {"archive": validate_archive_name(archive)}
+    except ValueError as error:
+        raise CommandError(str(error)) from None
+
+
+def restore_application(manifest: dict, client: HelperClient, arguments: dict, *, request_id: str | None = None,
+                        on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Replace this application's data with a verified backup, chosen on the server."""
+    require_helper_action(client, "restore")
+    request_id = request_id or new_request_id("restore")
+    outcome = submit_and_wait(client, "restore", request_id=request_id, arguments=arguments,
+                              timeout=job_timeout(manifest), on_progress=on_progress)
+    return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id,
+                                  "status": outcome["status"], "exit_code": outcome["exit_code"], **outcome["detail"]}
 
 
 def application_doctor(manifest: dict, client: HelperClient, *, which=None, resolve=None) -> tuple[int, dict]:
@@ -416,7 +544,8 @@ def application_doctor(manifest: dict, client: HelperClient, *, which=None, reso
 
 
 def server_doctor(admin: AdminClient) -> tuple[int, dict]:
-    """Deep server health: helper, Caddy wiring, sshd confinement, Docker, disk, and each application's state."""
+    """Deep server health: helper, Caddy wiring, sshd confinement, ports, Docker, disk, and each application's
+    state and consistency."""
     result = admin.call("doctor", None, {})
     return (0 if result["ok"] else 3), {"ok": result["ok"], "scope": "server health (read-only)", "checks": result["checks"]}
 

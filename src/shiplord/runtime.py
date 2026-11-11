@@ -10,11 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import platform
+import re
 import shutil
+import stat
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .environment import EnvironmentError_, load_environment_file
 from .layout import Layout
@@ -27,6 +30,8 @@ PULL_TIMEOUT_SECONDS = 900
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_LOG_BYTES = 262144
 MAX_LOG_LINES = 1000
+DEFAULT_FOLLOW_SECONDS = 300
+MAX_FOLLOW_SECONDS = 3600
 MIN_FREE_BYTES = 1024 * 1024 * 1024  # refuse to pull when less than this is free: a full disk fails a deploy halfway
 DOCKER_ROOT = Path("/var/lib/docker")
 REVISION_LABEL = "org.opencontainers.image.revision"
@@ -38,6 +43,8 @@ LOG_DRIVER = "json-file"
 LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}
 SECURITY_OPTIONS = ("no-new-privileges",)
 CAP_DROP = ("ALL",)
+
+_SINCE = re.compile(r"[0-9]{1,5}[smh]\Z")
 _MACHINE_PLATFORMS = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
 
 
@@ -92,6 +99,11 @@ def stop_signal(configured: str) -> str:
 def _digest(image: str) -> str:
     """The immutable part of an image reference; a registry alias or mirror must not change which image is meant."""
     return image.rpartition("@")[2]
+
+
+def cpu_limit_arg(cpus: float) -> str:
+    """Docker's ``--cpus`` takes a decimal CPU count; a whole number is written without a trailing ``.0``."""
+    return str(int(cpus)) if float(cpus).is_integer() else repr(float(cpus))
 
 
 def _registry(image: str) -> str:
@@ -151,8 +163,26 @@ class Runtime(Protocol):
     def start(self, registration: dict, release: dict) -> None: ...
     def stop(self, registration: dict) -> None: ...
     def is_running(self, registration: dict, release: dict) -> bool: ...
-    def logs(self, registration: dict, tail: int) -> str: ...
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str: ...
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str: ...
     def discard(self, registration: dict, release: dict) -> list[str]: ...
+    def data_root(self, registration: dict) -> Path: ...
+
+
+def validate_since(value: str) -> str:
+    """Only relative durations both Docker and journalctl read the same way are accepted."""
+    if not isinstance(value, str) or not _SINCE.fullmatch(value):
+        raise ValueError("--since must be a duration such as 30s, 15m or 2h")
+    return value
+
+
+def validate_follow_timeout(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= MAX_FOLLOW_SECONDS:
+        raise ValueError(f"--timeout must be between 1 and {MAX_FOLLOW_SECONDS} seconds")
+    return value
 
 
 class DockerRuntime:
@@ -319,6 +349,35 @@ class DockerRuntime:
         if retained is None:
             raise RuntimeFailure("the unlabelled application volume has no retained Shiplord container evidence", "storage")
         return {"volume_name": name, "fingerprint": fingerprint, "container_id": retained}
+
+    def data_root(self, registration: dict) -> Path:
+        """The host directory that holds this application's persistent data, for a backup or a restore.
+
+        Only a volume Shiplord manages is ever read, and only through the mountpoint the daemon reports. The
+        caller needs local access to that directory: it is ``root``-owned, so a helper running as root has it.
+        """
+        self.check_volume(registration, create=False)  # refuse an absent or foreign volume before reading anything
+        inspect = self._docker(["volume", "inspect", "--format", "{{.Mountpoint}}", self.volume_name(registration)],
+                               "storage")
+        if inspect.code != 0:
+            if "no such volume" in inspect.output.lower():
+                raise RuntimeFailure("this application has no data volume to back up; nothing was changed", "storage",
+                                     kind="no_data")
+            raise RuntimeFailure("the application volume could not be inspected", "storage", inspect.output)
+        mountpoint = inspect.output.strip()
+        if not mountpoint.startswith("/") or mountpoint.rstrip("/") == "":
+            raise RuntimeFailure("the application volume reports no usable mountpoint; nothing was changed", "storage",
+                                 kind="no_data")
+        path = Path(mountpoint)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise RuntimeFailure("the application volume is not reachable from this host; nothing was changed",
+                                 "storage", kind="no_data") from None
+        if not stat.S_ISDIR(info.st_mode):  # lstat: a link is not a directory, so it is refused too
+            raise RuntimeFailure("the application volume mountpoint is not a directory; nothing was changed", "storage",
+                                 kind="no_data")
+        return path
 
     def _legacy_volume_container(self, registration: dict, volume_name: str) -> str | None:
         """Return a retained Shiplord container ID only when its labels and exact volume mount agree."""
@@ -608,6 +667,10 @@ class DockerRuntime:
         argv += ["--stop-timeout", str(timeout),
                  "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
                  "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
+        if "cpu_limit" in config["resources"]:
+            argv += ["--cpus", cpu_limit_arg(config["resources"]["cpu_limit"])]
+        if config["deploy"].get("init"):  # a manifest that does not ask for it keeps the old container behavior
+            argv.append("--init")
         if custom is not None:
             argv += ["--env-file", str(self.layout.environments / registration["application_id"] / "app.env")]
         for key, value in _managed_environment(registration, config).items():  # after --env-file, so they win
@@ -708,15 +771,56 @@ class DockerRuntime:
                     {"HostIp": "127.0.0.1", "HostPort": str(registration["host_port"])}]}
                 and _environment_matches(actual_environment, expected_environment))
 
-    def logs(self, registration: dict, tail: int) -> str:
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str:
+        """The current release's container only: a stopped container of an older release is never read."""
         tail = max(1, min(int(tail), MAX_LOG_LINES))
-        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter", f"label=shiplord.app={registration['application_id']}"],
-                               "logs")
+        identifier = self._current_container(registration, release)
+        if identifier is None:
+            return ""
+        argv = ["logs", "--tail", str(tail)]
+        if since is not None:
+            argv += ["--since", since]
+        if timestamps:
+            argv += ["--timestamps"]
+        argv.append(identifier)
+        result = self._docker(argv, "logs", max_output=MAX_LOG_BYTES)
+        return result.output
+
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str:
+        """Stream the current release's container until ``duration`` expires; returns the stop reason."""
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        identifier = self._current_container(registration, release)
+        if identifier is None:
+            return "unavailable"
+        argv = ["logs", "--follow", "--tail", str(tail)]
+        if since is not None:
+            argv += ["--since", since]
+        if timestamps:
+            argv += ["--timestamps"]
+        argv.append(identifier)
+        try:
+            return self.system.stream([DOCKER, *argv], timeout=duration, on_chunk=emit)
+        except CommandError as error:
+            raise RuntimeFailure(f"docker could not complete ({error.kind})", "logs") from None
+
+    def _current_container(self, registration: dict, release: dict | None, phase: str = "logs") -> str | None:
+        """Select exactly the current release's container by label; None means there is nothing to read."""
+        if release is None:
+            return None
+        listing = self._docker(["ps", "-aq", "--no-trunc",
+                                "--filter", f"label=shiplord.app={registration['application_id']}",
+                                "--filter", f"label=shiplord.release={release_id(release)}"], phase)
         identifiers = listing.output.split()
         if listing.code != 0 or not identifiers:
-            return ""
-        result = self._docker(["logs", "--tail", str(tail), identifiers[0]], "logs", max_output=MAX_LOG_BYTES)
-        return result.output
+            return None
+        if any(len(identifier) != 64 or any(char not in "0123456789abcdef" for char in identifier)
+               for identifier in identifiers):
+            return None
+        return identifiers[0]
+
 
     def release_logs(self, registration: dict, release: dict, tail: int, *, max_bytes: int = MAX_LOG_BYTES) -> str | None:
         """Read this release's own container's last ``tail`` lines; ``None`` means it has no container.

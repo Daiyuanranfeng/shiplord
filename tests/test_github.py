@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -15,15 +16,15 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from shiplord import github  # noqa: E402
+from shiplord import github, tailscale  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, ci_key_labels, fetch_host_keys,  # noqa: E402
                              generate_ci_key, github_setup, github_status, known_hosts_lines, label_for, parse_host_key,
-                             resolve_ssh_host, rotate_key)
+                             resolve_ssh_host, rotate_key, upgrade_workflow)
 from shiplord.keys import parse_public_key  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
-from shiplord.workflow import DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH, render_deploy_workflow, render_workflow  # noqa: E402
+from shiplord.workflow import DEPLOY_WORKFLOW_PATH, PINS, WORKFLOW_PATH, render_deploy_workflow, render_workflow  # noqa: E402
 
 REF = "cd" * 20
 HOST = "server.example.com"
@@ -36,13 +37,13 @@ def host_key(seed=1, key_type="ssh-ed25519"):
     return key_type, base64.b64encode(field(key_type.encode()) + field(bytes([seed]) * 32)).decode()
 
 
-def manifest(runtime="docker", with_github=False, server="production", template="google-adk"):
+def manifest(runtime="docker", with_github=False, server="production", template="google-adk", branch="main"):
     value = {"schema_version": 1, "name": "orders", "server": server, "template": template, "runtime": runtime,
              "http": {"api_domain": "orders.example.com", "frontend_origins": [], "container_port": 8080,
                       "readiness_path": "/ready"}, "resources": {"memory_mb": 512},
              "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}
     if with_github:
-        value["github"] = {"repository": "Example/orders", "deployment_branch": "main"}
+        value["github"] = {"repository": "Example/orders", "deployment_branch": branch}
     return validate_manifest(value)
 
 
@@ -187,6 +188,64 @@ class GitHubTestCase(unittest.TestCase):
 
     def state(self, server="production"):
         return json.loads((self.state_directory(server) / "state.json").read_text())
+
+
+class TailscaleCredentialTests(unittest.TestCase):
+    """The automatable half of issue #48: create the trust credential when a token is present."""
+
+    TOKEN = "tskey-api-throwaway-fixture-value"
+
+    def setUp(self):
+        self.gh = GitHub(FakeGh())
+
+    def create(self, *, environ, oidc=None):
+        if oidc is not None:
+            self.gh.runner.oidc = oidc
+        self.requests = []
+
+        def transport(url, headers, body):
+            self.requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        return github.tailscale_credential(self.gh, "Example/orders", manifest(), environ=environ,
+                                           transport=transport)
+
+    def test_without_a_token_the_printed_instructions_are_the_fallback(self):
+        self.assertIsNone(self.create(environ={}))
+        self.assertIsNone(self.create(environ={tailscale.API_TOKEN_ENV: "  "}))
+
+    def test_a_token_creates_the_owner_wide_credential_so_later_repositories_reuse_it(self):
+        settings, warnings = self.create(environ={tailscale.API_TOKEN_ENV: self.TOKEN},
+                                         oidc={"use_default": True, "sub_claim_prefix": "repo:Example@11/orders@22"})
+        self.assertEqual(settings, {"SHIPLORD_TS_CLIENT_ID": "id123456",
+                                    "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        self.assertEqual(warnings, [])
+        (url, headers, body), = self.requests
+        payload = json.loads(body)
+        self.assertEqual(payload["subject"], "repo:Example@11/*:ref:refs/heads/main")
+        self.assertEqual((payload["issuer"], payload["scopes"], payload["tags"]),
+                         (tailscale.GITHUB_ISSUER, ["auth_keys"], ["tag:ci"]))
+        self.assertEqual(payload["description"], "shiplord: Example/orders")
+        self.assertNotIn(self.TOKEN, json.dumps(settings) + json.dumps(warnings) + json.dumps(payload))
+
+    def test_extra_tags_are_created_with_the_credential(self):
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        github.tailscale_credential(self.gh, "Example/orders", manifest(), tags=["tag:ci", "tag:deploy"],
+                                    environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=transport)
+        self.assertEqual(json.loads(requests[0][2])["tags"], ["tag:ci", "tag:deploy"])
+
+    def test_a_refusal_does_not_echo_the_token(self):
+        def refusing(url, headers, body):
+            return 401, json.dumps({"message": f"bad token {self.TOKEN}"}).encode()
+        with self.assertRaises(tailscale.TailscaleError) as caught:
+            github.tailscale_credential(self.gh, "Example/orders", manifest(),
+                                        environ={tailscale.API_TOKEN_ENV: self.TOKEN}, transport=refusing)
+        self.assertNotIn(self.TOKEN, str(caught.exception))
 
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
@@ -342,6 +401,60 @@ class SetupTests(GitHubTestCase):
         with self.assertRaisesRegex(GitHubError, "owner/repository"):
             self.setup_call(repository="not a repo")
 
+    def test_a_workflow_generated_for_trunk_triggers_and_uses_the_subject_on_trunk(self):
+        result = self.setup_call(deployment_branch="trunk")
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["trunk"]', text)
+        self.assertNotIn("refs/heads/main", text)
+        guidance = result["tailscale_setup"]
+        self.assertEqual(guidance["subject_repository"], "repo:Example/orders:ref:refs/heads/trunk")
+        self.assertEqual(guidance["subject_all_repositories"], "repo:Example/*:ref:refs/heads/trunk")
+        self.assertIn("refs/heads/trunk", " ".join(guidance["steps"]))
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        self.assertEqual(result["steps"]["manifest"], "ship.toml names Example/orders on trunk")
+        expected = render_workflow(manifest() | {"github": {"repository": "Example/orders", "deployment_branch": "trunk"}},
+                                   tooling_ref=REF)
+        self.assertEqual(text, expected)
+
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.setup_call()
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn('branches: ["main"]', text)
+        self.assertEqual(result["tailscale_setup"]["subject_repository"], "repo:Example/orders:ref:refs/heads/main")
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_a_changed_branch_is_recorded_without_touching_the_rest_of_ship_toml(self):
+        self.setup_call()
+        text = (self.project / "ship.toml").read_text()
+        text = text.replace('deployment_branch = "main"', 'deployment_branch = "main"  # current release branch')
+        (self.project / "ship.toml").write_text(text)
+        self.setup_call(deployment_branch="trunk")
+        updated = (self.project / "ship.toml").read_text()
+        self.assertEqual(updated.count("[github]"), 1)
+        self.assertIn('deployment_branch = "trunk"  # current release branch', updated)
+        self.assertEqual(updated.replace('deployment_branch = "trunk"', 'deployment_branch = "main"'), text)
+        self.assertIn('branches: ["trunk"]', (self.project / WORKFLOW_PATH).read_text())
+
+    def test_a_github_section_without_a_branch_gets_the_default_and_a_chosen_one(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call(deployment_branch="trunk")
+        self.assertIn('deployment_branch = "trunk"', (self.project / "ship.toml").read_text())
+        (self.project / "ship.toml").write_text(MANIFEST_TOML + '\n[github]\nrepository = "Example/orders"\n')
+        self.setup_call()
+        self.assertIn('deployment_branch = "main"', (self.project / "ship.toml").read_text())
+
+    def test_an_invalid_deployment_branch_is_refused_before_anything_changes(self):
+        before = (self.project / "ship.toml").read_bytes()
+        for branch in ("main..other", ".hidden", "-main", "release/", "main.lock", "main branch"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(GitHubError) as caught:
+                    self.setup_call(deployment_branch=branch)
+                self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+
     def test_a_failure_registering_leaves_the_key_for_resumption_and_never_stores_the_secret(self):
         self.server.fail_add = True
         with self.assertRaises(GitHubError) as caught:
@@ -442,12 +555,78 @@ class SetupTests(GitHubTestCase):
         with patch("shiplord.github.detect_tooling_ref", return_value="ef" * 20):
             self.assertIn("efefefefefef", self.setup_call(tooling_ref=None)["steps"]["workflow"])
 
-    def test_native_applications_get_credentials_but_no_generated_workflow(self):
+    def test_native_applications_get_credentials_and_a_workflow_that_builds_and_deploys(self):
         (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
-        result = self.setup_call(manifest=manifest("native"))
-        self.assertIn("skipped", result["steps"]["workflow"])
-        self.assertFalse((self.project / WORKFLOW_PATH).exists())
+        command, path = "go build -trimpath -o dist/orders ./cmd/orders", "dist/orders"
+        result = self.setup_call(manifest=manifest("native"), build_command=command, binary_path=path)
+        self.assertIn(f"written ({WORKFLOW_PATH}", result["steps"]["workflow"])
+        text = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn(command, text)
+        self.assertIn("Upload the binary", text)
+        self.assertIn("actions/upload-artifact@", text)
+        self.assertIn("actions/download-artifact@", text)
+        self.assertIn('shiplord deploy --binary "$BINARY"', text)
+        expected = render_workflow(manifest("native") | {"github": {"repository": "Example/orders",
+                                   "deployment_branch": "main", "build_command": command, "binary_path": path}},
+                                   tooling_ref=REF)
+        self.assertEqual(text, expected)
+        manifest_text = (self.project / "ship.toml").read_text()
+        self.assertIn(f'build_command = "{command}"', manifest_text)
+        self.assertIn(f'binary_path = "{path}"', manifest_text)
         self.assertIn(SECRET_NAME, self.gh_runner.secrets)
+
+    def test_native_setup_reuses_the_build_settings_recorded_in_the_manifest(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        self.setup_call(manifest=manifest("native"), build_command="make", binary_path="build/orders")
+        stored = manifest("native") | {"github": {"repository": "Example/orders", "deployment_branch": "main",
+                                                  "build_command": "make", "binary_path": "build/orders"}}
+        second = self.setup_call(manifest=stored)
+        self.assertIn("unchanged", second["steps"]["workflow"])
+        self.assertIn('build_command = "make"', (self.project / "ship.toml").read_text())
+
+    def test_native_setup_without_build_settings_is_refused_before_any_change(self):
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        before = (self.project / "ship.toml").read_bytes()
+        with patch.object(github, "generate_ci_key", side_effect=AssertionError("must not create a key")):
+            with self.assertRaisesRegex(GitHubError, "--build-command") as caught:
+                self.setup_call(manifest=manifest("native"))
+        self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertFalse((self.project / WORKFLOW_PATH).exists())
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+
+    def test_native_setup_refuses_an_existing_github_section_without_build_settings(self):
+        native = MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"')
+        (self.project / "ship.toml").write_text(native + '\n[github]\nrepository = "Example/orders"\ndeployment_branch = "main"\n')
+        with self.assertRaisesRegex(GitHubError, "add both"):
+            self.setup_call(manifest=manifest("native", with_github=True), build_command="make", binary_path="build/orders")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_native_build_flags_are_refused_for_a_docker_application(self):
+        with self.assertRaisesRegex(GitHubError, "only to native"):
+            self.setup_call(build_command="make")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_a_build_setting_that_differs_from_the_manifest_is_refused(self):
+        stored = manifest("native") | {"github": {"repository": "Example/orders", "deployment_branch": "main",
+                                                  "build_command": "make", "binary_path": "build/orders"}}
+        with self.assertRaisesRegex(GitHubError, "already names github.build_command"):
+            self.setup_call(manifest=stored, build_command="make release")
+        self.assertEqual(self.gh_runner.calls, [])
+
+    def test_unsafe_native_build_settings_are_refused_before_any_change(self):
+        for build_command, binary_path in (("make\nrm -rf /", "build/orders"), ("make", "../orders"),
+                                           ("make", "/usr/local/bin/orders"), ("make", "build//orders")):
+            with self.subTest(build_command=build_command, binary_path=binary_path):
+                with self.assertRaises(GitHubError) as caught:
+                    self.setup_call(manifest=manifest("native"), build_command=build_command, binary_path=binary_path)
+                self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        with self.assertRaisesRegex(GitHubError, "one binary"):
+            self.setup_call(manifest=manifest("native"), build_command="make", binary_path="build/orders",
+                            platforms="linux/amd64,linux/arm64")
+        self.assertEqual(self.gh_runner.calls, [])
 
     def test_tailscale_settings_a_custom_ci_host_and_a_nondefault_port_are_carried_through(self):
         result = self.setup_call(ci_host="tail.example.ts.net", resolve=lambda host: (host, 2222),
@@ -463,7 +642,9 @@ class SetupTests(GitHubTestCase):
         given = " ".join(self.setup_call(tailscale={"SHIPLORD_TS_CLIENT_ID": "id", "SHIPLORD_TS_AUDIENCE": "aud"})["remaining"])
         self.assertNotIn("--tailscale-client-id", given)
         self.assertIn("tag:ci", given)
-        native = " ".join(self.setup_call(manifest=manifest("native"))["remaining"])
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        native = " ".join(self.setup_call(
+            manifest=manifest("native"), build_command="make", binary_path="build/orders")["remaining"])
         self.assertNotIn("registry login", native)
 
     def test_without_tailscale_settings_the_result_carries_the_exact_subject_for_immutable_subjects(self):
@@ -492,6 +673,7 @@ class SetupTests(GitHubTestCase):
     def test_the_remaining_manual_steps_are_stated_and_no_run_is_claimed(self):
         text = " ".join(self.setup_call()["remaining"])
         self.assertIn("Tailscale", text)
+        self.assertIn("TAILSCALE_API_KEY", text)
         self.assertIn("No GitHub Actions run has been performed", text)
 
 
@@ -638,6 +820,44 @@ class StatusTests(GitHubTestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+@unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
+class SetupCompleteTests(GitHubTestCase):
+    """The local evidence `shiplord setup` uses to skip a finished github setup; it never queries GitHub."""
+
+    def complete(self, repository="Example/orders", project=None):
+        return github.setup_complete(manifest(with_github=True), project=project or self.project,
+                                     repository=repository, home=self.home)
+
+    def test_it_needs_the_manifest_workflow_and_a_stored_secret(self):
+        self.assertFalse(self.complete())  # nothing has run yet
+        self.setup_call()
+        self.assertTrue(self.complete())
+
+    def test_a_missing_workflow_or_a_different_repository_is_not_complete(self):
+        self.setup_call()
+        self.assertFalse(self.complete(repository="Other/repo"))
+        self.assertFalse(self.complete(project=self.project / "elsewhere"))
+        (self.project / WORKFLOW_PATH).unlink()
+        self.assertFalse(self.complete())
+
+    def test_a_secret_that_was_never_stored_is_not_complete(self):
+        self.setup_call()
+        state_path = github.ci_directory("orders", "production", self.home) / "state.json"
+        state = json.loads(state_path.read_text())
+        state["secret_set"] = False
+        state_path.write_text(json.dumps(state))
+        self.assertFalse(self.complete())
+
+    def test_a_native_application_is_complete_only_with_its_generated_workflow(self):
+        native = manifest(runtime="native", with_github=True)
+        native["github"] = {**native["github"], "build_command": "make", "binary_path": "build/orders"}
+        (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))
+        self.setup_call(manifest=native, build_command="make", binary_path="build/orders")
+        self.assertTrue(github.setup_complete(native, project=self.project, repository="Example/orders", home=self.home))
+        (self.project / WORKFLOW_PATH).unlink()
+        self.assertFalse(github.setup_complete(native, project=self.project, repository="Example/orders", home=self.home))
+
+
 class HostKeyTests(unittest.TestCase):
     def test_host_keys_are_validated_and_formatted_for_known_hosts(self):
         key_type, blob = host_key(3)
@@ -709,6 +929,114 @@ class KeyGenerationTests(unittest.TestCase):
         self.assertEqual([stdin for _, stdin in calls], [b"super-secret-value", b"multi\nline"])
 
 
+STALE = "9" * 40
+
+
+class UpgradeWorkflowTests(GitHubTestCase):
+    """`github setup --upgrade-workflow`: only the pins change, and only in a file Shiplord wrote."""
+
+    def pipeline(self, *, branch="main", quality=None, stale=("checkout",)):
+        value = manifest(with_github=True) | {"github": {"repository": "Example/orders", "deployment_branch": branch}}
+        texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(value, tooling_ref=REF),
+                 WORKFLOW_PATH: render_workflow(value, tooling_ref=REF, quality_workflow=quality)}
+        for name in stale:
+            texts[DEPLOY_WORKFLOW_PATH] = texts[DEPLOY_WORKFLOW_PATH].replace(PINS[name].commit, STALE)
+        for path, text in texts.items():
+            target = self.project / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        return texts
+
+    def upgrade(self, **overrides):
+        value = overrides.pop("manifest", manifest(with_github=True))
+        return upgrade_workflow(value, project=self.project, home=self.home, **overrides)
+
+    def read(self, path):
+        return (self.project / path).read_text()
+
+    def test_a_stale_pin_is_refreshed_and_every_other_line_is_preserved(self):
+        texts = self.pipeline()
+        (self.project / DEPLOY_WORKFLOW_PATH).write_text(texts[DEPLOY_WORKFLOW_PATH] + "# a local note\n")
+        result = self.upgrade()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["changed"], [DEPLOY_WORKFLOW_PATH])
+        self.assertEqual(result["unchanged"], [WORKFLOW_PATH])
+        self.assertEqual(result["pins"], [{"path": DEPLOY_WORKFLOW_PATH, "action": "actions/checkout",
+                                           "from": STALE, "to": PINS["checkout"].commit, "version": "v4"}])
+        self.assertEqual(self.read(DEPLOY_WORKFLOW_PATH),
+                         texts[DEPLOY_WORKFLOW_PATH].replace(STALE, PINS["checkout"].commit) + "# a local note\n")
+        self.assertEqual(self.read(WORKFLOW_PATH), texts[WORKFLOW_PATH])
+
+    def test_a_hand_written_workflow_is_refused_before_anything_is_written(self):
+        texts = self.pipeline()
+        hand_written = ("name: Mine\non: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                        f"      - uses: actions/checkout@{STALE}\n")
+        (self.project / WORKFLOW_PATH).write_text(hand_written)  # the stale deploy workflow is accepted first
+        with self.assertRaises(GitHubError) as caught:
+            self.upgrade()
+        self.assertEqual((caught.exception.code, caught.exception.step), (2, "workflow"))
+        self.assertIn(WORKFLOW_PATH, str(caught.exception))
+        self.assertEqual(self.read(WORKFLOW_PATH), hand_written)
+        self.assertEqual(self.read(DEPLOY_WORKFLOW_PATH), texts[DEPLOY_WORKFLOW_PATH])  # not written either
+
+    def test_the_deployment_branch_and_the_quality_job_survive(self):
+        texts = self.pipeline(branch="release/prod", quality=QUALITY_WORKFLOW)
+        self.assertEqual(self.upgrade()["changed"], [DEPLOY_WORKFLOW_PATH])
+        self.assertEqual(self.read(WORKFLOW_PATH), texts[WORKFLOW_PATH])
+        self.assertIn('branches: ["release/prod"]', self.read(WORKFLOW_PATH))
+        self.assertIn(f"uses: ./{QUALITY_WORKFLOW}", self.read(WORKFLOW_PATH))
+        self.assertIn("refs/heads/release/prod", self.read(DEPLOY_WORKFLOW_PATH))
+        self.assertNotIn(STALE, self.read(DEPLOY_WORKFLOW_PATH))
+
+    def test_a_missing_pipeline_file_is_refused(self):
+        self.pipeline()
+        (self.project / DEPLOY_WORKFLOW_PATH).unlink()
+        with self.assertRaisesRegex(GitHubError, "github setup"):
+            self.upgrade()
+        self.assertFalse((self.project / DEPLOY_WORKFLOW_PATH).exists())
+
+    def test_a_second_upgrade_has_nothing_left_to_do(self):
+        self.pipeline()
+        self.upgrade()
+        result = self.upgrade()
+        self.assertEqual((result["changed"], result["pins"]), ([], []))
+        self.assertIn("already pin", result["note"])
+
+    def test_a_native_application_refreshes_its_one_generated_file(self):
+        native = manifest("native", with_github=True)
+        native["github"] = {**native["github"], "build_command": "make", "binary_path": "build/orders"}
+        text = render_workflow(native, tooling_ref=REF).replace(PINS["checkout"].commit, STALE)
+        (self.project / WORKFLOW_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (self.project / WORKFLOW_PATH).write_text(text)
+        result = self.upgrade(manifest=native)
+        self.assertEqual(result["changed"], [WORKFLOW_PATH])
+        self.assertNotIn(STALE, self.read(WORKFLOW_PATH))
+        self.assertFalse((self.project / DEPLOY_WORKFLOW_PATH).exists())
+
+    def record(self, digests):
+        directory = self.state_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "state.json").write_text(json.dumps({"workflows": digests}))
+
+    def test_the_recorded_digest_follows_a_file_shiplord_wrote(self):
+        texts = self.pipeline()
+        self.record({path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()})
+        self.upgrade()
+        recorded = self.state()["workflows"]
+        for path in (DEPLOY_WORKFLOW_PATH, WORKFLOW_PATH):
+            with self.subTest(path=path):
+                self.assertEqual(recorded[path], hashlib.sha256((self.project / path).read_bytes()).hexdigest())
+
+    def test_an_edited_file_is_not_recorded_as_shiplords_so_setup_still_refuses_it(self):
+        texts = self.pipeline()
+        clean = hashlib.sha256(texts[DEPLOY_WORKFLOW_PATH].encode()).hexdigest()
+        self.record({DEPLOY_WORKFLOW_PATH: clean, WORKFLOW_PATH: hashlib.sha256(texts[WORKFLOW_PATH].encode()).hexdigest()})
+        (self.project / DEPLOY_WORKFLOW_PATH).write_text(texts[DEPLOY_WORKFLOW_PATH] + "# a local note\n")
+        self.upgrade()
+        self.assertIn("# a local note", self.read(DEPLOY_WORKFLOW_PATH))
+        self.assertEqual(self.state()["workflows"][DEPLOY_WORKFLOW_PATH], clean)  # still "the user edited it"
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -738,11 +1066,12 @@ class CheckCiTests(unittest.TestCase):
         self.slept = []
         self.now = [0.0]
 
-    def check(self, timeout=1200):
+    def check(self, timeout=1200, **changes):
         def sleep(seconds):
             self.slept.append(seconds)
             self.now[0] += seconds
-        return check_ci(manifest(with_github=True), gh=self.gh, timeout=timeout, clock=lambda: self.now[0], sleep=sleep)
+        return check_ci(manifest(with_github=True, **changes), gh=self.gh, timeout=timeout,
+                        clock=lambda: self.now[0], sleep=sleep)
 
     def test_a_check_dispatches_check_only_on_the_deployment_branch_and_waits_for_the_new_run(self):
         self.gh_runner.views = [{"status": "in_progress"}, check_view()]
@@ -753,6 +1082,15 @@ class CheckCiTests(unittest.TestCase):
         self.assertIn("check_only=true", dispatch)
         self.assertEqual(result["steps"]["Deploy"], "skipped")
         self.assertEqual(self.slept, [10])
+
+    def test_a_check_uses_the_configured_branch_for_the_dispatch_and_the_subject(self):
+        self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}
+        self.gh_runner.views = [check_view("failure", "Join the tailnet")]
+        code, result = self.check(branch="trunk")
+        dispatch = next(a for a, _ in self.gh_runner.calls if a[:2] == ["workflow", "run"])
+        self.assertEqual(dispatch[dispatch.index("--ref") + 1], "trunk")
+        self.assertEqual((code, result["failed_step"]), (1, "Join the tailnet"))
+        self.assertEqual(result["subject_expected"], "repo:Example@1/orders@2:ref:refs/heads/trunk")
 
     def test_a_tailscale_refusal_names_the_subject_github_presents(self):
         self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}

@@ -17,6 +17,9 @@ from typing import Callable
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 POLL_SECONDS = 1.0
+DEFAULT_READY_STATUS = 200
+MAX_POLL_SECONDS = 60
+_STATUSES = (100, 599)
 
 
 class ProbeFailure(Exception):
@@ -25,6 +28,24 @@ class ProbeFailure(Exception):
     def __init__(self, message: str, kind: str):
         super().__init__(message)
         self.kind = kind
+
+
+class ReadinessError(ValueError):
+    """A readiness setting cannot be used safely."""
+
+
+def validate_status(value: object) -> int:
+    """The HTTP status that means ready; one code, because a probe answers one question."""
+    if type(value) is not int or not _STATUSES[0] <= value <= _STATUSES[1]:
+        raise ReadinessError(f"deploy.readiness_status must be an integer between {_STATUSES[0]} and {_STATUSES[1]}")
+    return value
+
+
+def validate_interval(value: object) -> int:
+    """Seconds between readiness polls; bounded so a deploy cannot poll forever or hammer the application."""
+    if type(value) is not int or not 1 <= value <= MAX_POLL_SECONDS:
+        raise ReadinessError(f"deploy.readiness_interval_seconds must be an integer between 1 and {MAX_POLL_SECONDS}")
+    return value
 
 
 class _WatchedConnection(http.client.HTTPConnection):
@@ -94,6 +115,21 @@ def _routes_for_host(node: object, domain: str, found: list[dict]) -> None:
             _routes_for_host(item, domain, found)
 
 
+def _static_responses(node: object, found: list[dict]) -> None:
+    if isinstance(node, dict):
+        if node.get("handler") == "static_response":
+            found.append(node)
+        for value in node.values():
+            _static_responses(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _static_responses(item, found)
+
+
+REDIRECT_STATUS = 308
+URI_PLACEHOLDER = "{http.request.uri}"  # Caddy's {uri}: the path and query string of the request
+
+
 def config_routes_to(config: object, domain: str, upstream: str) -> bool:
     """True if some route matching ``domain`` in a Caddy JSON config proxies to ``upstream``."""
     routes: list[dict] = []
@@ -106,6 +142,25 @@ def config_routes_to(config: object, domain: str, upstream: str) -> bool:
     return False
 
 
+def config_redirects_to(config: object, host: str, canonical: str) -> bool:
+    """True if some route matching ``host`` permanently redirects every path and query to ``canonical``.
+
+    Caddy renders ``redir https://<host>{uri} 308`` as a ``static_response`` whose ``Location`` keeps the
+    request URI, so a redirect that would drop the path, the query, or the scheme is not this redirect.
+    """
+    expected = f"https://{canonical}{URI_PLACEHOLDER}"
+    routes: list[dict] = []
+    _routes_for_host(config, host, routes)
+    for route in routes:
+        responses: list[dict] = []
+        _static_responses(route, responses)
+        for response in responses:
+            locations = (response.get("headers") or {}).get("Location") or []
+            if response.get("status_code") == REDIRECT_STATUS and expected in locations:
+                return True
+    return False
+
+
 class Probes:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
                  fetch=http_get, admin_port: int = 2019, https_port: int = 443,
@@ -114,15 +169,19 @@ class Probes:
         self.admin_port, self.https_port, self.https_context = admin_port, https_port, https_context
 
     def ready_once(self, registration: dict, release: dict) -> bool:
-        path = release["configuration"]["http"]["readiness_path"]
+        configuration = release["configuration"]
+        path = configuration["http"]["readiness_path"]
+        expected = configuration["deploy"].get("readiness_status", DEFAULT_READY_STATUS)
         try:
-            return self.fetch("127.0.0.1", registration["host_port"], path, read_body=False)[0] == 200
+            return self.fetch("127.0.0.1", registration["host_port"], path, read_body=False)[0] == expected
         except (OSError, http.client.HTTPException):
             return False
 
     def wait_ready(self, registration: dict, release: dict, alive: Callable[[], bool]) -> dict:
-        """Poll the readiness path until 200, the process exits, or the deadline passes."""
-        timeout = release["configuration"]["deploy"]["readiness_timeout_seconds"]
+        """Poll the readiness path until the configured status, the process exits, or the deadline passes."""
+        deploy = release["configuration"]["deploy"]
+        timeout = deploy["readiness_timeout_seconds"]
+        interval = deploy.get("readiness_interval_seconds", POLL_SECONDS)
         deadline = self.clock() + timeout
         attempts = 0
         while True:
@@ -133,7 +192,7 @@ class Probes:
                 return {"attempts": attempts, "ready": True}
             if self.clock() >= deadline:
                 raise ProbeFailure(f"the application was not ready within {timeout} seconds", "timeout")
-            self.sleep(POLL_SECONDS)
+            self.sleep(interval)
 
     def routing(self, registration: dict) -> bool | None:
         """Check the active Caddy configuration through its admin API; None if it cannot be read."""
@@ -144,19 +203,25 @@ class Probes:
             config = json.loads(body.decode("utf-8"))
         except (OSError, http.client.HTTPException, ValueError):
             return None
-        return config_routes_to(config, registration["api_domain"], f"127.0.0.1:{registration['host_port']}")
+        canonical = registration["api_domain"]
+        if not config_routes_to(config, canonical, f"127.0.0.1:{registration['host_port']}"):
+            return False
+        # An alias that is not served as a permanent redirect to the canonical hostname is not what was rendered.
+        return all(config_redirects_to(config, host, canonical) for host in registration.get("hostnames") or ())
 
     def https(self, registration: dict, release: dict) -> dict:
-        """Informational: does the public name serve over verified TLS (needs DNS and a certificate)?"""
+        """Informational: does the public name serve the readiness status over verified TLS (needs DNS and a certificate)?"""
         domain = registration["api_domain"]
+        configuration = release["configuration"]
+        expected = configuration["deploy"].get("readiness_status", DEFAULT_READY_STATUS)
         context = self.https_context or ssl.create_default_context()
         try:
             with socket.create_connection(("127.0.0.1", self.https_port), timeout=5) as raw:
                 with context.wrap_socket(raw, server_hostname=domain) as tls:
-                    path = release["configuration"]["http"]["readiness_path"]
+                    path = configuration["http"]["readiness_path"]
                     tls.sendall(f"GET {path} HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
                     first = tls.recv(64).split(b"\r\n", 1)[0].decode("ascii", "replace")
-            return {"verified": first.startswith("HTTP/1.1 200"), "status_line": first}
+            return {"verified": first.startswith(f"HTTP/1.1 {expected}"), "status_line": first}
         except ssl.SSLCertVerificationError:
             return {"verified": False, "error": "certificate_not_trusted"}
         except (OSError, ssl.SSLError):

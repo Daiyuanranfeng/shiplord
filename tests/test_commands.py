@@ -72,6 +72,18 @@ class InputTests(unittest.TestCase):
             commands.image_repository_for(manifest(), None)
         self.assertIsNone(commands.image_repository_for(manifest(runtime="native"), None))
 
+    def test_a_manifest_image_table_names_another_registry(self):
+        hub = validate_manifest(dict(configuration(), image={"repository": "docker.io/example/orders"}))
+        self.assertEqual(commands.image_repository_for(hub, None), "docker.io/example/orders")
+        bare = validate_manifest(dict(configuration(), image={"repository": "nginx"}))
+        self.assertEqual(commands.image_repository_for(bare, None), "docker.io/library/nginx")
+        # The override is normalised by the same policy, before any server is contacted.
+        self.assertEqual(commands.image_repository_for(manifest(), "nginx"), "docker.io/library/nginx")
+        with self.assertRaisesRegex(CommandError, "ambiguous"):
+            commands.image_repository_for(manifest(), "example/orders")
+        with self.assertRaisesRegex(CommandError, "ghcr.io/owner/name"):
+            commands.image_repository_for(manifest(), "quay.io/example/orders")
+
     def test_the_release_sequence_is_the_commit_time_so_ci_and_local_agree(self):
         repo = self.home / "repo"
         repo.mkdir()
@@ -97,11 +109,26 @@ class InputTests(unittest.TestCase):
     def test_deploy_inputs_are_validated_without_any_connection(self):
         commands.validate_deploy_inputs(manifest(), IMAGE, COMMIT)
         for image, commit in (("ghcr.io/example/orders:latest", COMMIT), (IMAGE, "HEAD"), (IMAGE, COMMIT[:39]),
-                              ("ghcr.io/example/orders@sha256:abc", COMMIT), ("x; rm -rf /@sha256:" + "a" * 64, COMMIT)):
+                              ("ghcr.io/example/orders@sha256:abc", COMMIT), ("x; rm -rf /@sha256:" + "a" * 64, COMMIT),
+                              ("quay.io/example/orders@sha256:" + "a" * 64, COMMIT),
+                              ("example/orders@sha256:" + "a" * 64, COMMIT),
+                              ("ghcr.io/example/orders@sha512:" + "a" * 128, COMMIT),
+                              (IMAGE.upper(), COMMIT)):
             with self.subTest(image=image, commit=commit), self.assertRaises(CommandError):
                 commands.validate_deploy_inputs(manifest(), image, commit)
         with self.assertRaisesRegex(CommandError, "native"):
             commands.validate_deploy_inputs(manifest(runtime="native"), IMAGE, COMMIT)
+
+    def test_docker_hub_images_are_pinned_and_stored_in_their_one_spelling(self):
+        digest = "sha256:"
+        for given, stored in (("docker.io/example/orders@" + digest + "a" * 64,
+                               "docker.io/example/orders@" + digest + "a" * 64),
+                              ("docker.io/library/nginx@" + digest + "b" * 64,
+                               "docker.io/library/nginx@" + digest + "b" * 64),
+                              ("nginx@" + digest + "c" * 64, "docker.io/library/nginx@" + digest + "c" * 64)):
+            with self.subTest(image=given):
+                arguments = commands._deploy_arguments(manifest(), given, 1000, False)
+                self.assertEqual(arguments["artifact"], {"kind": "docker", "image": stored})
 
 
 class AdminCommandTests(unittest.TestCase):
@@ -187,6 +214,42 @@ class AdminCommandTests(unittest.TestCase):
         _, listing = commands.set_environment(manifest(), AdminClient("a@h", runner=FakeSsh((ok({"keys": ["A"]}), b"", 0))), "keys")
         self.assertNotIn("note", listing)
 
+    def test_one_key_edits_send_the_value_only_in_the_frame_and_never_return_it(self):
+        secret = "postgres://u:s3cr3t@db/x"
+        ssh = FakeSsh((ok({"keys": ["DATABASE_URL"], "changed": True}), b"", 0))
+        code, output = commands.edit_environment(manifest(), AdminClient("a@h", runner=ssh), "set-key",
+                                                 assignment=f"DATABASE_URL={secret}")
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["arguments"], {"operation": "set-key", "key": "DATABASE_URL", "value": secret})
+        self.assertIn(secret.encode(), ssh.calls[0][1])
+        self.assertNotIn("s3cr3t", str(ssh.calls[0][0]) + str(output))
+        self.assertEqual((code, output["keys"]), (0, ["DATABASE_URL"]))
+        self.assertIn("next time a release starts", output["note"])
+
+        ssh = FakeSsh((ok({"keys": [], "changed": True}), b"", 0))
+        code, output = commands.edit_environment(manifest(), AdminClient("a@h", runner=ssh), "unset", key="OLD")
+        self.assertEqual(read_frame(io.BytesIO(ssh.calls[0][1]))["arguments"], {"operation": "unset", "key": "OLD"})
+        self.assertEqual((code, output["changed"]), (0, True))
+        self.assertIn("next time a release starts", output["note"])
+
+    def test_invalid_one_key_edits_are_refused_before_any_connection(self):
+        ssh = FakeSsh()
+        client = AdminClient("a@h", runner=ssh)
+        cases = ((("set-key",), {"assignment": "PORT=1"}, "managed by Shiplord"),
+                 (("set-key",), {"assignment": "BAD LINE s3cr3t"}, "KEY=VALUE"),
+                 (("set-key",), {"assignment": "A=1\nB=2"}, "invalid"),
+                 (("set-key",), {"assignment": "A-B=1"}, "variable name"),
+                 (("set-key",), {"assignment": None}, "assignment is required"),
+                 (("unset",), {"key": "A B"}, "variable name"),
+                 (("unset",), {"key": "PORT"}, "managed by Shiplord"),
+                 (("unset",), {"key": None}, "variable name"),
+                 (("merge",), {"key": "A"}, "unknown environment operation"))
+        for operation, arguments, expected in cases:
+            with self.subTest(operation=operation, arguments=str(arguments)[:20]), \
+                    self.assertRaisesRegex(CommandError, expected) as caught:
+                commands.edit_environment(manifest(), client, *operation, **arguments)
+            self.assertNotIn("s3cr3t", str(caught.exception))
+
     def test_environment_diff_reports_only_key_name_changes(self):
         secret, other = "postgres://u:first-secret@db/x", "postgres://u:second-secret@db/y"
         ssh = FakeSsh((ok({"keys": ["KEEP", "REMOVE"]}), b"", 0))
@@ -236,16 +299,29 @@ class RegistryCommandTests(unittest.TestCase):
         self.assertEqual((code, result["registries"]), (0, [{"registry": "ghcr.io", "username": "bot"}]))
         self.assertIn("read-only", result["note"])
 
+    def test_docker_hub_credentials_are_accepted_like_ghcr(self):
+        ssh = FakeSsh((ok({"registries": [{"registry": "docker.io", "username": "bot"}]}), b"", 0))
+        code, result = commands.registry_login(manifest(), AdminClient("a@h", runner=ssh), registry="docker.io",
+                                               username="bot", token=self.TOKEN)
+        sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+        self.assertEqual(sent["arguments"]["registry"], "docker.io")
+        self.assertIn(self.TOKEN.encode(), ssh.calls[0][1])
+        self.assertNotIn(self.TOKEN, str(result))
+        self.assertEqual((code, result["registries"]), (0, [{"registry": "docker.io", "username": "bot"}]))
+
     def test_invalid_input_is_refused_before_any_connection(self):
         ssh = FakeSsh()
         client = AdminClient("a@h", runner=ssh)
-        for kwargs in ({"registry": "docker.io"}, {"username": "a b"}, {"token": "has space"}, {"token": ""},
-                       {"token": "x" * 513}, {"token": "a\nb"}):
+        for kwargs in ({"registry": "quay.io"}, {"registry": "docker.io/evil"}, {"registry": "index.docker.io"},
+                       {"registry": "https://index.docker.io/v1/"}, {"username": "a b"}, {"token": "has space"},
+                       {"token": ""}, {"token": "x" * 513}, {"token": "a\nb"}):
             options = dict(registry="ghcr.io", username="bot", token=self.TOKEN)
             options.update(kwargs)
             with self.subTest(kwargs=str(kwargs)[:30]), self.assertRaises(CommandError) as caught:
                 commands.registry_login(manifest(), client, **options)
             self.assertNotIn(self.TOKEN, str(caught.exception))
+        with self.assertRaises(CommandError):
+            commands.registry_other(manifest(), client, "logout", "quay.io")
         self.assertEqual(ssh.calls, [])
 
     def test_logout_and_status_send_no_secret_material(self):
@@ -259,7 +335,7 @@ class RegistryCommandTests(unittest.TestCase):
 class DeployCommandTests(ClientTestCase):
     def deploy(self, **overrides):
         options = dict(image=IMAGE, commit=COMMIT, sequence=1000, request_id="req-1", timeout=60,
-                       public_check=lambda domain, path: {"ok": True, "status": 200, "error": None})
+                       public_check=lambda domain, path, **kwargs: {"ok": True, "status": 200, "error": None})
         options.update(overrides)
         import shiplord.client as client_module
         original = client_module.wait_for_job
@@ -277,7 +353,7 @@ class DeployCommandTests(ClientTestCase):
         self.assertEqual((result["request_id"], result["url"]), ("req-1", "https://orders.example.com"))
 
     def test_public_verification_is_reported_but_only_fails_the_command_when_required(self):
-        failing = lambda domain, path: {"ok": False, "status": None, "error": "dns_unresolved"}  # noqa: E731
+        failing = lambda domain, path, **kwargs: {"ok": False, "status": None, "error": "dns_unresolved"}  # noqa: E731
         code, result = self.deploy(public_check=failing)
         self.assertEqual((code, result["ok"], result["public"]["error"]), (0, True, "dns_unresolved"))
         code, result = self.deploy(public_check=failing, request_id="req-2", require_public=True)
@@ -356,13 +432,32 @@ class QueryCommandTests(ClientTestCase):
         code, plan = commands.plan_application(manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000)
         self.assertEqual((code, plan["action"], plan["route_change"]), (0, "deploy", "create"))
         self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
-        self.runtime.logs = lambda registration, tail: f"tail={tail}\n"
+        self.runtime.log_output = "tail=5\n"
         self.assertEqual(commands.application_logs(self.client, 5)[1]["logs"], "tail=5\n")
+        self.assertEqual(self.runtime.log_arguments, {"release": None, "tail": 5, "since": None, "timestamps": False})
         for tail in (0, 1001):
             with self.assertRaises(CommandError):
                 commands.application_logs(self.client, tail)
         code, status = commands.application_status(self.client)
         self.assertEqual((code, status["application"]["current"], status["job"]), (0, None, None))
+
+    def test_follow_passes_bounded_arguments_and_returns_the_stop_reason(self):
+        self.runtime.follow_chunks, self.runtime.follow_stopped = ["line\n"], "timeout"
+        chunks = []
+        code, result = commands.application_logs(self.client, 5, since="15m", timestamps=True, follow=True,
+                                                 timeout=30, on_chunk=chunks.append)
+        self.assertEqual((code, chunks, result["stopped"], result["release"]), (0, ["line\n"], "timeout", None))
+        self.assertEqual(self.runtime.follow_arguments,
+                         {"release": None, "tail": 5, "since": "15m", "timestamps": True, "duration": 30})
+
+    def test_log_options_are_validated_before_any_connection(self):
+        options = ({"since": "1d"}, {"since": 5}, {"follow": True, "timeout": 0},
+                   {"follow": True, "timeout": 3601}, {"follow": True, "on_chunk": None})
+        for choice in options:
+            with self.subTest(choice=choice), self.assertRaises(CommandError):
+                commands.application_logs(self.client, 5, **choice)
+        self.assertEqual(self.commands, [])
+
 
     def test_job_lookup_is_read_only_and_reports_the_recorded_outcome(self):
         commit, arguments = self.deploy_arguments()
@@ -508,6 +603,52 @@ class QueryCommandTests(ClientTestCase):
         self.assertTrue(result["forced_stop"]["forced"])
         self.assertEqual(result["forced_stop"]["signal"], "SIGKILL")
         self.assertFalse(result["running"])
+
+
+class BackupCommandTests(ClientTestCase):
+    def setUp(self):
+        super().setUp()
+        self.data = self.layout.data / "orders"
+        self.data.mkdir(parents=True)
+        (self.data / "state.db").write_bytes(b"sqlite")
+        self.runtime.data_root_path = self.data
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+        self.waited = []
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            self.waited.append(job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda seconds: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+
+    def test_backup_and_restore_report_the_verified_archive(self):
+        code, backup = commands.backup_application(manifest(), self.client, request_id="bk-1")
+        self.assertEqual((code, backup["ok"], backup["verified"]), (0, True, True))
+        name = backup["archive"]
+        (self.data / "state.db").write_bytes(b"changed")
+        arguments = commands.restore_arguments(name, False)
+        code, restore = commands.restore_application(manifest(), self.client, arguments, request_id="rs-1")
+        self.assertEqual((code, restore["ok"], restore["archive"]), (0, True, name))
+        self.assertEqual((self.data / "state.db").read_bytes(), b"sqlite")
+        self.assertEqual(self.waited, ["bk-1", "rs-1"])
+
+    def test_restore_needs_exactly_one_source_and_a_safe_name(self):
+        for archive, latest in ((None, False), ("shiplord-backup-orders-20240101T000000Z.tar.gz", True)):
+            with self.subTest(archive=archive, latest=latest), self.assertRaises(CommandError):
+                commands.restore_arguments(archive, latest)
+        self.assertEqual(commands.restore_arguments(None, True), {"latest": True})
+        for name in ("../escape.tar.gz", "/etc/passwd.tar.gz", "a/b.tar.gz", "not-a-backup.tar"):
+            with self.subTest(name=name), self.assertRaises(CommandError):
+                commands.restore_arguments(name, False)
+
+    def test_an_old_helper_is_refused_with_the_protocol_exit_code(self):
+        self.client.call = lambda action, **options: {"actions": ["capabilities", "deploy"]}
+        with self.assertRaises(CommandError) as caught:
+            commands.backup_application(manifest(), self.client)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("server bootstrap", str(caught.exception))
 
 
 class DoctorTests(ClientTestCase):
@@ -676,6 +817,12 @@ class PublicCheckTests(unittest.TestCase):
     def test_a_verified_200_passes_and_retries_while_the_service_settles(self):
         self.assertEqual(self.check([200]), {"ok": True, "status": 200, "error": None})
         self.assertTrue(self.check([503, 502, 200])["ok"])
+
+    def test_a_configured_readiness_status_is_the_one_that_passes(self):
+        self.assertEqual(self.check([204], ready_status=204), {"ok": True, "status": 204, "error": None})
+        ticks = iter(range(0, 10000, 20))
+        self.assertEqual(self.check([204], clock=lambda: next(ticks)),
+                         {"ok": False, "status": 204, "error": "unexpected_status"})
 
     def test_failures_are_classified_after_the_deadline(self):
         ticks = iter(range(0, 10000, 20))

@@ -60,6 +60,9 @@ requested optional features in one capabilities call before submitting `plan` or
 `shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
 (`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
 
+`runtime_knobs_v1` means the helper honours `resources.cpu_limit`, `deploy.init`, `deploy.readiness_status`, and
+`deploy.readiness_interval_seconds`, and refuses any value outside their documented ranges before a release is stored.
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered
@@ -110,7 +113,7 @@ frame. Nothing travels in argv. Requests carry `application_id`, null `commit`, 
 
 | Action | `arguments` |
 | --- | --- |
-| `provision` | `runtime`, `api_domain`, `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname or ceiling to an existing application |
+| `provision` | `runtime`, `api_domain`, optional `hostnames` (additional hostnames that redirect to it), `image_repository` (null for native), `public_key`, `key_label`; optional `max_memory_mb`, and `update`: `true` to apply a changed hostname, additional hostnames, or ceiling to an existing application |
 | `keys` | `operation` (`add`, `remove`, `list`), `label`, `public_key` |
 | `environment` | `operation` (`set`, `clear`, `keys`), `text` |
 | `registry` | `operation` (`login`, `logout`, `list`), `registry` (`ghcr.io`), `username`, `token` |

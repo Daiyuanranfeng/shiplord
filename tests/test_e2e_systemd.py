@@ -125,6 +125,8 @@ class NativeSystemdTests(unittest.TestCase):
         cls.config.mkdir(exist_ok=True)
         cls.executable = shutil.which("shiplord")
         cls.environment = dict(os.environ, XDG_CONFIG_HOME=str(cls.config), HOME="/root")
+        # A developer's real Tailscale token must never reach a test: `github setup` would call the API.
+        cls.environment.pop("TAILSCALE_API_KEY", None)
         cls.setup_ssh()
         cls.build_fixtures()
         cls.addClassCleanup(cls.cleanup)
@@ -251,7 +253,13 @@ class NativeSystemdTests(unittest.TestCase):
                          ("active", "always", "enabled"))  # enabled: it comes back after a reboot
         binary = next(Path(f"/opt/shiplord/{self.app}").glob("*/app"))
         self.assertEqual((binary.stat().st_uid, oct(binary.stat().st_mode & 0o777)), (0, "0o755"))
-        self.assertIn("fixture started version=v1", self.cli("logs", "--tail", "20", check=0).stdout)  # from journald
+        logs = self.cli("logs", "--tail", "20", "--timestamps", check=0).stdout
+        self.assertIn("fixture started version=v1", logs)  # from journald
+        self.assertRegex(logs, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+        self.assertIn("fixture started version=v1", self.cli("logs", "--tail", "20", "--since", "1h", check=0).stdout)
+        followed = self.cli("logs", "--tail", "50", "--follow", "--timeout", "3", check=0)
+        self.assertIn("fixture started version=v1", followed.stdout)
+        self.assertIn("Outcome: stopped at the timeout", followed.stderr)
 
     def test_04_a_crashed_process_is_restarted_by_systemd(self):
         pid = self.show("MainPID")["MainPID"]
@@ -333,15 +341,20 @@ class NativeSystemdTests(unittest.TestCase):
         self.assertEqual(self.get("/version"), "v2")
 
     def test_13_the_deep_doctor_sees_a_healthy_systemd_host(self):
-        result = self.cli_json("doctor", "--server", "production", "--deep", check=3)  # no Docker daemon in this container
+        result = self.cli_json("doctor", "--server", "production", "--deep")  # native-only: Docker is not required
         checks = result["checks"]
-        for name in ("helper", "caddy", "sshd", "disk", "applications"):
+        for name in ("helper", "caddy", "sshd", "ports", "disk", "applications", "consistency"):
             self.assertTrue(checks[name]["ok"], (name, checks[name]))
         self.assertTrue(checks["caddy"]["service_active"])  # the real caddy.service, through real systemctl
-        self.assertFalse(checks["docker"]["ok"])
+        self.assertEqual(checks["docker"],
+                         {"ok": True, "required": False, "available": False, "version": None})
+        self.assertTrue(all(port["external"] for port in checks["ports"]["ports"]))
         application = checks["applications"]["applications"][0]
         self.assertEqual((application["runtime"], application["deployed"], application["unfinished_transaction"]),
                          ("native", True, None))
+        consistency = checks["consistency"]["applications"][0]
+        self.assertEqual((consistency["application"], consistency["ok"], consistency["route"], consistency["running"]),
+                         (self.app, True, "identical", True))
 
     def test_12_old_release_directories_are_removed_once_they_leave_the_retention_window(self):
         self.deploy("v3", 5000)

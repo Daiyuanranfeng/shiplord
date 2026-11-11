@@ -9,6 +9,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add `shiplord release` to build and push a Docker image from a clean checkout,
+  then deploy the pushed digest without copying it by hand.
+- Add `shiplord setup`, which runs configure, provision, env, registry login,
+  github setup, and check-ci in order and resumes at the first incomplete step.
+- Render every command's result as readable lines, and accept `--json` on
+  `init`, `configure`, and `server add` as the other commands already did.
 - Add a `QueryPlanner/shiplord/deploy` composite action and make the generated
   workflow call it instead of inlining the tailnet, SSH, deploy and summary steps.
 - Add `shiplord recover <app> --server <alias>`, so an interrupted deployment can be
@@ -18,6 +24,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Removal refuses while the current directory's `ship.toml` names the alias.
 - Add `shiplord provision --update` to apply a changed hostname or memory
   ceiling without removing the application's state, environment, or keys.
+- Serve additional hostnames per application: `http.hostnames` (or
+  `--hostname`, repeatable) and `http.www_redirect` (`--www`) redirect
+  permanently to the canonical `http.api_domain`, keeping the path and query
+  string. The extra hostnames are part of the registration, so a deployment
+  cannot add or drop them.
+- Generate a GitHub Actions release workflow for native applications: it builds
+  the binary, uploads it as an artifact, and deploys it with
+  `shiplord deploy --binary`. `github setup` takes `--build-command` and
+  `--binary-path` and records both in `[github]`.
 
 ### Fixed
 

@@ -14,10 +14,13 @@ from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_
 from shiplord.system import TRUNCATION_MARKER, CommandError, CommandResult
 
 
-def registration(app="orders", domain="orders.example.com", port=20000):
-    return {"schema_version": 1, "application_id": app, "deployment_uid": 1001, "deployment_user": "ship-orders",
-            "runtime": "docker", "api_domain": domain, "host_port": port,
-            "image_repository": f"ghcr.io/example/{app}", "max_memory_mb": 4096}
+def registration(app="orders", domain="orders.example.com", port=20000, hostnames=()):
+    value = {"schema_version": 1, "application_id": app, "deployment_uid": 1001, "deployment_user": "ship-orders",
+             "runtime": "docker", "api_domain": domain, "host_port": port,
+             "image_repository": f"ghcr.io/example/{app}", "max_memory_mb": 4096}
+    if hostnames:
+        value["hostnames"] = list(hostnames)
+    return value
 
 
 class FakeCaddy:
@@ -146,7 +149,8 @@ class ApplyTests(RoutingTestCase):
         before = self.snapshot()
         bad = [registration(domain="a.example.com {\n\tfile_server\n}\nb.example.com"),
                registration(domain="a.example.com }"), registration(domain="A.example.com"),
-               registration(port=2019), registration(port=22), dict(registration(), extra=1)]
+               registration(port=2019), registration(port=22), dict(registration(), extra=1),
+               dict(registration(), hostnames=["a.example.com {\n\tfile_server\n}\nb.example.com"])]
         with self.lock.acquire():
             for value in bad:
                 with self.subTest(value=str(value)[:60]), self.assertRaises(ValueError):
@@ -163,6 +167,39 @@ class ApplyTests(RoutingTestCase):
             render_route("bad domain", 20000)
         with self.assertRaises(RoutingError):
             render_route("orders.example.com", 2019)
+
+    def test_render_route_rejects_an_invalid_alias(self):
+        for hostnames in (["bad domain"], ["orders.example.com"], ["a.example.com", "a.example.com"],
+                          ["Orders.example.com"], ["127.0.0.1"], "legacy.example.com"):
+            with self.subTest(hostnames=hostnames), self.assertRaises(ValueError):
+                render_route("orders.example.com", 20000, hostnames)
+
+    def test_additional_hostnames_are_permanent_redirects_that_keep_the_uri(self):
+        self.assertEqual(render_route("orders.example.com", 20000,
+                                      ["legacy.example.com", "www.orders.example.com"]),
+                         b"orders.example.com {\n\treverse_proxy 127.0.0.1:20000\n}\n"
+                         b"\nlegacy.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n"
+                         b"\nwww.orders.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n")
+
+    def test_a_route_with_aliases_is_applied_and_reloads_once(self):
+        aliases = ["legacy.example.com", "www.orders.example.com"]
+        with self.lock.acquire():
+            result = self.manager.apply(registration(hostnames=aliases))
+        self.assertTrue(result.changed)
+        self.assertIn(b"\nlegacy.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n",
+                      (self.ship / "orders.caddy").read_bytes())
+        self.assertEqual(self.caddy.reload_calls, 1)
+
+    def test_inspecting_a_route_reports_an_alias_change_as_different(self):
+        with self.lock.acquire():
+            self.manager.apply(registration())
+            self.assertEqual(self.manager.inspect_route(registration()), "identical")
+            self.assertEqual(self.manager.inspect_route(registration(hostnames=["legacy.example.com"])),
+                             "different")
+            self.manager.apply(registration(hostnames=["legacy.example.com"]))
+            self.assertEqual(self.manager.inspect_route(registration(hostnames=["legacy.example.com"])),
+                             "identical")
+            self.assertEqual(self.manager.inspect_route(registration()), "different")
 
     def test_a_route_change_leaves_a_0640_caddyfile_at_0640(self):
         (self.root / "Caddyfile").chmod(0o640)
@@ -354,11 +391,11 @@ class RemoveAndReconcileTests(RoutingTestCase):
 
 
 class ConflictTests(RoutingTestCase):
-    def assertConflict(self, kind="conflict", **options):
+    def assertConflict(self, kind="conflict", hostnames=(), **options):
         before = self.snapshot()
         manager = RouteManager(self.root, self.lock, self.caddy, **options)
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
-            manager.apply(registration())
+            manager.apply(registration(hostnames=hostnames))
         self.assertEqual(caught.exception.kind, kind)
         self.assertEqual(self.caddy.validate_calls, [])
         self.assertEqual(self.caddy.reload_calls, 0)
@@ -367,15 +404,15 @@ class ConflictTests(RoutingTestCase):
     def main_with(self, text):
         self.write_main(self.MAIN + text + f"\nimport {self.root}/ship/*.caddy\n")
 
-    def assertApplies(self, text):
+    def assertApplies(self, text, hostnames=()):
         """The hostname is free: the route is installed, then removed for the next case."""
         self.main_with(text)
         with self.lock.acquire():
-            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.apply(registration(hostnames=hostnames)).changed)
             self.assertTrue(self.manager.remove("orders").changed)
 
-    def inspect(self, text):
-        return routing._Inspection("orders.example.com", f"{self.root}/ship/*.caddy", False).scan(text)
+    def inspect(self, text, hostnames=()):
+        return routing._Inspection(["orders.example.com", *hostnames], f"{self.root}/ship/*.caddy", False).scan(text)
 
     def test_hostname_forms_in_the_main_caddyfile_are_conflicts(self):
         forms = ["orders.example.com {\n}", "https://orders.example.com {\n}", "http://orders.example.com:8080 {\n}",
@@ -403,6 +440,37 @@ class ConflictTests(RoutingTestCase):
         for label, text in cases.items():
             with self.subTest(label):
                 self.assertApplies(text)
+
+    def test_an_alias_in_the_main_caddyfile_is_a_conflict(self):
+        for form in ("legacy.example.com {\n}", "https://legacy.example.com/x {\n}",
+                     "a.example.com, legacy.example.com {\n}", "LEGACY.example.com:443 {\n}"):
+            with self.subTest(form=form):
+                self.main_with(form)
+                self.assertConflict(hostnames=["legacy.example.com"])
+
+    def test_an_alias_in_another_managed_route_is_refused(self):
+        self.write_route("billing.caddy", "legacy.example.com {\n\treverse_proxy 127.0.0.1:20001\n}\n")
+        self.assertConflict(hostnames=["legacy.example.com"])
+
+    def test_a_redirect_target_is_not_treated_as_a_site_address(self):
+        # Another site redirecting to the alias is not another site serving it.
+        self.assertApplies("site.example.net {\n\tredir https://legacy.example.com{uri} 308\n}",
+                           hostnames=["legacy.example.com"])
+        self.assertEqual(self.inspect("legacy.example.net {\n\tredir https://www.orders.example.com{uri} 308\n}",
+                                      ["www.orders.example.com"]), [])
+
+    def test_a_wildcard_that_covers_an_alias_is_refused(self):
+        self.main_with("*.orders.example.com {\n}")
+        self.assertConflict(hostnames=["www.orders.example.com"])
+        with self.lock.acquire():
+            RouteManager(self.root, self.lock, self.caddy, allow_wildcard_overlap=True).apply(
+                registration(hostnames=["www.orders.example.com"]))
+        self.assertTrue((self.ship / "orders.caddy").exists())
+
+    def test_unrelated_wildcard_and_similar_hostnames_do_not_conflict_with_an_alias(self):
+        self.main_with("*.example.net {\n}\nlegacy.example.com.evil.test {\n}")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration(hostnames=["legacy.example.com"])).changed)
 
     def test_a_wildcard_inside_a_directive_value_does_not_overlap(self):
         self.assertApplies("site.example.net {\n\treverse_proxy https://*.example.com\n}")
@@ -979,6 +1047,103 @@ class EnsureImportTests(RoutingTestCase):
         self.assertTrue(caught.exception.intervention_required)
         self.assertIn(".prior-Caddyfile", str(caught.exception))
         self.assertTrue((self.root / ".prior-Caddyfile").exists())
+
+
+class RemoveImportTests(RoutingTestCase):
+    """Uninstall removes the managed import once, and only when it is the one Shiplord wrote."""
+
+    def setUp(self):
+        super().setUp()
+        self.line = f"import {self.root}/ship/*.caddy\n"
+
+    def test_removes_only_the_managed_import_and_reloads_once(self):
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual(self.caddy.reload_calls, 1)
+        self.assertNotIn(self.line, self.caddy.validate_calls[0]["text"])
+        self.assertIn("example.org", self.caddy.validate_calls[0]["text"])
+        self.assertNoTransactionLeftovers()
+        self.assertEqual(self.mode(self.root / "Caddyfile"), 0o644)
+
+    def test_a_caddyfile_without_the_import_is_left_untouched(self):
+        self.write_main(self.MAIN)
+        before = self.snapshot()
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls, self.caddy.validate_calls), (before, 0, []))
+
+    def test_rewriting_the_caddyfile_preserves_its_owner_and_mode(self):
+        path = self.root / "Caddyfile"
+        path.chmod(0o640)
+        before = path.stat()
+        with self.lock.acquire():
+            self.manager.remove_import()
+        after = path.stat()
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o640, before.st_uid, before.st_gid))
+
+    def test_duplicate_imports_missing_file_and_missing_lock_are_refused(self):
+        with self.assertRaisesRegex(RoutingError, "lock"):
+            self.manager.remove_import()
+        self.write_main(self.MAIN + self.line + self.line)
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "more than once"):
+            self.manager.remove_import()
+        self.assertEqual(self.snapshot(), before)
+        (self.root / "Caddyfile").unlink()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "missing"):
+            self.manager.remove_import()
+
+    def test_an_interrupted_change_is_refused_without_touching_anything(self):
+        (self.root / ".prior-Caddyfile").write_text("old")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertEqual((self.root / ".prior-Caddyfile").read_text(), "old")
+        self.assertEqual([p.name for p in self.root.rglob(".tmp-*")], [])
+        self.assertEqual([p.name for p in self.root.rglob(".shiplord-validate-*")], [])
+
+    def test_a_redundant_prior_is_settled_and_the_import_is_removed(self):
+        self.write_main(self.MAIN + self.line)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertNoTransactionLeftovers()
+
+    def test_a_prior_from_a_change_that_never_published_is_settled_without_a_rewrite(self):
+        self.write_main(self.MAIN)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertEqual((self.caddy.reload_calls, self.caddy.validate_calls), (0, []))
+
+    def test_validation_failure_leaves_the_caddyfile_untouched(self):
+        self.caddy.fail_validate = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertEqual(caught.exception.kind, "validation")
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertNoTransactionLeftovers()
+
+    def test_reload_failure_restores_the_caddyfile_and_reloads_again(self):
+        self.caddy.fail_reload = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertFalse(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 2))
+        self.assertNoTransactionLeftovers()
 
 
 class TokenizerTests(unittest.TestCase):

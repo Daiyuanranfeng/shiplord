@@ -91,20 +91,55 @@ shiplord configure --server production --api-domain orders-api.example.com \
   --frontend https://orders.example.com           # or --no-frontend
 shiplord provision                                   # registers your SSH key for this application
 shiplord env set --from-file .env.production         # runtime secrets; values are never printed
+shiplord env set FEATURE_FLAG=on                     # change one variable, leaving other lines as they are
+shiplord env unset OLD_FLAG                          # remove one variable; safe to repeat
 shiplord restart                                     # apply the environment to the running release
-shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
+shiplord registry login --username bot --token-file t   # only for a private image; add --registry docker.io
 
 # every release
-shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only
+shiplord release                                        # build, push, and deploy this checkout
+shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # read-only, prebuilt image
 shiplord deploy --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>
 shiplord status
 shiplord logs --tail 100
+shiplord logs --since 15m --timestamps            # the current release's container or unit only
+shiplord logs --follow --timeout 300              # stream until Ctrl-C or the 5-minute bound
 shiplord rollback
 shiplord recover
 ```
 
 Create the DNS record for `--api-domain` at your DNS provider; Shiplord checks DNS and reports it but never
 changes it.
+
+### Additional hostnames
+
+`http.api_domain` is the canonical hostname: the one that serves the application. An application can also answer
+on additional hostnames that permanently redirect (HTTP 308) to the canonical one, keeping the path and query
+string:
+
+```sh
+shiplord configure --server production --api-domain orders.example.com --no-frontend \
+  --hostname legacy.example.com --www          # --www adds www.orders.example.com
+```
+
+`--hostname` is repeatable, and `--www` adds `www.<api-domain>`. The same settings in `ship.toml` are:
+
+```toml
+[http]
+api_domain = "orders.example.com"
+hostnames = ["legacy.example.com"]
+www_redirect = true
+```
+
+The additional hostnames are part of the application's registration: `provision` records them, and a deployment
+whose manifest lists different ones is refused before anything runs. Changing them afterwards is an administrative
+change to the registration, not something a deployment account can do. `shiplord plan` shows them, and
+`shiplord status --json` includes them. Each hostname needs its own DNS record; Shiplord checks DNS and reports it
+but never changes it.
+
+A redirect never points at itself, so an alias cannot be the canonical hostname, a duplicate, or a `www` name
+outside the canonical hostname's own name. The canonical hostname still serves the application; only the aliases
+redirect.
 
 ### Releasing a native binary
 
@@ -151,6 +186,43 @@ shiplord deploy --binary ./dist/orders --commit "$(git rev-parse HEAD)" --sequen
 The binary is uploaded over the same SSH connection, and runs as an unprivileged account under a confined
 systemd unit.
 
+`shiplord github setup --repo <owner>/<repository> --build-command '<build command>' --binary-path dist/orders`
+writes a release workflow that runs that command on a hosted runner, uploads the binary as an artifact, and
+deploys it with `shiplord deploy --binary`. The two values are recorded in the manifest's `[github]` section,
+so later runs need no flags. Use `--platforms linux/arm64` to build on an arm64 runner for an arm64 server;
+a native workflow builds one architecture at a time. It has no quality job of its own, so run your tests in
+the build command or in a separate workflow.
+
+## One command for the first run
+
+After the server is registered and bootstrapped, `shiplord setup` runs the per-application steps in order:
+
+```sh
+shiplord setup --server production --api-domain orders-api.example.com \
+  --frontend https://orders.example.com \
+  --env-file .env.production \
+  --registry-username bot --token-file token \
+  --repo owner/orders
+```
+
+It configures the application (when `ship.toml` is missing), provisions the account, sets the environment,
+creates the registry pull login, writes the CI key, secret, variables and workflow, and finishes with
+`github check-ci`. Omitted inputs are skipped: without `--env-file` the environment is left unchanged, and
+without `--registry-username` no pull login is created. `--skip-ci` stops after the local steps; pass `--repo` or
+`--image-repository` too, because provision still needs to know where the image will live.
+
+Completed steps are observed, not remembered. A re-run skips a step whose result is already present (the
+manifest, the application's registration, the named environment keys, the recorded registry login, the CI
+state) and starts at the first one that is not. An observation that cannot be read counts as incomplete; every
+step is idempotent, so repeating it is safe. `--rerun` repeats the repeatable steps. `configure` is never
+repeated because `ship.toml` is never replaced.
+
+`setup` does not commit or push. `github setup` writes the workflow, but `check-ci` can only dispatch it once
+`.github/workflows/shiplord-release.yml` and `ship.toml` are on the deployment branch. On a first run, commit
+and push them, then run `shiplord setup` again; it resumes at `check-ci`. The final check exits non-zero when
+CI cannot reach the server. `github setup` refuses generic Docker applications (see below), so use `--skip-ci`
+and a custom workflow for those.
+
 ## Existing Docker applications
 
 Use the generic profile to deploy an existing image without Google ADK settings. In a terminal, run
@@ -175,19 +247,65 @@ An image can serve both its website and API at the configured hostname.
 Both profiles receive `HOST`, `PORT`, and `LOG_LEVEL`. Only `google-adk` receives Shiplord's `AGENT_DIR`,
 `AGENT_NAME`, `RELOAD_AGENTS`, `SERVE_WEB_INTERFACE`, and `ALLOW_ORIGINS` settings. Generic images keep
 their own defaults for those five variables and must implement their own CORS behavior when needed.
-All managed variable names remain reserved in `shiplord env set`, including ADK names, because environment
-files belong to the application and can survive a profile change.
+All managed variable names remain reserved in `shiplord env set` and `shiplord env unset`, including ADK names,
+because environment files belong to the application and can survive a profile change.
 
 `configure` defaults to `google-adk` for compatibility. `init` still scaffolds only `google-adk`, and native
 binaries still require that profile. `github setup` generates the ADK template's workflow and refuses generic
 applications before creating keys or changing GitHub; use a custom workflow that builds your image, runs
-your application's checks, and invokes `shiplord deploy` by digest.
+your application's checks, and invokes `shiplord deploy` by digest. A native application needs its build
+command and binary path; a `[github]` section that predates them is refused with the two lines to add.
 
 The CLI requires the helper capability `docker_generic_v1` before submitting a generic plan or deploy.
 Upgrade with `shiplord server bootstrap` when it is missing. Do not downgrade to a helper that cannot read
 generic release records. Changing the profile replaces the container even with the same image, commit,
 and sequence; rollback and journal recovery restore the recorded profile. Containers without a profile
 label are interpreted as legacy `google-adk` containers.
+
+## Image registries
+
+Shiplord pulls images from GitHub Container Registry (`ghcr.io`) and Docker Hub (`docker.io`). A
+`[github]` table means GHCR: `repository = "owner/name"` allows `ghcr.io/owner/name`. To deploy an image
+that lives on Docker Hub, name it in its own table:
+
+```toml
+[image]
+repository = "docker.io/example/orders"
+```
+
+Exactly these repository forms are accepted, and each is stored in one spelling:
+
+| Written | Stored |
+| --- | --- |
+| `ghcr.io/owner/name` | `ghcr.io/owner/name` |
+| `docker.io/namespace/name` | `docker.io/namespace/name` |
+| `docker.io/library/name` | `docker.io/library/name` |
+| `name` (a Docker Hub official image) | `docker.io/library/name` |
+
+A bare `owner/name` without a host is refused: it could be a GitHub owner/repository or a Docker Hub
+namespace, and guessing would allowlist an image you did not name. `docker.io/name` is refused for the
+same reason: write `docker.io/library/name` or just `name`. No other registry is supported yet, and a
+repository never carries a tag, a port, a scheme, or credentials. `[image]` and `[github]` may both be
+present only when they name the same GHCR repository.
+
+Every deploy is pinned by digest, for either registry:
+
+```sh
+shiplord deploy --image docker.io/example/orders@sha256:<digest> --commit <sha>
+```
+
+For a private image, store a read-only pull login for the registry that serves it. The token comes from a
+file or stdin, never from the command line, and is never printed:
+
+```sh
+shiplord registry login --username <account> --token-file token.txt --registry docker.io
+```
+
+Docker Hub credentials are written under the key Docker looks up (`https://index.docker.io/v1/`), so they
+are found when the image is pulled. `shiplord registry status` lists registry hosts and usernames only.
+
+`github setup` still generates a workflow that publishes to GHCR, because a Docker Hub push needs
+credentials Shiplord does not manage; for a Docker Hub image, use your own workflow and `shiplord deploy`.
 
 ## Persistent storage (Docker)
 
@@ -212,12 +330,36 @@ slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`,
 - Using `[storage]` needs a helper that advertises `docker_storage_v1`; a newer CLI refuses to submit it to an
   older helper (re-run `shiplord server bootstrap`). A helper must not be downgraded after deploying records that
   use `[storage]`.
-- `owner_uid` / `owner_gid` are validated but **not yet supported**: the helper rejects them, because establishing
-  ownership safely needs a pinned initializer image that has not been built and reviewed.
+- `owner_uid` / `owner_gid` are **not supported** and are refused when `ship.toml` is loaded, never at deploy:
+  establishing ownership safely needs a pinned initializer image that has not been built and reviewed. Have the
+  image establish the mount directory's ownership during its build instead.
 - An image can establish the mount directory's ownership during its build. Verify a fresh volume is writable
   by the image's application user with real Docker before deployment. Shiplord does not repair existing
   volume permissions, and changing the mount path does not migrate data from another application.
 
+## Runtime limits and readiness
+
+```toml
+[resources]
+memory_mb = 512
+cpu_limit = 0.5                    # CPUs, 0.01-64; default: no CPU limit
+
+[deploy]
+init = true                        # Docker only; run an init process as PID 1
+readiness_status = 204             # HTTP status that means ready; 100-599, default 200
+readiness_interval_seconds = 5     # seconds between readiness polls; 1-60, default 1
+```
+
+- `resources.cpu_limit` reaches Docker as `--cpus`. It is a number of CPUs, so `0.5` is half a CPU and `2` is two.
+  It is refused for native applications, whose systemd unit has no matching setting yet.
+- `deploy.init` adds Docker's `--init`, so an init process reaps orphaned children and forwards signals. The flag
+  is only added when the value is `true`; omitting it keeps the previous behaviour. It is refused for native
+  applications.
+- `readiness_status` is the one HTTP status that counts as ready, including in the post-deploy public HTTPS check.
+  `readiness_interval_seconds` is the pause between polls; `deploy.readiness_timeout_seconds` still bounds the whole
+  wait. Both apply to Docker and native releases, and omitting them keeps 200 and one second.
+- These settings need a helper that advertises `runtime_knobs_v1`; re-run `shiplord server bootstrap` when a newer
+  CLI refuses to submit them. An older helper also refuses them, because its manifest validator rejects unknown keys.
 ## Application data
 
 Each application gets exactly one persistent location, and Shiplord leaves it alone. This is the supported
@@ -307,14 +449,53 @@ shutdown_timeout_action = "fail" # "force" (default) or "fail"
 - The shutdown journal persists the original deadline. Recovery uses the time remaining rather than starting a new
   timeout period.
 
+## Backup and restore
+
+`shiplord backup` archives the application's persistent data on the server; `shiplord restore` puts a verified
+archive back. Both run as a normal job, with the same authorization, audit record, host lock, and exit codes as a
+deploy.
+
+```sh
+shiplord backup --json                      # writes and verifies an archive; nothing is uploaded
+shiplord restore --latest --yes --json      # replace the live data with the newest archive
+shiplord restore --archive shiplord-backup-orders-20260101T120000Z.tar.gz --yes
+```
+
+- An archive is only reported once it has been **read back**: it is written to a private temporary file, synced,
+  renamed into place, reopened, and compared with the data it was made from (entry count and byte total).
+- A restore is only reported once it has been **verified**: the record and checksum are checked, every entry is
+  validated, the contents are extracted beside the live data and counted, and only then is the live directory
+  replaced. The previous data is kept until the replacement has been verified and put back if it cannot be.
+- The application is **stopped** while its data is copied or replaced, so a live database is not archived
+  half-written, and started again afterwards. If it does not come back the job exits 6 (`intervention_required`).
+- Archives live under `/var/lib/shiplord/backups/<application>/` as `shiplord-backup-<app>-<timestamp>.tar.gz` with
+  a `.json` sidecar record. Both are root-owned and `0600`; the directory is `0700`. There is no download command
+  yet: copy an archive off the server by hand if you need an off-host copy.
+- Archives are refused when they are corrupt, truncated, belong to another application or runtime, or contain an
+  absolute path, `..`, a link, a device file, too many entries, or too many bytes. Symbolic links and special files
+  in the live data are refused at backup time for the same reason.
+- Free disk space is checked before an archive is written or extracted; a nearly full disk fails the job before the
+  application is touched.
+- `app.env` and the rest of `/etc/shiplord` are **not** in the archive. It contains only the data directory or the
+  contents of the application's Docker volume. Deprovisioning keeps backups, like it keeps data.
+- A backup or restore is refused while an unfinished deployment transaction exists (`recovery_required`); run
+  `shiplord recover` first.
+- Both are ordinary jobs and share the deploy job's one-hour bound. A job killed at that bound cannot restart the
+  application it stopped, so check `shiplord status` and deploy again if a very large backup is interrupted.
+- Reading a Docker volume's contents needs the daemon's mountpoint to be reachable by the helper, which runs as
+  root on the server. A rootless or remote Docker daemon is not supported by this version.
+
 ## Deploying from GitHub Actions
 
 ```sh
 shiplord github setup --repo owner/orders --tooling-ref <commit of Shiplord pushed to GitHub>
+# add --deployment-branch <branch> when the release branch is not main
 git add .github/workflows/shiplord-release.yml ship.toml && git commit   # merge to the deployment branch
 shiplord github check-ci            # joins Tailscale and logs in with the CI key; builds and deploys nothing
 shiplord github status --check-server
 shiplord github rotate-key
+shiplord github setup --upgrade-workflow   # refresh the action pins in the generated workflows
+shiplord github check-pins                 # confirm every pinned action commit still resolves
 ```
 
 `github setup` uses your authenticated `gh`. It creates a dedicated Ed25519 CI key, registers it on the server,
@@ -324,19 +505,31 @@ stdin) and sets the `SHIPLORD_*` repository variables. It then writes `.github/w
 the template's quality checks, an image build, and `shiplord deploy` by digest from a runner joined to your tailnet.
 It is resumable, keeps the private key only until GitHub has it, and never uploads your personal key.
 
-Two things stay with you because they need authority Shiplord does not have: the **Tailscale trust credential** and
-**DNS**. For Tailscale, `github setup` guides you instead: it reads the OIDC subject GitHub will actually present (repositories
-with immutable subjects use `repo:Owner@<id>/name@<id>`, not the plain names), prints the policy line and the
-credential settings with every value filled in, asks for the client ID and audience (not secrets), checks they belong
-together, and saves them so the next application's setup does not ask again. Use the owner-wide subject it suggests,
-`repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every repository. `--tailscale-client-id` and
-`--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
+Two things need authority Shiplord does not have by default: the **Tailscale trust credential** and **DNS**. For
+Tailscale, set `TAILSCALE_API_KEY` to a Tailscale API token that may create federated identities and `github setup`
+creates the credential itself, with the owner-wide subject, then stores the client ID and audience. The token is used
+for that one request and is never saved or printed. Without a token, `github setup` guides you instead: it reads the
+OIDC subject GitHub will actually present (repositories with immutable subjects use `repo:Owner@<id>/name@<id>`, not
+the plain names), prints the policy line and the credential settings with every value filled in, asks for the client
+ID and audience (not secrets), checks they belong together, and saves them so the next application's setup does not
+ask again. Use the owner-wide subject it suggests, `repo:Owner@<id>/*:ref:refs/heads/<deployment branch>` (main
+unless `[github] deployment_branch` says otherwise), to do this once for every repository.
+`--tailscale-client-id` and `--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with
+a check-only run. The generated workflow pins every action to a commit, never cancels a running
 production deploy, and gives `id-token: write` only to the jobs that need it. `rotate-key` adds and proves a new key,
 updates GitHub, and only then revokes the old one. It finds the key to replace in the server's authorized-keys list,
 so it works from a machine that never ran `github setup`; local setup state is kept per server and application.
 
 CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY`, `SHIPLORD_SSH_KNOWN_HOSTS_FILE`
 (and optionally `SHIPLORD_SSH_PORT`) replace the server alias, and SSH ignores `~/.ssh/config` entirely.
+
+The pins themselves age. `github setup --upgrade-workflow` rewrites the `uses:` lines of the workflows Shiplord
+generated with the pins the installed Shiplord carries, and changes nothing else: the deployment branch, the
+pinned Shiplord commit, the quality job, and your own edits stay as they are. It refuses a file that does not
+carry Shiplord's generated header, so a hand-written workflow is never touched, and it writes nothing unless
+every file in the pipeline is accepted. `github check-pins` asks the GitHub API whether each pinned commit still
+exists **in that action's own repository**; it reads `GITHUB_TOKEN` or `GH_TOKEN` from the environment (there is
+no `--token` option) and reports a pin it could not ask about as unverified, never as resolving.
 
 ### The Shiplord deploy action
 
@@ -396,17 +589,22 @@ reach the run page or the calling job.
 | `server remove <alias>` | Delete an alias. Refuses while the current directory's `ship.toml` names it. |
 | `server rename <old> <new>` | Rename an alias. Refuses when the new alias already exists. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
-| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
+| `server uninstall <alias> [--force]` | Remove the helper, launchers, sshd drop-in, and Caddy import. Keeps application data. |
+| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal; `--json` never prompts). |
+| `setup` | Run configure, provision, env, registry login, github setup, and check-ci in order; resume at the first incomplete step. |
 | `provision [--update]` | Create the application's account, state, port, and key access on the server. `--update` applies a changed hostname or memory ceiling without removing state or keys. |
-| `env set --from-file F` / `env diff --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `diff` previews the key names it would add or remove without reading values; `keys` lists names only. |
+| `env set --from-file F` / `env set KEY=VALUE` / `env unset KEY` / `env diff --from-file F` / `env keys` / `env clear` | Manage runtime environment. Whole-file `set` refuses an empty file; one-key edits keep every other line byte-identical; `unset` is idempotent; `diff` previews the key names it would add or remove without reading values; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
-| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
+| `release [--image-repository R] [--tag T] [--platform P]` | Build and push this checkout, then deploy the pushed digest. Refuses a dirty tree. |
+| `status`, `logs --tail N [--since D] [--timestamps] [--follow --timeout S]` | Release state, running state, unfinished work; the current release's bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
-| `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
-| `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
-| `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, Docker, disk, each application); every registered server read-only; access, helper, DNS. |
+| `backup` / `restore --archive N \| --latest --yes` | Write and verify an archive of the application's data; replace live data with a verified archive. |
+| `registry login --username U --token-file F \| --token-stdin [--registry ghcr.io\|docker.io]` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
+| `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
+| `github setup --upgrade-workflow` / `check-pins` | Refresh the action pins in the generated workflows; confirm each pinned commit still resolves in its repository. |
+| `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, ports once deployed, Docker when needed, disk, each application's state and consistency); every registered server read-only; access, helper, DNS. |
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete
 environments.
@@ -429,12 +627,13 @@ not edit any manifest, so a manifest that names the old alias must be updated to
 
 ## What a deployment does
 
-1. The helper checks the request against the application's registration (hostname, runtime, image repository)
-   and refuses anything that would change them.
+1. The helper checks the request against the application's registration (hostname and any additional hostnames,
+   runtime, image repository) and refuses anything that would change them.
 2. **Prepare, without touching the running app:** pull the image by digest (platform and revision label
    verified) or verify and install the uploaded binary. A failure here changes nothing.
 3. **Journal** the transaction, replace the runtime (a brief restart window), poll the readiness path.
-4. Apply the Caddy route only if it changed, verify the active configuration routes the hostname, then commit.
+4. Apply the Caddy route only if it changed, verify the active configuration serves the hostname and redirects
+   every additional hostname to it, then commit.
 5. On any failure, restore the last committed release, verify it, and only then clear the journal. The command
    still exits nonzero. A first release that fails leaves no runtime and no route.
 6. A candidate that failed leaves nothing behind; the image or binary of a release that leaves the
@@ -469,7 +668,8 @@ the same environment file that just failed. Fix the value and run `shiplord reco
 - Per-application deployment accounts; authorized keys are root-owned and carry `command=...,restrict`.
 - The dispatcher never evaluates the client's command line; sudo permits one fixed helper with no arguments.
 - Application ports bind to loopback only; Caddy is the only public entry point.
-- Runtime environment files are root-only; secrets never appear in argv, logs, results, or generated files.
+- Runtime environment files are root-only. Shiplord never prints or logs a value. `env set KEY=VALUE` puts that
+  value in your shell history and local process list; use `env set --from-file` (or `--from-file -`) for secrets.
 - Host keys are pinned (`StrictHostKeyChecking=yes`); a changed key fails closed.
 - Containers run with a memory limit, bounded logs, `no-new-privileges` and all capabilities dropped; native
   services run as a separate unprivileged account with `ProtectSystem=strict` and no capabilities.

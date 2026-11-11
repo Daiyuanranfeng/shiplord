@@ -25,14 +25,15 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import FakeCaddy  # noqa: E402
-from shiplord import registry, release_state  # noqa: E402
+from shiplord import registries  # noqa: E402
+from shiplord.backup import BackupManager, read_manifest  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import Probes  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION  # noqa: E402
 from shiplord.privileged_host import serve  # noqa: E402
-from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  # noqa: E402
+from shiplord.registry import PORT_RANGE, Registry, port_is_free, validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
 from shiplord.routing import RoutingError  # noqa: E402
@@ -137,8 +138,22 @@ class RealDockerDeployTests(unittest.TestCase):
     def setUpClass(cls):
         docker("info")
         cls.app = "fixture-" + secrets.token_hex(3)
-        for target, pattern in ((release_state, "_IMAGE"), (registry, "_REPOSITORY")):
-            patcher = patch.object(target, pattern, IMAGE_PATTERN if pattern == "_IMAGE" else REPOSITORY_PATTERN)
+        # The fixture registry is a localhost port, which the shipped policy does not accept. Only the host
+        # rule is replaced; the digest rule and every other check still run.
+        original_repository, original_pinned = registries.validate_repository, registries.validate_pinned
+
+        def local_repository(value):
+            if isinstance(value, str) and REPOSITORY_PATTERN.fullmatch(value):
+                return value
+            return original_repository(value)
+
+        def local_pinned(value):
+            if isinstance(value, str) and IMAGE_PATTERN.fullmatch(value):
+                return value
+            return original_pinned(value)
+
+        for name, replacement in (("validate_repository", local_repository), ("validate_pinned", local_pinned)):
+            patcher = patch.object(registries, name, replacement)
             patcher.start()
             cls.addClassCleanup(patcher.stop)
         cls.temp = tempfile.TemporaryDirectory()
@@ -318,7 +333,8 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIn("fixture crashing on purpose", crashing.detail["candidate_logs"]["output"])
         self.assertEqual(crashing.detail["candidate_logs"]["tail"], 100)
         self.assertEqual(self.get("/version"), "v2")
-        self.assertIn("fixture started version=v2", self.runtime.logs(self.registration, 50))  # the restored release
+        self.assertIn("fixture started version=v2",
+                      self.runtime.logs(self.registration, self.state.read_state()["current"], 50))  # restored release
         self.assertEqual(self.state.read_state()["current"]["commit"], "b" * 40)
         self.assertIsNone(self.state.read_journal())
 
@@ -342,8 +358,24 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(self.get("/version"), "v1")
         self.assertIsNone(self.state.read_journal())
 
-        logs = self.runtime.logs(self.registration, 50)
+        logs = self.runtime.logs(self.registration, self.state.read_state()["current"], 50, timestamps=True)
         self.assertIn("fixture started version=v1", logs)
+        self.assertRegex(logs, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")  # timestamps are real, not invented
+
+        # A stopped container of another release is never read, even when docker lists it first.
+        stale = docker("run", "-d", "--label", f"shiplord.app={self.app}", "--label", "shiplord.release=000000000000",
+                       self.images["v1"]["image"], "sh", "-c", "echo stale-release").stdout.strip()
+        try:
+            self.assertNotIn("stale-release", self.runtime.logs(self.registration, self.state.read_state()["current"], 50))
+        finally:
+            docker("rm", "-f", stale, check=False)
+
+        # Following is bounded by its own deadline, and it starts from --since.
+        chunks = []
+        self.assertEqual(self.runtime.follow_logs(self.registration, self.state.read_state()["current"], tail=10,
+                                                  since="1h", timestamps=True, duration=2, emit=chunks.append),
+                         "timeout")
+        self.assertIn("fixture started version=v1", "".join(chunks))
 
         # preparation failures leave the running container untouched
         before = self.containers()
@@ -686,6 +718,58 @@ class RealDockerDeployTests(unittest.TestCase):
         with self.lock.acquire():
             return self.deployer.rollback(request_id)
 
+    def manager(self):
+        return BackupManager(registration=self.registration, state=self.state, runtime=self.runtime,
+                             layout=self.layout)
+
+    def wipe_data(self):
+        """Delete the volume's contents as a lost disk would; the container keeps running with nothing to read."""
+        data_root = self.runtime.data_root(self.registration)
+        for entry in data_root.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        self.assertEqual(list(data_root.iterdir()), [])
+
+    def test_zzz_backup_wipe_and_restore_round_trip(self):
+        """Back up, destroy the data, restore it, and refuse a corrupt archive without touching live data."""
+        self.assertOutcome(self.deploy("req-b1", "v1", 9000), "succeeded")
+        before_rows = json.loads(self.get("/sqlite"))
+        before_counter = int(self.get("/counter"))
+        with self.lock.acquire():
+            backed_up = self.manager().backup()
+        self.assertOutcome(backed_up, "succeeded")
+        self.assertTrue(backed_up.detail["verified"])
+        name = backed_up.detail["archive"]
+        archive = self.layout.backups / self.app / name
+        self.assertEqual(oct(archive.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(read_manifest(archive.with_name(name + ".json")).archive, name)
+
+        self.wipe_data()
+        with self.lock.acquire():
+            restored = self.manager().restore({"archive": name})
+        self.assertOutcome(restored, "succeeded")
+        self.assertTrue(restored.detail["verified"])
+        self.assertEqual(self.get("/version"), "v1")
+        self.assertEqual(json.loads(self.get("/sqlite")), before_rows + ["v1"])
+        self.assertEqual(int(self.get("/counter")), before_counter + 1)
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
+        with self.lock.acquire():
+            second = self.manager().backup()
+        self.assertOutcome(second, "succeeded")
+        corrupt = self.layout.backups / self.app / second.detail["archive"]
+        with corrupt.open("r+b") as file:
+            file.seek(20)
+            file.write(b"\x00")
+        live_counter = int(self.get("/counter"))
+        with self.lock.acquire():
+            refused = self.manager().restore({"archive": second.detail["archive"]})
+        self.assertOutcome(refused, "failed")
+        self.assertEqual(refused.detail["error"], "checksum_mismatch")
+        self.assertEqual(int(self.get("/counter")), live_counter + 1)  # the live data was never replaced
+        self.assertEqual(self.get("/version"), "v1")
     # the authorized helper path, for a test that must go through the dispatcher and the worker ----
     def register_application(self):
         """Write the registration the helper reads; it must match the record every deploy in this class used."""
@@ -694,7 +778,7 @@ class RealDockerDeployTests(unittest.TestCase):
         descriptor = os.open(self.layout.registrations, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, descriptor)
         with self.lock.acquire():
-            registration = registry.Registry(descriptor, self.lock).register(
+            registration = Registry(descriptor, self.lock).register(
                 self.app, deployment_uid=1001, deployment_user="ship-fixture", runtime="docker",
                 api_domain="fixture.example.test", image_repository=REPOSITORY,
                 probe=lambda port: port == self.port)

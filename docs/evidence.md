@@ -33,7 +33,7 @@ into it. A row here is not a pass.
 | Real sshd, sudo, useradd, visudo: bootstrap, provisioning, the SSH forced-command path | `tests/linux/run.sh host` | 9/9 passed |
 | Real Docker daemon and registry: the deploy engine, rollback, recovery, retention | `tests/linux/run.sh docker` | 1/1 passed (full deploy/rollback/recovery/retention lifecycle) |
 | The real `shiplord` CLI against real sshd, sudo, Caddy, Docker; two applications; GitHub setup and CI simulation | `tests/linux/run.sh e2e` | 24/24 passed |
-| The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy` | `tests/linux/run.sh systemd` | 13/13 passed |
+| The native lifecycle on real systemd (PID 1), real transient jobs, journald, `systemctl reload caddy`; then a real container reboot with an open journal | `tests/linux/run.sh systemd` | 13/13 passed, then boot recovery 2/2 (interrupt phase) and 5/5 (verify phase, after `docker restart`) |
 | The generated project, against the template's own 1,200-test suite | `uv run pytest tests` in a project made by `shiplord init` | 1,196 passed; 5 failed, of which 2 also fail on the untouched template on this machine and 3 passed when rerun alone (load flakes) |
 
 These counts are from that audit. The unit baseline on `main` at `97047f1` is 1126 tests, 94 skipped
@@ -62,11 +62,13 @@ the latest completed `main` run (42913399156, `97047f1`) had all 12 jobs green. 
 | Logs, status, explicit rollback, interrupted-job recovery | Verified | e2e 07/12/13, systemd 09-11 (client dies; worker is `SIGKILL`ed; `recover` restores). |
 | Failed releases return nonzero and preserve or restore the last good release | Verified | Docker lifecycle and e2e 09 (exit 5); systemd 06/07 (including a kernel OOM kill). |
 | CI key creation, repository configuration, safe rotation | Setup verified with the real `gh` and GitHub; rotation against a stand-in `gh` | Real server run below: `github setup` against a private repository (secret, variables, key proven over Tailscale SSH). `test_github`; e2e 16-20 for wrong host keys and rotation. |
+| Tailscale trust credential created by `github setup` | Request shape verified against a fake transport; no real Tailscale call | `test_tailscale`, `test_github`, `test_cli` assert the federated-key payload, the owner-wide subject, and that the token never reaches output or an error. A real run needs a token that may create federated identities. |
+| The owner-wide subject covers a second repository | **Unverified against Tailscale** | `test_tailscale` records the documented `*` semantics only. A `github check-ci` run from a second repository is still needed; the pattern is unchanged until then. |
 | A real GitHub push completes the full path through Tailscale/OpenSSH | Verified on a real server | Real server run below: a merge to `main` built the binary on a GitHub-hosted runner, joined the tailnet through OIDC, and deployed with the CI key (`gh-40839230420-2`). |
 | No personal private key is uploaded; host trust is pinned | Verified | `test_github` (the secret is the dedicated key; no key material in results, state, or arguments); CI mode ignores `~/.ssh/config` (found and fixed by e2e 19); host keys come over the trusted connection. |
 | Deployment privileges scoped to the registered application and helper | Verified | Real sudo/sshd: `test_host_integration` (account cannot write its own access, cannot use admin), e2e 15 and 24 (each login refused for the other application). |
 | Secret values absent from repository files, normal output, artifacts | Verified for the paths tested | Env, registry token, CI key, sudo password: never in argv, results, state, or errors (`test_provision`, `test_commands`, `test_github`, `test_client`). The generated workflow passes secrets only through `env:`. |
-| Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
+| Resource limits, finite timeouts, log limits, retention active | Verified | Container memory/log/pids/caps flags and `MemoryMax` enforced by the kernel; `--cpus`/`--init` and configurable readiness status/interval covered by unit tests (not real Docker); readiness, command, lock, and upload deadlines; job pruning; image/binary retention including failed candidates. journald's own size limits are the host default. |
 | Required local, Linux, failure, and live-workflow tests pass with recorded evidence | Partly | CI now runs the real-host suites and the latest observed `main` run is green; the live workflow was one native app. This is not a `tests/linux/run.sh all` run; see `release-gate.md` criterion 1. |
 | README and AGENTS.md let a fresh agent release and interpret failures | Written, not field-tested | `README.md`, `AGENTS.md`, the generated `SHIPLORD.md`; no fresh agent was run against them. |
 | No additional continuously running deployment service | Verified by construction | Only jobs run, as transient units that exit; there is no daemon. |
@@ -90,12 +92,15 @@ the latest completed `main` run (42913399156, `97047f1`) had all 12 jobs green. 
 | Older queued deployment | `test_deploy`, e2e 10 |
 | SSH disconnect during deployment | systemd 09 (client killed; the transient unit finishes) |
 | Helper killed mid-deploy | systemd 10 (worker `SIGKILL`ed; journal; `recover`), Docker lifecycle (simulated kill) |
+| Helper killed mid-deploy, then the host reboots | `tests/linux/run.sh systemd`: the worker is `SIGKILL`ed, the container is restarted, and `shiplord-boot-recovery.service` finishes the transaction at boot (journal closed, committed release serving, no person ran `recover`) |
 | Incompatible helper version | `test_protocol`, `test_helper_actions`, `test_provision` |
 | Private-key upload to GitHub fails | `test_github` (setup resumes; rotation leaves the old key working) |
 | Rollback itself fails | `test_deploy` (exit 5, previous restored; exit 6 when restoration fails) |
 
-A real machine reboot was not tested and must not be done to your server for testing; behavior after power loss is
-unverified. This is still true on `main`; see [`release-gate.md`](release-gate.md) criterion 3.
+A real machine reboot was not performed. A container reboot with real systemd as PID 1 was: `tests/linux/run.sh
+systemd` leaves an interrupted transaction's journal open, restarts the container, and
+`shiplord-boot-recovery.service` finishes that transaction during boot. An unclean power loss, and a host whose
+disk is lost mid-fsync, remain unverified. See [`release-gate.md`](release-gate.md) criterion 3.
 
 ## What running it for real found
 
@@ -151,8 +156,9 @@ What it found:
   rather than allocating a TTY; requests are frames, so secrets never touch argv.
 - **Architectures:** native binaries may be `linux-amd64` or `linux-arm64`; the server accepts only its own.
 - **Names:** repository variables and secrets use a `SHIPLORD_` prefix instead of `SHIP_`.
-- **Workflow generation** covers Docker applications. A native application gets the CI key, secret, and variables, but
-  you call `shiplord deploy --binary` from your own build job.
+- **Workflow generation** covers Docker applications and native binaries. A native workflow runs the build command
+  recorded in `[github]`, uploads the binary as an artifact, and deploys it with `shiplord deploy --binary`; it is
+  covered by unit tests, but no GitHub Actions run of a generated native workflow has been observed yet.
 - **`doctor --server`** is a cheap protocol probe by default; `--deep` adds the sudo-backed health report.
 - **Registry pull logins** are per application, read-only, and stored root-only; only `ghcr.io` is accepted.
 
@@ -165,14 +171,15 @@ What it found:
   candidate that asked for another path, and returns to the legacy path; one volume throughout.
 - Real Docker: `test_z_image_declared_volume_does_not_break_readiness_or_release_identity` deploys an image declaring
   `VOLUME /scratch`; readiness and release identity still pass with Docker's additional anonymous mount.
-- Not done: ownership initialization (`owner_uid`/`owner_gid` are rejected by the helper), the non-root UID 10001
-  fixture, interruption tests around volume creation, and proof that the path-only restoration regression fails on the
-  baseline in real Docker (the unit test shows it at the `is_running` boundary). A legacy unlabelled volume is accepted
-  only when a retained Shiplord container proves the exact volume; that proof is tied to the inspected volume identity
-  in the transaction journal.
+- Not done: ownership initialization (`owner_uid`/`owner_gid` are refused at manifest validation, so a request that
+  smuggles them is refused before a plan or job), the non-root UID 10001 fixture, interruption tests around volume
+  creation, and proof that the path-only restoration regression fails on the baseline in real Docker (the unit test
+  shows it at the `is_running` boundary). A legacy unlabelled volume is accepted only when a retained Shiplord
+  container proves the exact volume; that proof is tied to the inspected volume identity in the transaction journal.
 - **Explicit ownership initialization remains blocked** until a pinned initializer image is reviewed and a fresh
-  volume is proven writable by UID 10001 in the real-Docker suite. The helper continues to reject
-  `owner_uid`/`owner_gid` until both prerequisites pass. An image that establishes the directory's ownership during
+  volume is proven writable by UID 10001 in the real-Docker suite. `validate_storage` refuses
+  `owner_uid`/`owner_gid` while loading `ship.toml` (`tests/test_runtime_knobs.py`, `tests/test_storage.py`), so the
+  setting cannot be accepted and then refused at deploy. An image that establishes the directory's ownership during
   its build can instead use path-only storage, after an application-specific fresh-volume check.
 - Separate local application evidence (2026-10-30): Handwriting Studio commit
   `9502a77beb81dc1182ac14ba4a0543d2a28496cd`, Linux amd64 image
@@ -180,6 +187,16 @@ What it found:
   `10001:10001` on a fresh `/data` volume through the Docker runtime adapter. This proof is outside the repository's
   CI suite; it does not establish permissions on an existing volume, general initialization support, remote helper
   recovery, or a production deployment.
+
+## Runtime knobs
+
+- Unit: `tests/test_runtime_knobs.py` checks manifest validation (bounds, native refusal, unknown keys), that
+  `resources.cpu_limit` and `deploy.init` reach the `docker run` command line, that a configured readiness status and
+  interval drive `probes` for stored releases, that storage ownership is refused while the manifest loads, and the
+  `runtime_knobs_v1` negotiation. `tests/test_storage.py` and `tests/test_probes.py` cover the moved refusal and the
+  unchanged defaults.
+- Not done: real Docker execution of `--cpus` and `--init`, and a readiness poll against a live container. The
+  command line and the polling loop are covered by unit tests only; `tests/linux/run.sh docker` was not run here.
 
 ## Generic Docker profile
 
@@ -275,4 +292,5 @@ Still open:
 - CI installs Shiplord's own dependencies unpinned (`pip install -e .`); a new release of one could change CI results.
 - Native services can still connect to other loopback services (only binding is restricted), and Docker applications share
   the default bridge network; see the README's *Limits of the confinement*.
-- Behavior across reboot or power loss; two truly concurrent deployments; a genuinely full disk.
+- Behavior across an unclean power loss (the reboot test uses a clean `docker restart`); two truly concurrent
+  deployments; a genuinely full disk.

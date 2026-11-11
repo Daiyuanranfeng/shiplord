@@ -11,8 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import shiplord
-from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
-                                SSHD_DROPIN, BootstrapError, bootstrap, helper_modules, python_supported)
+from shiplord.installer import (BOOT_UNIT, CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
+                                SSHD_DROPIN, BootstrapError, boot_recovery_unit, bootstrap, collect_old_versions,
+                                helper_modules, python_supported, remove_boot_recovery)
 from shiplord.layout import Layout, deployment_user
 from shiplord.routing import RoutingError
 from shiplord.system import TRUNCATION_MARKER, CommandResult
@@ -45,6 +46,9 @@ class FakeSystem:
         self.results = {}
         self.units = {"ssh.service"}
         self.active = set()
+        self.enabled = set()  # units `systemctl enable` has been asked to enable
+        self.enable_error = None
+        self.reload_error = None
         self.accounts = {}  # name -> passwd comment
         self.groups = {}  # name -> members
         self.truncate_passwd = False
@@ -58,6 +62,18 @@ class FakeSystem:
             if command == "list-unit-files":
                 listed = [unit for unit in argv[2:] if unit in self.units]
                 return CommandResult(0 if listed else 1, "".join(f"{unit} enabled enabled\n" for unit in listed))
+            if command == "is-enabled":
+                return CommandResult(0 if argv[-1] in self.enabled else 1, "")
+            if command == "enable":
+                if self.enable_error is not None:
+                    return self.enable_error
+                self.enabled.add(argv[-1])
+                return CommandResult(0, "")
+            if command == "disable":
+                self.enabled.discard(argv[-1])
+                return CommandResult(0, "")
+            if command == "daemon-reload":
+                return self.reload_error if self.reload_error is not None else CommandResult(0, "")
             if command == "is-active":
                 return CommandResult(0 if argv[-1] in self.active else 3, "")
             return self.results.get(argv[-1], CommandResult(0, ""))
@@ -119,6 +135,10 @@ class InstallerTestCase(unittest.TestCase):
         self.os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
+        self.systemd = True
+        patcher = patch("shiplord.installer.systemd_running", lambda: self.systemd)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_bootstrap(self, source=SOURCE):
         return bootstrap(self.layout, source, self.system, self.caddy)
@@ -153,7 +173,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertTrue(all(result["changed"].values()), result)
         layout = self.layout
         for path, mode in ((layout.registrations, 0o700), (layout.environments, 0o700), (layout.app_state, 0o700),
-                           (layout.jobs, 0o700), (layout.authorized_keys, 0o755), (layout.var, 0o755)):
+                           (layout.jobs, 0o700), (layout.backups, 0o700), (layout.authorized_keys, 0o755),
+                           (layout.var, 0o755)):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
         current = layout.lib / "current"
         self.assertEqual(os.readlink(current), result["version"])
@@ -161,7 +182,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertFalse((current / "shiplord" / "cli.py").exists())
         self.assertIn("from shiplord.privileged_host import main", (current / "host_launcher.py").read_text())
         for wrapper, launcher in ((layout.host, "host_launcher.py"), (layout.admin, "admin_launcher.py"),
-                                  (layout.worker, "worker_launcher.py"), (layout.dispatch, "dispatch_launcher.py")):
+                                  (layout.worker, "worker_launcher.py"), (layout.boot, "boot_launcher.py"),
+                                  (layout.dispatch, "dispatch_launcher.py")):
             self.assertEqual(stat.S_IMODE(wrapper.stat().st_mode), 0o755)
             self.assertEqual(wrapper.read_text(),
                              f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B {layout.lib}/current/{launcher} "$@"\n')
@@ -179,7 +201,7 @@ class BootstrapTests(InstallerTestCase):
 
     def test_the_installed_wrappers_run_the_interpreter_the_probe_checks(self):
         self.run_bootstrap()
-        for wrapper in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.dispatch):
+        for wrapper in (self.layout.host, self.layout.admin, self.layout.worker, self.layout.boot, self.layout.dispatch):
             self.assertIn(f"exec {SERVER_PYTHON} -I -S -B ", wrapper.read_text())
 
     def test_second_run_changes_nothing(self):
@@ -191,7 +213,8 @@ class BootstrapTests(InstallerTestCase):
         self.assertFalse(any(second["changed"].values()), second)
         self.assertEqual({str(p): p.read_bytes() for p in self.prefix.rglob("*") if p.is_file()}, before)
         self.assertEqual([[call[0].rsplit("/", 1)[-1], *call[1:2]] for call in self.system.calls[calls:]],
-                         [["systemctl", "list-unit-files"], ["getent", "group"], ["getent", "passwd"]])
+                         [["systemctl", "list-unit-files"], ["systemctl", "is-enabled"],
+                          ["getent", "group"], ["getent", "passwd"]])
         self.assertEqual(self.caddy.reloaded, 1)
 
     def test_changed_code_installs_a_new_version_and_keeps_the_old_one(self):
@@ -287,6 +310,180 @@ class BootstrapTests(InstallerTestCase):
         self.assertNotIn(["/usr/sbin/sshd", "-t"], self.system.calls)
 
 
+class BootRecoveryUnitTests(InstallerTestCase):
+    """The unit that finishes an interrupted deploy after a restart."""
+
+    @property
+    def unit(self):
+        return self.layout.systemd_units / BOOT_UNIT
+
+    def test_bootstrap_installs_and_enables_it(self):
+        result = self.run_bootstrap()
+        self.assertTrue(result["changed"]["boot_recovery"], result)
+        self.assertEqual(stat.S_IMODE(self.unit.stat().st_mode), 0o644)
+        self.assertEqual(self.unit.read_bytes(), boot_recovery_unit(self.layout))
+        self.assertIn(["/usr/bin/systemctl", "daemon-reload"], self.system.calls)
+        self.assertIn(["/usr/bin/systemctl", "enable", BOOT_UNIT], self.system.calls)
+        self.assertIn(BOOT_UNIT, self.system.enabled)
+
+    def test_it_runs_once_per_boot_after_docker_and_caddy_and_reports_to_the_journal(self):
+        self.run_bootstrap()
+        text = self.unit.read_text()
+        self.assertIn("Type=oneshot", text)
+        self.assertIn(f"ExecStart={self.layout.boot}", text)
+        self.assertIn("Wants=docker.service caddy.service", text)
+        self.assertIn("After=docker.service caddy.service", text)
+        self.assertIn("StandardOutput=journal", text)
+        self.assertIn("StandardError=journal", text)
+        self.assertIn("WantedBy=multi-user.target", text)
+        self.assertIn(f"ConditionPathIsDirectory={self.layout.app_state}", text)
+        # Bounded: a timeout, and a start-rate limit so a restart loop cannot recover without limit.
+        self.assertIn("TimeoutStartSec=", text)
+        self.assertIn("StartLimitIntervalSec=", text)
+        self.assertIn("StartLimitBurst=", text)
+        self.assertNotIn("Restart=", text)  # a oneshot that exits must not be restarted
+        self.assertNotIn("Requires=", text)  # a host whose Docker failed still has to boot
+
+    def test_a_repeat_bootstrap_neither_rewrites_nor_reenables_it(self):
+        self.run_bootstrap()
+        calls = len(self.system.calls)
+        second = self.run_bootstrap()
+        self.assertFalse(second["changed"]["boot_recovery"], second)
+        self.assertEqual([[call[0].rsplit("/", 1)[-1], *call[1:2]] for call in self.system.calls[calls:]],
+                         [["systemctl", "list-unit-files"], ["systemctl", "is-enabled"],
+                          ["getent", "group"], ["getent", "passwd"]])
+
+    def test_a_unit_that_is_present_but_disabled_is_enabled(self):
+        self.run_bootstrap()
+        self.system.enabled.discard(BOOT_UNIT)
+        self.assertTrue(self.run_bootstrap()["changed"]["boot_recovery"])
+        self.assertIn(BOOT_UNIT, self.system.enabled)
+
+    def test_a_host_without_systemd_running_still_gets_the_unit_file(self):
+        self.systemd = False
+        result = self.run_bootstrap()
+        self.assertTrue(result["changed"]["boot_recovery"], result)
+        self.assertTrue(self.unit.exists())
+        commands = [call[1] for call in self.system.calls if call[0] == "/usr/bin/systemctl"]
+        self.assertNotIn("daemon-reload", commands)
+        self.assertNotIn("enable", commands)
+
+    def test_a_rejected_reload_fails_bootstrap_without_a_path(self):
+        self.system.reload_error = CommandResult(1, "Failed to reload daemon: Access denied")
+        with self.assertRaises(BootstrapError) as raised:
+            self.run_bootstrap()
+        self.assertNotIn(self.temp.name, str(raised.exception))
+
+    def test_a_rejected_enable_fails_bootstrap(self):
+        self.system.enable_error = CommandResult(1, "Failed to enable unit")
+        with self.assertRaisesRegex(BootstrapError, "enable the boot recovery unit"):
+            self.run_bootstrap()
+
+    def test_uninstall_removes_it_and_does_nothing_the_second_time(self):
+        self.run_bootstrap()
+        self.assertTrue(remove_boot_recovery(self.layout, self.system))
+        self.assertFalse(self.unit.exists())
+        self.assertNotIn(BOOT_UNIT, self.system.enabled)
+        self.assertIn(["/usr/bin/systemctl", "disable", BOOT_UNIT], self.system.calls)
+        self.assertFalse(remove_boot_recovery(self.layout, self.system))
+
+    def test_uninstall_leaves_application_state_alone(self):
+        self.run_bootstrap()
+        state = self.layout.app_state / "orders"
+        state.mkdir(mode=0o700)
+        (state / "state.json").write_text("{}\n")
+        remove_boot_recovery(self.layout, self.system)
+        self.assertTrue((state / "state.json").exists())
+
+    def test_the_module_the_unit_runs_is_shipped_to_the_server(self):
+        self.assertIn("boot.py", helper_modules(SOURCE))
+        self.run_bootstrap()
+        current = self.layout.lib / "current"
+        self.assertTrue((current / "shiplord" / "boot.py").exists())
+        self.assertIn("from shiplord.boot import main", (current / "boot_launcher.py").read_text())
+
+
+class CollectTests(InstallerTestCase):
+    """A successful bootstrap keeps the current and previous helper versions and collects older ones."""
+
+    def version(self, name, *, complete=True):
+        path = self.layout.lib / name
+        (path / "shiplord").mkdir(parents=True)
+        (path / "shiplord" / "installer.py").write_text("x = 1\n")
+        if complete:
+            (path / ".complete").write_text("")
+        return path
+
+    def age(self, path, marker_mtime_ns):
+        os.utime(path / ".complete", ns=(marker_mtime_ns, marker_mtime_ns))
+
+    def old_versions(self):
+        """Two finished versions older than the installed one, newest first after the current version."""
+        first = self.run_bootstrap()
+        base = (self.layout.lib / first["version"] / ".complete").stat().st_mtime_ns
+        older = self.version("0.1.0-aaaaaaaaaaaa")
+        newer = self.version("0.1.0-bbbbbbbbbbbb")
+        self.age(older, base - 2_000_000_000)
+        self.age(newer, base - 1_000_000_000)
+        return first, older, newer
+
+    def test_a_second_bootstrap_keeps_the_current_and_the_previous_version(self):
+        first, older, newer = self.old_versions()
+        second = self.run_bootstrap()
+        self.assertEqual(second["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue((self.layout.lib / first["version"]).is_dir())
+        self.assertTrue(newer.is_dir())
+        self.assertFalse(older.exists())
+
+    def test_collecting_again_removes_nothing(self):
+        self.old_versions()
+        self.run_bootstrap()
+        self.assertEqual(self.run_bootstrap()["collected"], [])
+
+    def test_a_version_a_symlink_points_at_is_kept(self):
+        _first, older, newer = self.old_versions()
+        (self.layout.lib / "rollback").symlink_to(older.name)
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_the_version_the_running_helper_executes_from_is_kept(self):
+        _first, older, newer = self.old_versions()
+        running = older / "shiplord" / "installer.py"
+        with patch("shiplord.installer.__file__", str(running)):
+            self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_an_unfinished_version_and_a_foreign_directory_are_left_alone(self):
+        self.old_versions()
+        unfinished = self.version("0.1.0-cccccccccccc", complete=False)
+        foreign = self.layout.lib / "manual"
+        foreign.mkdir()
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue(unfinished.is_dir())
+        self.assertTrue(foreign.is_dir())
+
+    def test_a_collection_failure_is_a_warning_not_a_failed_bootstrap(self):
+        _first, older, _newer = self.old_versions()
+        with patch("shiplord.installer.remove_version_tree",
+                   side_effect=BootstrapError("could not remove an old helper version")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["collected"], [])
+        self.assertEqual(result["warnings"], ["could not remove an old helper version"])
+        self.assertTrue(older.is_dir())
+
+    def test_a_listing_failure_is_a_warning_without_a_host_path(self):
+        self.run_bootstrap()
+        with patch("shiplord.installer.complete_versions",
+                   side_effect=OSError(13, "Permission denied", "/var/lib/shiplord/current")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["warnings"], ["old helper versions could not be collected"])
+        self.assertNotIn("/var/lib", result["warnings"][0])
+
+    def test_collecting_needs_an_installed_helper_directory(self):
+        with self.assertRaisesRegex(BootstrapError, "helper directory"):
+            collect_old_versions(self.layout)
 class OsBaselineTests(InstallerTestCase):
     """An unsupported host is refused before the first side effect, not after a misleading failure."""
 
@@ -495,7 +692,7 @@ class DeploymentGroupTests(InstallerTestCase):
         second = self.run_bootstrap()
         self.assertFalse(second["changed"]["sshd_group"])
         self.assertEqual([call[0].rsplit("/", 1)[-1] for call in self.system.calls[calls:]],
-                         ["systemctl", "getent", "getent"])
+                         ["systemctl", "systemctl", "getent", "getent"])
 
     def test_a_group_that_cannot_be_created_stops_before_the_dropin(self):
         self.system.results["groupadd"] = CommandResult(1, "failed")

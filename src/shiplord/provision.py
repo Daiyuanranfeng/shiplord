@@ -10,14 +10,15 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import secrets
 import shutil
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
-from .environment import EnvironmentError_, load_environment_file, parse_environment
+from . import registries
+from .environment import (EnvironmentError_, edit_environment, load_environment_file, load_environment_text,
+                          parse_environment, render_environment, validate_key, validate_value)
 from .installer import DEPLOY_GROUP, DEPLOY_MARKER
 from .keys import KeyError_, KeyStore, PublicKey, parse_public_key, validate_label
 from .layout import Layout, deployment_user, runtime_user
@@ -195,7 +196,7 @@ def _open_directory(path: Path) -> int:
 
 
 def _preflight_update(layout: Layout, system: System, lock: HostLock, app: str, *, runtime: str, api_domain: str,
-                      image_repository: str | None, max_memory_mb: int | None,
+                      image_repository: str | None, max_memory_mb: int | None, hostnames: Sequence[str] = (),
                       apply_route: Callable[[dict], object] | None) -> tuple[dict, dict, dict | None]:
     """Validate an update before its first side effect; return (previous, planned, deployed release)."""
     account = _account(system, deployment_user(app))
@@ -226,27 +227,30 @@ def _preflight_update(layout: Layout, system: System, lock: HostLock, app: str, 
         ceiling = previous["max_memory_mb"] if max_memory_mb is None else max_memory_mb
         planned, _ = registry.update(app, deployment_uid=previous["deployment_uid"],
                                      deployment_user=previous["deployment_user"], runtime=runtime,
-                                     api_domain=api_domain, image_repository=image_repository,
+                                     api_domain=api_domain, hostnames=hostnames,
+                                     image_repository=image_repository,
                                      max_memory_mb=ceiling, dry_run=True)
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
         os.close(registry_fd)
-    if planned["api_domain"] != previous["api_domain"] and current is not None and apply_route is None:
+    route_moves = planned["api_domain"] != previous["api_domain"] \
+        or (planned.get("hostnames") or []) != (previous.get("hostnames") or [])
+    if route_moves and current is not None and apply_route is None:
         raise ProvisionError("the public route cannot be moved by this server; run `shiplord server bootstrap` first")
     return previous, planned, current
 
 
 def provision(layout: Layout, system: System, lock: HostLock, *, application_id: str, runtime: str, api_domain: str,
               image_repository: str | None, public_key: str, key_label: str,
-              max_memory_mb: int | None = None, update: bool = False,
+              hostnames: Sequence[str] = (), max_memory_mb: int | None = None, update: bool = False,
               apply_route: Callable[[dict], object] | None = None) -> dict:
     """Create or complete an application's host resources. The caller holds the host lock.
 
     With ``update`` an existing application keeps its account, port, state, environment, and keys; only its public
-    hostname and memory ceiling may change. ``max_memory_mb`` left unset keeps the current ceiling on an update and
-    uses the default at provisioning. ``apply_route`` moves the public route of a deployed application when the
-    hostname changes; it is required for that case and receives the updated registration.
+    hostname, additional hostnames, and memory ceiling may change. ``max_memory_mb`` left unset keeps the current
+    ceiling on an update and uses the default at provisioning. ``apply_route`` moves the public route of a deployed
+    application when a hostname changes; it is required for that case and receives the updated registration.
     """
     if not lock.held:
         raise ProvisionError("host lock is required")
@@ -259,7 +263,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     ceiling = DEFAULT_MAX_MEMORY_MB if max_memory_mb is None else max_memory_mb
     try:  # reject bad input before the first side effect; uid and port are placeholders here
         validate_registration(registration_request(app, deployment_uid=1, deployment_user=deployment_user(app),
-                                                   runtime=runtime, api_domain=api_domain,
+                                                   runtime=runtime, api_domain=api_domain, hostnames=hostnames,
                                                    image_repository=image_repository, max_memory_mb=ceiling))
     except StateError as error:
         raise ProvisionError(f"invalid application settings: {error}") from None
@@ -269,7 +273,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     existing = None
     if update:
         previous, planned, current = _preflight_update(layout, system, lock, app, runtime=runtime,
-                                                       api_domain=api_domain,
+                                                       api_domain=api_domain, hostnames=hostnames,
                                                        image_repository=image_repository,
                                                        max_memory_mb=max_memory_mb, apply_route=apply_route)
         max_memory_mb = planned["max_memory_mb"]
@@ -283,7 +287,7 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
             existing = Registry(registry_fd, lock).check(
                 app, deployment_uid=None if account is None else account["uid"],
                 deployment_user=deployment_user(app), runtime=runtime, api_domain=api_domain,
-                image_repository=image_repository, max_memory_mb=max_memory_mb)
+                hostnames=hostnames, image_repository=image_repository, max_memory_mb=max_memory_mb)
         except StateError as error:
             raise ProvisionError(f"registration failed: {error}") from None
         finally:
@@ -315,8 +319,9 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
     created["sudo_policy"] = _install_sudoers(layout, system, app, account["name"])
     route_changed = False
     changed = False
-    if update and previous is not None and planned is not None \
-            and planned["api_domain"] != previous["api_domain"] and current is not None:
+    if update and previous is not None and planned is not None and current is not None \
+            and (planned["api_domain"] != previous["api_domain"]
+                 or (planned.get("hostnames") or []) != (previous.get("hostnames") or [])):
         try:
             route_changed = bool(getattr(apply_route(planned), "changed", True))
         except RoutingError as error:
@@ -326,27 +331,34 @@ def provision(layout: Layout, system: System, lock: HostLock, *, application_id:
         registry = Registry(registry_fd, lock)
         if update:
             record, changed = registry.update(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                              runtime=runtime, api_domain=api_domain,
+                                              runtime=runtime, api_domain=api_domain, hostnames=hostnames,
                                               image_repository=image_repository, max_memory_mb=max_memory_mb)
             created["registration"] = False
         else:
             record = registry.register(app, deployment_uid=account["uid"], deployment_user=account["name"],
-                                       runtime=runtime, api_domain=api_domain, image_repository=image_repository,
-                                       max_memory_mb=max_memory_mb)
+                                       runtime=runtime, api_domain=api_domain, hostnames=hostnames,
+                                       image_repository=image_repository, max_memory_mb=max_memory_mb)
             created["registration"] = existing is None
     except StateError as error:
         raise ProvisionError(f"registration failed: {error}") from None
     finally:
         os.close(registry_fd)
     result = {"application_id": app, "deployment_user": account["name"], "host_port": record["host_port"],
-              "api_domain": record["api_domain"], "runtime": record["runtime"], "max_memory_mb": record["max_memory_mb"],
+              "api_domain": record["api_domain"], "hostnames": record.get("hostnames") or [],
+              "runtime": record["runtime"], "max_memory_mb": record["max_memory_mb"],
               "key_fingerprint": key.fingerprint,
               "created": created}
     if update:
         result["updated"] = changed
         result["route_changed"] = route_changed
-        result["changes"] = {field: {"from": previous[field], "to": record[field]}
-                             for field in ("api_domain", "max_memory_mb") if previous[field] != record[field]}
+        changes = {}
+        for field in ("api_domain", "hostnames", "max_memory_mb"):
+            before, after = previous.get(field), record.get(field)
+            if field == "hostnames":
+                before, after = before or [], after or []
+            if before != after:
+                changes[field] = {"from": before, "to": after}
+        result["changes"] = changes
     return result
 
 
@@ -378,13 +390,42 @@ def manage_key(layout: Layout, application_id: str, operation: str, *, label: st
     raise ProvisionError("unknown key operation")
 
 
-def manage_environment(layout: Layout, application_id: str, operation: str, *, text: str | None = None) -> dict:
-    """Set, clear, or list the key names of an application's runtime environment file.
+def _write_environment_file(path: Path, text: str) -> None:
+    """Replace an environment file atomically with a private, owner-only temporary file."""
+    temporary = path.with_name(f".app.env.tmp-{secrets.token_hex(6)}")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fchmod(file.fileno(), 0o600)
+            if os.geteuid() == 0:
+                os.fchown(file.fileno(), 0, 0)
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    except OSError:
+        raise ProvisionError("could not write the environment file") from None
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    Values are never returned. They take effect the next time a release is started. A file that cannot
-    be read is still replaced or removed, so a corrupt file never needs a manual root shell to repair.
+
+def manage_environment(layout: Layout, application_id: str, operation: str, *, text: str | None = None,
+                       key: str | None = None, value: str | None = None) -> dict:
+    """Set, clear, list, or edit the key names of an application's runtime environment file.
+
+    Values are never returned. They take effect the next time a release is started. ``set-key`` and
+    ``unset`` change one line and leave every other line byte-identical; they refuse a file they cannot
+    rewrite safely, because discarding it would also discard variables this command was not asked about.
+    A whole-file ``set`` or a ``clear`` still repairs an unreadable file, so it never needs a manual root shell.
     """
     app = validate_app_name(application_id)
+    if operation in ("set-key", "unset"):  # reject bad input before the directory check or any file read
+        try:
+            key = validate_key(key)
+            if operation == "set-key":
+                validate_value(value)
+        except EnvironmentError_ as error:
+            raise ProvisionError(str(error)) from None
     _require_provisioned(layout, app)
     path = layout.environments / app / "app.env"
     if operation == "clear":
@@ -404,6 +445,19 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
             return {"keys": sorted(load_environment_file(path) or {})}
         except EnvironmentError_ as error:
             raise ProvisionError(f"{error}; use `shiplord env clear` to replace it") from None
+    if operation in ("set-key", "unset"):
+        try:
+            current = load_environment_text(path)
+        except EnvironmentError_ as error:
+            raise ProvisionError(f"{error}; use `shiplord env clear` to replace it") from None
+        try:
+            updated = edit_environment(current or "", key, value if operation == "set-key" else None)
+        except EnvironmentError_ as error:
+            raise ProvisionError(str(error)) from None
+        changed = updated != (current or "")
+        if changed:
+            _write_environment_file(path, updated)
+        return {"keys": sorted(parse_environment(updated)), "changed": changed}
     if operation != "set":
         raise ProvisionError("unknown environment operation")
     if not isinstance(text, str):
@@ -419,30 +473,13 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
         current, discarded = None, True
     if not discarded and values == current and path.exists():
         return {"keys": sorted(values), "changed": False}
-    temporary = path.with_name(f".app.env.tmp-{secrets.token_hex(6)}")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            file.write("".join(f"{key}={values[key]}\n" for key in sorted(values)))
-            file.flush()
-            os.fchmod(file.fileno(), 0o600)
-            if os.geteuid() == 0:
-                os.fchown(file.fileno(), 0, 0)
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        raise ProvisionError("could not write the environment file") from None
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_environment_file(path, render_environment(values))
     notice = ({"warnings": ["the previous environment file was unreadable; its contents were discarded"]}
               if discarded else {})
     return {"keys": sorted(values), "changed": True, **notice}
 
 
-REGISTRY_HOSTS = ("ghcr.io",)
 REGISTRY_CONFIG = "config.json"
-_LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
-_LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
 
 
 def _registry_username(entry: object) -> str:
@@ -455,10 +492,13 @@ def _registry_username(entry: object) -> str:
         raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not valid "
                              "base64") from None
     username, separator, _ = decoded.partition(":")
-    if not separator or not _LOGIN_USER.fullmatch(username):
-        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
-                             "username:token")
-    return username
+    if separator:
+        try:
+            return registries.validate_username(username)
+        except registries.RegistryPolicyError:
+            pass
+    raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
+                         "username:token")
 
 
 def _registry_auths(path: Path) -> dict:
@@ -553,21 +593,26 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
     current = _registry_auths(directory / REGISTRY_CONFIG)
 
     def summary() -> dict:  # registries and usernames only; never a token
-        return {"registries": [{"registry": name, "username": _registry_username(entry)}
+        return {"registries": [{"registry": registries.host_for_key(name), "username": _registry_username(entry)}
                                for name, entry in sorted(current.items())]}
 
     if operation == "list":
         return summary()
-    if registry not in REGISTRY_HOSTS:
-        raise ProvisionError(f"registry logins are accepted for {', '.join(REGISTRY_HOSTS)} only")
+    try:
+        host = registries.validate_host(registry)
+    except registries.RegistryPolicyError as error:
+        raise ProvisionError(str(error)) from None
     if operation == "logout":
-        current.pop(registry, None)
+        for key in registries.login_keys(host):
+            current.pop(key, None)
     elif operation == "login":
-        if not isinstance(username, str) or not _LOGIN_USER.fullmatch(username):
-            raise ProvisionError("invalid registry username")
-        if not isinstance(token, str) or not _LOGIN_TOKEN.fullmatch(token):
-            raise ProvisionError("invalid registry token")
-        current[registry] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
+        try:
+            registries.validate_login(host, username, token)
+        except registries.RegistryPolicyError as error:
+            raise ProvisionError(str(error)) from None
+        for key in registries.login_keys(host):  # replace any hand-written bare docker.io entry
+            current.pop(key, None)
+        current[registries.login_key(host)] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
     else:
         raise ProvisionError("unknown registry operation")
     if not current:

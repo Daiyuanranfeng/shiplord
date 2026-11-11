@@ -10,18 +10,20 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from typer.testing import CliRunner
 
-from shiplord import cli
+from shiplord import cli, tailscale
 from shiplord.client import AdminClient, ClientError, HelperClient
 from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
 from shiplord.transport import TransportError
+from shiplord.workflow import DEPLOY_WORKFLOW_PATH, PINS, WORKFLOW_PATH, render_deploy_workflow, render_workflow
 
 MANIFEST = '''schema_version = 1
 name = "orders"
@@ -63,11 +65,46 @@ class ManifestTests(unittest.TestCase):
         result = self.load(MANIFEST.replace('["https://orders.example.com"]', '[]'))
         self.assertEqual(result["http"]["frontend_origins"], [])
 
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.load(MANIFEST.replace('\ndeployment_branch = "main"', ""))
+        self.assertEqual(result["github"]["deployment_branch"], "main")
+
+    def test_deployment_branch_names_are_validated(self):
+        for branch in ("main", "trunk", "release/prod", "release/2026.01"):
+            with self.subTest(branch=branch):
+                result = self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+                self.assertEqual(result["github"]["deployment_branch"], branch)
+        for branch in ("", " main", "main ", ".main", "-main", "main/", "main.", "main.lock", "a..b", "a//b", "a@{b", "a b"):
+            with self.subTest(branch=branch), self.assertRaises(ManifestError) as caught:
+                self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+            self.assertNotIn("secretvalue", str(caught.exception))
+
     def test_generic_is_an_explicit_docker_profile(self):
         contents = MANIFEST.replace('template = "google-adk"', 'template = "generic"')
         self.assertEqual(self.load(contents)["template"], "generic")
         with self.assertRaisesRegex(ManifestError, "generic template requires the docker runtime"):
             self.load(contents.replace('runtime = "docker"', 'runtime = "native"'))
+
+    def test_an_image_table_names_a_supported_registry(self):
+        without_github = MANIFEST.split("[github]")[0]
+        hub = self.load(without_github + '[image]\nrepository = "docker.io/example/orders"\n')
+        self.assertEqual(hub["image"], {"repository": "docker.io/example/orders"})
+        self.assertEqual(image_repository_for(hub, None), "docker.io/example/orders")
+        bare = self.load(without_github + '[image]\nrepository = "nginx"\n')
+        self.assertEqual(bare["image"], {"repository": "docker.io/library/nginx"})
+        self.assertEqual(image_repository_for(bare, None), "docker.io/library/nginx")
+        # A [github] table and an [image] table may agree, but never disagree.
+        agreeing = self.load(MANIFEST + '[image]\nrepository = "ghcr.io/queryplanner/orders"\n')
+        self.assertEqual(agreeing["image"]["repository"], "ghcr.io/queryplanner/orders")
+        with self.assertRaisesRegex(ManifestError, "two image repositories"):
+            self.load(MANIFEST + '[image]\nrepository = "docker.io/example/orders"\n')
+        for repository in ("docker.io/nginx", "example/orders", "quay.io/example/orders",
+                           "docker.io/example/orders:latest", "docker.io/Example/orders", ""):
+            with self.subTest(repository=repository), self.assertRaises(ManifestError):
+                self.load(without_github + f'[image]\nrepository = "{repository}"\n')
+        native = without_github.replace('runtime = "docker"', 'runtime = "native"')
+        with self.assertRaisesRegex(ManifestError, "Docker applications"):
+            self.load(native + '[image]\nrepository = "docker.io/example/orders"\n')
 
     def test_invalid_fields_are_rejected_without_echoing_values(self):
         replacements = [
@@ -111,6 +148,57 @@ class ManifestTests(unittest.TestCase):
             self.load('name = "secretvalue')
         self.assertNotIn("secretvalue", str(caught.exception))
 
+    def test_native_github_build_settings_are_optional_but_validated(self):
+        native = MANIFEST.replace('runtime = "docker"', 'runtime = "native"')
+        self.assertNotIn("build_command", self.load(native)["github"])  # every other command still works
+        settings = 'deployment_branch = "main"\nbuild_command = "go build -o dist/orders ./cmd/orders"\nbinary_path = "dist/orders"'
+        loaded = self.load(native.replace('deployment_branch = "main"', settings))
+        self.assertEqual((loaded["github"]["build_command"], loaded["github"]["binary_path"]),
+                         ("go build -o dist/orders ./cmd/orders", "dist/orders"))
+        with self.assertRaisesRegex(ManifestError, "only to native"):
+            self.load(MANIFEST.replace('deployment_branch = "main"', settings))
+
+    def test_native_build_settings_reject_unsafe_values(self):
+        native = MANIFEST.replace('runtime = "docker"', 'runtime = "native"')
+        for command, path in (("make\nrm -rf /", "build/orders"), ("", "build/orders"), ("make", ""),
+                              ("make", "../orders"), ("make", "/usr/local/bin/orders"), ("make", "build//orders"),
+                              ("make", "build/./orders"), ("make", "build/orders/")):
+            settings = (f'deployment_branch = "main"\nbuild_command = {json.dumps(command)}\n'
+                        f'binary_path = {json.dumps(path)}')
+            with self.subTest(command=command, path=path), self.assertRaises(ManifestError):
+                self.load(native.replace('deployment_branch = "main"', settings))
+
+    def with_http(self, extra: str) -> dict:
+        return self.load(MANIFEST.replace('api_domain = "orders-api.example.com"',
+                                          'api_domain = "orders-api.example.com"\n' + extra))
+
+    def test_additional_hostnames_and_the_www_alias_are_expanded(self):
+        aliases = self.with_http('hostnames = ["legacy.example.com", "www.orders-api.example.com"]')
+        self.assertEqual(aliases["http"]["hostnames"],
+                         ["legacy.example.com", "www.orders-api.example.com"])
+        self.assertEqual(self.with_http("www_redirect = true")["http"]["hostnames"],
+                         ["www.orders-api.example.com"])
+        # Without aliases the key is absent, so a record written before aliases existed validates unchanged.
+        self.assertNotIn("hostnames", self.load(MANIFEST)["http"])
+
+    def test_unusable_additional_hostnames_are_rejected(self):
+        cases = {
+            "duplicate": 'hostnames = ["legacy.example.com", "legacy.example.com"]',
+            "the canonical hostname": 'hostnames = ["orders-api.example.com"]',
+            "www outside the canonical hostname": 'hostnames = ["www.other.example.com"]',
+            "uppercase": 'hostnames = ["Legacy.example.com"]',
+            "ip address": 'hostnames = ["127.0.0.1"]',
+            "wildcard": 'hostnames = ["*.example.com"]',
+            "not a list": 'hostnames = "legacy.example.com"',
+            "not strings": "hostnames = [1]",
+            "www twice": 'hostnames = ["www.orders-api.example.com"]\nwww_redirect = true',
+            "www_redirect not a boolean": 'www_redirect = "yes"',
+        }
+        for label, extra in cases.items():
+            with self.subTest(label), self.assertRaises(ManifestError) as caught:
+                self.with_http(extra)
+            self.assertNotIn("other.example.com", str(caught.exception))
+
     def test_configuration_reports_unusable_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigurationError, "could not create ship.toml"):
@@ -125,6 +213,8 @@ class CLITests(unittest.TestCase):
             executable = Path(__import__("sys").executable).parent / "shiplord"
         if env is None:  # configure consults the registered servers; never read the developer's own configuration
             env = dict(os.environ, XDG_CONFIG_HOME=str(Path(directory) / ".test-config"))
+        # A real Tailscale token in the developer's environment must never reach a test: it would call the API.
+        env = {name: value for name, value in env.items() if name != tailscale.API_TOKEN_ENV}
         # stdin is not a terminal, so no command may wait for an answer.
         return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
                               env=env, stdin=subprocess.DEVNULL)
@@ -151,6 +241,7 @@ class CLITests(unittest.TestCase):
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
                     ["restart", "--json"], ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["release", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
@@ -161,6 +252,13 @@ class CLITests(unittest.TestCase):
                         self.assertIn("ship.toml", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_setup_without_a_manifest_asks_for_a_repository_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "setup", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--repo", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_deprovision_requires_explicit_confirmation_before_any_connection(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
@@ -168,6 +266,40 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "deprovision", "--retire", "--json", env=env)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("--yes", json.loads(result.stdout)["error"])
+
+    def test_restore_requires_confirmation_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)  # no server aliases exist here
+            result = self.invoke(directory, "restore", "--latest", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
+            # With --yes the confirmation passes and the missing server alias is the next failure (exit 3).
+            self.assertEqual(self.invoke(directory, "restore", "--latest", "--yes", "--json", env=env).returncode, 3)
+            self.assertEqual(self.invoke(directory, "backup", "--json", env=env).returncode, 3)
+
+    def test_backup_and_restore_need_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (["backup", "--json"], ["restore", "--latest", "--yes", "--json"]):
+                with self.subTest(command=command):
+                    result = self.invoke(directory, *command)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("ship.toml", json.loads(result.stdout)["error"])
+
+    def test_backup_output_reports_the_verified_archive(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            cli.output.render_operation(
+                0, {"status": "succeeded", "archive": "shiplord-backup-orders-20240101T000000Z.tar.gz",
+                    "sha256": "b" * 64, "size": 10, "entries": 2, "bytes": 4, "verified": True,
+                    "application": {"restarted": True, "running": True}},
+                "orders on production", "backup")
+        text = buffer.getvalue()
+        self.assertIn("Outcome: succeeded", text)
+        self.assertIn("Archive: shiplord-backup-orders-20240101T000000Z.tar.gz", text)
+        self.assertIn("Sha256: " + "b" * 64, text)
+        self.assertIn("Verified: yes", text)
+        self.assertIn("Application: running", text)
 
     def test_deploy_validates_its_input_before_reading_any_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
@@ -230,6 +362,40 @@ class CLITests(unittest.TestCase):
             self.assertNotIn("ghp_example", result.stdout + result.stderr)
             result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key), "--json", env=env)
             self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "docker.io", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # Docker Hub is accepted like GHCR
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "quay.io", "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ghcr.io and docker.io", json.loads(result.stdout)["error"])
+
+    def test_env_edits_validate_before_any_server_lookup_and_never_echo_values(self):
+        secret = "postgres://u:s3cr3t@db/x"
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            cases = ((["env", "set", f"PORT={secret}"], "managed by Shiplord"),
+                     (["env", "set", f"BAD LINE {secret}"], "KEY=VALUE"),
+                     (["env", "set", f"A={secret}\nB=2"], "invalid"),
+                     (["env", "unset", "A B"], "variable name"),
+                     (["env", "set"], "exactly one"),
+                     (["env", "set", "A=1", "--from-file", "f"], "exactly one"))
+            for args, expected in cases:
+                with self.subTest(args=args[:2]):
+                    result = self.invoke(directory, *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, json.loads(result.stdout)["error"])
+                    self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            result = self.invoke(directory, "env", "set", f"DATABASE_URL={secret}", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            self.assertEqual(self.invoke(directory, "env", "unset", "OLD", "--json", env=env).returncode, 3)
+            env_file = Path(directory) / "runtime.env"
+            env_file.write_text(f"DATABASE_URL={secret}\n")
+            result = self.invoke(directory, "env", "set", "--from-file", str(env_file), "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # whole-file replacement still works
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
 
     def test_github_commands_need_a_manifest_and_a_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
@@ -247,11 +413,159 @@ class CLITests(unittest.TestCase):
             self.assertIn("tag:ci", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
 
+    def test_github_setup_upgrade_workflow_refreshes_the_pins_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project = Path(directory)
+            (project / "ship.toml").write_text(MANIFEST)
+            manifest = load_manifest(project / "ship.toml")
+            texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(manifest, tooling_ref="ab" * 20),
+                     WORKFLOW_PATH: render_workflow(manifest, tooling_ref="ab" * 20)}
+            texts[DEPLOY_WORKFLOW_PATH] = texts[DEPLOY_WORKFLOW_PATH].replace(PINS["checkout"].commit, "9" * 40)
+            for path, content in texts.items():
+                (project / path).parent.mkdir(parents=True, exist_ok=True)
+                (project / path).write_text(content + "# a local note\n")
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["changed"], [DEPLOY_WORKFLOW_PATH])
+            self.assertEqual(output["pins"], [{"action": "actions/checkout", "from": "9" * 40,
+                                               "path": DEPLOY_WORKFLOW_PATH, "to": PINS["checkout"].commit,
+                                               "version": "v4"}])
+            refreshed = (project / DEPLOY_WORKFLOW_PATH).read_text()
+            self.assertNotIn("9" * 40, refreshed)
+            self.assertIn(str(PINS["checkout"]), refreshed)
+            self.assertIn("# a local note", refreshed)
+            self.assertEqual((project / WORKFLOW_PATH).read_text(), texts[WORKFLOW_PATH] + "# a local note\n")
+
+    def test_github_setup_upgrade_workflow_refuses_a_workflow_shiplord_did_not_write(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project = Path(directory)
+            (project / "ship.toml").write_text(MANIFEST)
+            hand_written = "name: Mine\non: push\njobs: {}\n"
+            (project / DEPLOY_WORKFLOW_PATH).parent.mkdir(parents=True)
+            (project / DEPLOY_WORKFLOW_PATH).write_text(hand_written)
+            (project / WORKFLOW_PATH).write_text(hand_written)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn(DEPLOY_WORKFLOW_PATH, json.loads(result.stdout)["error"])
+            self.assertEqual((project / DEPLOY_WORKFLOW_PATH).read_text(), hand_written)
+            self.assertEqual((project / WORKFLOW_PATH).read_text(), hand_written)
+            mismatch = self.invoke(directory, "github", "setup", "--repo", "Other/repo", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(mismatch.returncode, 2, mismatch.stdout)
+            self.assertIn("already names", json.loads(mismatch.stdout)["error"])
+
+    def test_github_setup_needs_a_repository_unless_it_only_upgrades_the_pins(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "github", "setup", "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--repo", json.loads(result.stdout)["error"])
+            result = self.invoke(directory, "github", "setup", "--upgrade-workflow", "--json", env=env)
+            self.assertEqual(result.returncode, 2)  # there is no generated pipeline to upgrade yet
+            self.assertIn("github setup", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
+
+    def test_github_check_pins_reports_every_pin_and_keeps_the_token_out_of_the_output(self):
+        token = "ghs_exampleTOKEN1234567890"
+        seen = []
+
+        def fetch(url, sent):
+            seen.append((url, sent))
+            return 200, "{}"
+        with patch("shiplord.workflow.github_fetch", side_effect=fetch):
+            result = CliRunner().invoke(cli.app, ["github", "check-pins", "--json"], env={"GITHUB_TOKEN": token})
+        self.assertEqual(result.exit_code, 0, result.output)
+        output = json.loads(result.stdout)
+        self.assertEqual((output["ok"], output["checked"], output["missing"]), (True, len(PINS), []))
+        self.assertEqual(len(seen), len(PINS))
+        self.assertEqual({sent for _, sent in seen}, {token})
+        self.assertNotIn(token, result.stdout + result.stderr)
+
+    def test_github_check_pins_without_the_api_fails_instead_of_reporting_success(self):
+        with patch("shiplord.workflow.github_fetch", side_effect=OSError("no route to host")):
+            result = CliRunner().invoke(cli.app, ["github", "check-pins", "--json"],
+                                        env={"GITHUB_TOKEN": "", "GH_TOKEN": ""})
+        self.assertEqual(result.exit_code, 1, result.output)
+        output = json.loads(result.stdout)
+        self.assertEqual((output["ok"], output["missing"]), (False, []))
+        self.assertEqual(len(output["unverified"]), len(PINS))
+        self.assertIn("nothing here says they resolve", output["error"])
+
+    def test_github_setup_rejects_an_invalid_deployment_branch_before_using_github_or_a_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--deployment-branch", "main..other", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("valid branch name", json.loads(result.stdout)["error"])
+            self.assertEqual((root / "ship.toml").read_text(), MANIFEST)
+            self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
+
     def test_doctor_rejects_conflicting_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.invoke(directory, "doctor", "--local", "--server", "production", "--json")
         self.assertEqual(result.returncode, 2)
         self.assertFalse(json.loads(result.stdout)["ok"])
+
+    def test_github_setup_creates_the_tailscale_credential_when_a_token_is_in_the_environment(self):
+        token = "tskey-api-throwaway-fixture-value"
+        manifest = load_manifest(Path(self.write_manifest()))
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=transport), \
+                patch.dict(os.environ, {tailscale.API_TOKEN_ENV: token, "XDG_CONFIG_HOME": config}):
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(token, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "created through the Tailscale API")
+        self.assertEqual(setup.call_args.kwargs["tailscale"],
+                         {"SHIPLORD_TS_CLIENT_ID": "id123456", "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        payload = json.loads(requests[0][2])
+        self.assertEqual(payload["subject"], "repo:QueryPlanner/*:ref:refs/heads/main")
+        self.assertNotIn(token, json.dumps(payload))
+
+    def test_github_setup_without_a_token_keeps_the_printed_instructions_and_makes_no_request(self):
+        manifest = load_manifest(Path(self.write_manifest()))
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=AssertionError("must not call Tailscale")), \
+                patch.dict(os.environ, {"XDG_CONFIG_HOME": config}, clear=False):
+            os.environ.pop(tailscale.API_TOKEN_ENV, None)
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "not configured")
+        self.assertEqual(setup.call_args.kwargs["tailscale"], {})
+
+    def write_manifest(self) -> str:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = Path(directory) / "ship.toml"
+        path.write_text(MANIFEST)
+        return str(path)
 
     def test_configure_creates_a_valid_manifest_without_github_settings(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -541,7 +855,22 @@ class CLITests(unittest.TestCase):
         self.assertIn("shiplord", help_result.stdout.lower())
 
 
-class CLIInventoryTests(unittest.TestCase):
+class ServerConfigMixin(unittest.TestCase):
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def env(self, config: Path) -> dict[str, str]:
+        return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+
+class CLIInventoryTests(ServerConfigMixin):
     inventory = {"ok": True, "applications": [{
         "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,
         "release_recorded": True, "unfinished_transaction": None, "ok": True,
@@ -977,6 +1306,56 @@ class CLIInventoryTests(unittest.TestCase):
                                                env=self.env(config))
             self.assertEqual(set(json.loads(logs_json.stdout)), {"ok", "logs"})
 
+    def test_logs_forward_since_timestamps_and_follow_to_the_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs",
+                       return_value=(0, {"ok": True, "logs": "one\n"})) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--tail", "25",
+                                                      "--since", "15m", "--timestamps"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(call.call_args.args[1], 25)
+        self.assertEqual(call.call_args.kwargs["since"], "15m")
+        self.assertTrue(call.call_args.kwargs["timestamps"])
+        self.assertFalse(call.call_args.kwargs["follow"])
+
+    def test_follow_and_json_are_refused_before_any_connection(self):
+        with patch("shiplord.cli._app_context") as context:
+            result = CliRunner().invoke(cli.app, ["logs", "orders", "--follow", "--json"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("cannot be combined", json.loads(result.stdout)["error"])
+        context.assert_not_called()
+
+    def test_follow_writes_chunks_as_they_arrive_and_reports_the_stop_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+
+            def stream(client, tail, **options):
+                options["on_chunk"]("one\n")
+                options["on_chunk"]("two\n")
+                return 0, {"ok": True, "logs": "", "stopped": "timeout", "release": "a" * 12}
+
+            with patch("shiplord.cli.commands.application_logs", side_effect=stream) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow",
+                                                      "--timeout", "60"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.stdout, "one\ntwo\n")
+        self.assertIn(f"Outcome: stopped at the timeout (release {'a' * 12})", result.stderr)
+        self.assertEqual(call.call_args.kwargs["timeout"], 60)
+
+    def test_ctrl_c_stops_following_with_exit_130(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs", side_effect=KeyboardInterrupt):
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 130)
+        self.assertIn("Stopped following logs.", result.stderr)
+
+
     def test_status_explains_an_observed_unfinished_transaction(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"
@@ -1244,6 +1623,96 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(server_data["client"]["version"], "0.2.0")
 
 
+class ServerUninstallTests(ServerConfigMixin):
+    """`shiplord server uninstall` calls the admin action and reports what it removed."""
+
+    result = {"status": "uninstalled",
+              "removed": {"caddy": {"import": True, "placeholder": True}, "sshd": True,
+                          "wrappers": ["shiplord-host", "shiplord-admin"], "versions": 2,
+                          "directories": ["registrations", "jobs"]},
+              "retained": ["the state directory that holds the host lock"], "applications": []}
+
+    def fake(self, result=None, error=None):
+        calls = []
+
+        class FakeAdmin:
+            def __init__(self, target, prompt=None):
+                self.target = target
+
+            def call(self, action, application_id, arguments, *, timeout=120):
+                calls.append((action, application_id, arguments, timeout))
+                if error is not None:
+                    raise error
+                return dict(self_result if self_result is not None else ServerUninstallTests.result)
+
+        self_result = result
+        return FakeAdmin, calls
+
+    def test_human_output_lists_removals_retained_state_and_the_data_warning(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls, [("uninstall", None, {"force": False}, 300)])
+        self.assertIn("Removed:", result.stdout)
+        self.assertIn("the managed Caddy import", result.stdout)
+        self.assertIn("the launchers: shiplord-host, shiplord-admin", result.stdout)
+        self.assertIn("the helper code (2 versions)", result.stdout)
+        self.assertIn("Left in place:", result.stdout)
+        self.assertIn("Application data is never deleted", result.stdout)
+        self.assertIn("shiplord server bootstrap", result.stdout)
+
+    def test_json_keeps_the_result_and_the_data_warning(self):
+        admin, _calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["removed"]["wrappers"], ["shiplord-host", "shiplord-admin"])
+        self.assertIn("Application data is never deleted", data["note"])
+
+    def test_force_is_passed_to_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--force", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls[0][2], {"force": True})
+
+    def test_a_refused_uninstall_exits_two_and_names_the_applications(self):
+        error = ClientError("2 applications are still provisioned (orders, billing); deprovision them first "
+                            "or pass --force", 2, error_code="rejected")
+        admin, _calls = self.fake(error=error)
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 2, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["error_code"], "rejected")
+        self.assertIn("orders", data["error"])
+
+    def test_an_unknown_alias_exits_three_without_calling_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "absent", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertEqual(calls, [])
 class EnvironmentDiffCLITests(unittest.TestCase):
     SECRET = "postgres://app:cli-secret@db/orders"
     MANIFEST = {"name": "orders", "server": "production"}
@@ -1364,9 +1833,9 @@ class CLIRecoveryTests(unittest.TestCase):
         client = run.call_args.args[1]
         self.assertEqual((client.application_id, client.target), ("orders", "ship-orders@host.example.com"))
         self.assertEqual(run.call_args.args[2], "recover")
-        self.assertIn("Target: orders on hetzner-vm", result.stderr)
-        self.assertIn("Outcome: recovered", result.stderr)
-        self.assertIn("status: recovered", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Target: orders on hetzner-vm", result.stdout)
+        self.assertIn("Outcome: recovered", result.stdout)
 
     def test_explicit_recovery_json_is_the_existing_result_shape(self):
         outcome = {"ok": True, "request_id": "rc-1", "status": "nothing_to_recover", "exit_code": 0}
@@ -1407,10 +1876,10 @@ class CLIRecoveryTests(unittest.TestCase):
                     patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)):
                 result = self.invoke("recover", "orders", "--server", "hetzner-vm")
             self.assertEqual(result.exit_code, code, result.output)
-            self.assertIn(f"status: {outcome['status']}", result.stdout)
-            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
             if outcome.get("error"):
-                self.assertIn(f"error: {outcome['error']}", result.stdout)
+                self.assertIn(f"Reason: {outcome['error'].replace('_', ' ')}", result.stdout)
 
     def test_recovery_outcomes_keep_their_exit_codes_in_manifest_mode(self):
         (self.project / "ship.toml").write_text(MANIFEST)
@@ -1422,7 +1891,7 @@ class CLIRecoveryTests(unittest.TestCase):
             self.assertEqual(result.exit_code, code, result.output)
             self.assertEqual(run.call_args.args[0]["name"], "orders")
             self.assertEqual(run.call_args.args[1], helper.return_value)
-            self.assertIn(f"status: {outcome['status']}", result.stdout)
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
             self.assertEqual(result.stderr, "")
 class RecordingAdminClient:
     """A stand-in for the sudo client that records the resolved target and each request."""

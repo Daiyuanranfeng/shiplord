@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import http.server
+import json
 import os
 import ssl
 import shutil
@@ -16,6 +17,7 @@ import time
 import unittest
 from pathlib import Path
 
+from shiplord.probes import config_redirects_to, config_routes_to, http_get
 from shiplord.registry import PORT_RANGE, port_is_free
 from shiplord.release_state import HostLock
 from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_caddy, service_environment
@@ -137,6 +139,10 @@ class RealCaddyTests(unittest.TestCase):
 
     def fetch(self, host: str) -> bytes:
         """HTTPS request to the local Caddy, verifying its certificate against Caddy's own local CA."""
+        return self.fetch_response(host)[2]
+
+    def fetch_response(self, host: str, path: str = "/") -> tuple[int, dict, bytes]:
+        """Status, headers, and body for one HTTPS request; redirects are returned, never followed."""
         root = self.data_home / "caddy" / "pki" / "authorities" / "local" / "root.crt"
         context = ssl.create_default_context(cafile=str(root))  # raises until Caddy has issued its CA
 
@@ -147,8 +153,9 @@ class RealCaddyTests(unittest.TestCase):
 
         connection = Connection(host, context=context, timeout=5)
         try:
-            connection.request("GET", "/")
-            return connection.getresponse().read()
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
 
@@ -181,7 +188,25 @@ class RealCaddyTests(unittest.TestCase):
             self.assertTrue(self.manager.remove("orders").changed)
             self.wait_for(self.assert_route_gone)
 
-    def test_invalid_existing_route_is_reported_as_preexisting_and_nothing_changes(self):
+    def test_an_alias_redirects_permanently_to_the_canonical_host_keeping_the_uri(self):
+        port = self.start_upstream(b"canonical")
+        registration = dict(self.registration(port), hostnames=["www.orders.example.com", "legacy.example.com"])
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration).changed)
+        self.assertEqual(self.wait_for(lambda: self.fetch("orders.example.com")), b"canonical")
+        for alias in registration["hostnames"]:
+            status, headers, body = self.wait_for(lambda: self.fetch_response(alias, "/deep/path?q=1"))
+            self.assertEqual((status, headers.get("Location"), body),
+                             (308, "https://orders.example.com/deep/path?q=1", b""))
+        # The probe reads the live configuration Caddy actually runs, not the file that was rendered.
+        admin_status, admin_body = http_get("127.0.0.1", self.admin_port, "/config/apps/http/servers", timeout=3.0)
+        self.assertEqual(admin_status, 200)
+        config = json.loads(admin_body.decode("utf-8"))
+        self.assertTrue(config_routes_to(config, "orders.example.com", f"127.0.0.1:{port}"))
+        for alias in registration["hostnames"]:
+            self.assertTrue(config_redirects_to(config, alias, "orders.example.com"))
+
+
         (self.root / "ship" / "broken.caddy").write_text("broken.example.com {\n\tnot_a_directive\n}\n")
         (self.root / "ship" / "broken.caddy").chmod(0o644)  # independent of the umask; group-writable files are refused
         before = {p.name: p.read_bytes() for p in (self.root / "ship").iterdir()}

@@ -115,7 +115,7 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover", "backup", "restore", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1", "runtime_knobs_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
@@ -123,7 +123,9 @@ class ReadOnlyActionTests(HelperTestCase):
                ("logs", {"tail": 0}), ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}),
                ("deploy", {}), ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}),
                ("rollback", {"x": 1}), ("restart", {"x": 1}), ("recover", {"x": 1}),
-               ("recover", {"force_stop": "yes"}), ("recover", {"force_stop": 1})]
+               ("recover", {"force_stop": "yes"}), ("recover", {"force_stop": 1}), ("backup", {"x": 1}),
+               ("restore", {}), ("restore", {"archive": "../escape.tar.gz"}),
+               ("restore", {"archive": "a.tar.gz", "latest": True}), ("restore", {"latest": "yes"})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
@@ -131,6 +133,8 @@ class ReadOnlyActionTests(HelperTestCase):
             self.call("rollback", commit="a" * 40)
         with self.assertRaises(ProtocolError):
             self.call("restart", commit="a" * 40)
+        with self.assertRaises(ProtocolError):
+            self.call("backup", commit="a" * 40)
         with self.assertRaises(ProtocolError):
             self.call("deploy", commit="a" * 40, sequence=1, artifact={}, configuration={}, allow_older="yes")
         self.assertEqual(self.factory_calls, 0)
@@ -144,6 +148,61 @@ class ReadOnlyActionTests(HelperTestCase):
         with self.assertRaises(Exception):
             self.call("status", job_id="../etc/passwd")
 
+    def test_logs_return_the_runtime_output_with_the_requested_options(self):
+        self.runtime.log_output = "tail=7\n"
+        self.assertEqual(self.call("logs", tail=7, since="15m", timestamps=True)[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 7, "since": "15m", "timestamps": True})
+        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 100, "since": None, "timestamps": False})
+
+    def test_logs_read_the_release_that_is_current(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.call("logs", tail=5)
+        self.assertEqual(self.runtime.log_arguments["release"], self.state.read_state()["current"])
+
+    def test_logs_never_take_the_host_lock(self):
+        output = io.BytesIO()
+        self.runtime.follow_chunks = ["line\n"]
+        with patch.object(HostLock, "acquire", side_effect=AssertionError("logs must not lock the host")):
+            self.assertEqual(self.call("logs")[0]["result"], {"logs": ""})
+            response, code = dispatch(self.envelope("logs", follow=True, timeout=5), self.registration, self.factory,
+                                      destination=output)
+        self.assertEqual((response, code), (None, 0))
+        self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["status"], "stream")
+
+    def test_follow_streams_frames_and_a_final_result(self):
+        self.runtime.follow_chunks, self.runtime.follow_stopped = ["one\n", "two\n"], "timeout"
+        output = io.BytesIO()
+        response, code = dispatch(self.envelope("logs", tail=5, follow=True, timeout=30), self.registration,
+                                  self.factory, destination=output)
+        self.assertEqual((response, code), (None, 0))
+        stream = io.BytesIO(output.getvalue())
+        frames = [read_frame(stream), read_frame(stream), read_frame(stream)]
+        self.assertEqual(frames[0], {"status": "stream", "request_id": "req-1", "chunk": "one\n"})
+        self.assertEqual(frames[1]["chunk"], "two\n")
+        self.assertEqual(frames[2], {"status": "ok", "request_id": "req-1",
+                                     "result": {"stopped": "timeout", "release": None}})
+        self.assertEqual(stream.read(1), b"")  # nothing follows the final frame
+        self.assertEqual(self.runtime.follow_arguments,
+                         {"release": None, "tail": 5, "since": None, "timestamps": False, "duration": 30})
+
+    def test_a_follow_request_needs_a_destination_stream(self):
+        with self.assertRaises(ProtocolError):
+            self.call("logs", follow=True)
+        self.assertEqual(self.factory_calls, 0)
+
+    def test_log_options_are_validated_before_any_host_state_is_opened(self):
+        bad = [{"since": "1d"}, {"since": 5}, {"timestamps": "yes"}, {"follow": "yes"},
+               {"follow": True, "timeout": 0}, {"timeout": 3601}, {"timeout": "60"}, {"unexpected": 1}]
+        for arguments in bad:
+            with self.subTest(arguments=arguments), self.assertRaises(ProtocolError):
+                self.call("logs", **arguments)
+        self.assertEqual(self.factory_calls, 0)
+
+
     def test_status_job_lookup_is_scoped_to_the_application(self):
         billing = self.layout.jobs / "billing"
         billing.mkdir(mode=0o700)
@@ -153,11 +212,6 @@ class ReadOnlyActionTests(HelperTestCase):
         finally:
             os.close(descriptor)
         self.assertIsNone(self.call("status", job_id="billing-1")[0]["result"]["job"])
-
-    def test_logs_return_the_runtime_output(self):
-        self.runtime.logs = lambda registration, tail: f"tail={tail}\n"
-        self.assertEqual(self.call("logs", tail=7)[0]["result"], {"logs": "tail=7\n"})
-        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=100\n"})
 
     def test_plan_describes_the_change_and_changes_nothing(self):
         commit, arguments = self.deploy_arguments()
@@ -265,6 +319,25 @@ class DeployJobTests(HelperTestCase):
             response, code = self.call(action, f"{action}-1")
             self.assertEqual((code, response["job"]["action"]), (0, action))
         self.assertEqual([r for _, r in self.launcher.launched], ["rollback-1", "recover-1"])
+
+    def test_backup_and_restore_become_jobs_and_run_through_the_worker(self):
+        data = self.layout.data / "orders"
+        data.mkdir(parents=True)
+        (data / "state.db").write_bytes(b"sqlite")
+        self.runtime.data_root_path = data
+        response, code = self.call("backup", "backup-1")
+        self.assertEqual((code, response["job"]["action"]), (0, "backup"))
+        self.assertEqual(run_job(self.services, "orders", "backup-1"), 0)
+        backup = self.call("status", job_id="backup-1")[0]["result"]["job"]
+        self.assertEqual((backup["outcome"]["status"], backup["outcome"]["detail"]["verified"]), ("succeeded", True))
+        name = backup["outcome"]["detail"]["archive"]
+        (data / "state.db").write_bytes(b"changed")
+        response, code = self.call("restore", "restore-1", archive=name)
+        self.assertEqual((code, response["job"]["action"]), (0, "restore"))
+        self.assertEqual(run_job(self.services, "orders", "restore-1"), 0)
+        restored = self.call("status", job_id="restore-1")[0]["result"]["job"]
+        self.assertEqual(restored["outcome"]["status"], "succeeded")
+        self.assertEqual((data / "state.db").read_bytes(), b"sqlite")
 
 
 class RestartJobTests(HelperTestCase):
