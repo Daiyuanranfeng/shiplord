@@ -59,7 +59,9 @@ For a native Linux program, use the `google-adk` template above without `--image
 
 ## Deploy an update
 
-For a Docker app, build an image and push it to a registry. Deploy it by its digest, which identifies the exact image, and by the Git commit that produced it:
+Images can live on GitHub Container Registry (the `[github]` table means `ghcr.io/owner/name`) or Docker Hub
+(`[image] repository = "docker.io/namespace/name"`). Deploy either by its digest, which identifies the exact
+image, and by the Git commit that produced it:
 
 ```sh
 shiplord plan \

@@ -18,7 +18,8 @@ DEFAULT_CONTAINER_PORT = 8080
 DEFAULT_READINESS_PATH = "/ready"
 DEFAULT_MEMORY_MB = 512
 DEPLOYMENT_BRANCH = "main"
-# ghcr.io is the only registry Shiplord knows, so only a GitHub remote can justify an inferred repository.
+# Only a GitHub remote justifies the ghcr.io repository that a [github] table means; a Docker Hub image is
+# named explicitly in the manifest's [image] table instead.
 GITHUB_HOST = "github.com"
 # Deploys above the ceiling the administrator registered at provisioning are refused (4096 MiB by default), so the
 # interactive prompt stays inside it; an explicit --memory flag is checked only by the manifest rules.
@@ -52,8 +53,8 @@ def repository_from_url(url: str) -> str | None:
     """``owner/repository`` from a GitHub remote URL, or None when the URL names nothing Shiplord can justify.
 
     Both forms git writes are accepted: ``git@github.com:owner/orders.git`` and ``https://github.com/owner/orders.git``.
-    Only github.com is accepted, because ghcr.io is the only registry Shiplord knows. The URL itself is never returned
-    or reported: a remote can carry a credential.
+    Only github.com is accepted, because a GitHub repository is what the [github] table means. The URL itself is
+    never returned or reported: a remote can carry a credential.
     """
     text = url.strip()
     if not text:

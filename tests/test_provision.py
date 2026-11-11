@@ -850,9 +850,36 @@ class RegistryLoginTests(ProvisionTestCase):
         self.assertFalse(self.config().exists())
         manage_registry(self.layout, "orders", "logout", registry="ghcr.io")  # idempotent
 
+    def test_a_docker_hub_login_uses_the_key_docker_looks_up_and_lists_the_user_facing_host(self):
+        self.provision()
+        result = self.login(registry="docker.io")
+        self.assertEqual(result, {"registries": [{"registry": "docker.io", "username": "deploy-bot"}]})
+        document = json.loads(self.config().read_text())
+        self.assertEqual(list(document["auths"]), ["https://index.docker.io/v1/"])
+        auth = base64.b64decode(document["auths"]["https://index.docker.io/v1/"]["auth"]).decode()
+        self.assertEqual(auth, f"deploy-bot:{self.TOKEN}")
+        self.assertNotIn(self.TOKEN, str(result))
+        self.assertEqual(manage_registry(self.layout, "orders", "list"), result)
+        self.login()  # a second registry is kept beside it
+        self.assertEqual({entry["registry"] for entry in manage_registry(self.layout, "orders", "list")["registries"]},
+                         {"ghcr.io", "docker.io"})
+        manage_registry(self.layout, "orders", "logout", registry="docker.io")
+        self.assertEqual(manage_registry(self.layout, "orders", "list"),
+                         {"registries": [{"registry": "ghcr.io", "username": "deploy-bot"}]})
+
+    def test_a_bare_docker_hub_key_written_by_hand_is_replaced_by_the_canonical_one(self):
+        self.provision()
+        self.config().parent.mkdir(mode=0o700)
+        legacy = base64.b64encode(b"someone:other-token").decode()
+        self.config().write_text(json.dumps({"auths": {"docker.io": {"auth": legacy}}}))
+        self.login(registry="docker.io")
+        document = json.loads(self.config().read_text())
+        self.assertEqual(list(document["auths"]), ["https://index.docker.io/v1/"])
+
     def test_invalid_input_is_rejected_without_echoing_the_token(self):
         self.provision()
-        bad = [{"registry": "docker.io"}, {"registry": "ghcr.io/evil"}, {"username": "a b"}, {"username": ""},
+        bad = [{"registry": "quay.io"}, {"registry": "docker.io/evil"}, {"registry": "ghcr.io/evil"},
+               {"registry": "index.docker.io"}, {"username": "a b"}, {"username": ""},
                {"token": "has space"}, {"token": "x" * 513}, {"token": "tok\nen"}, {"token": None}]
         for change in bad:
             with self.subTest(change=str(change)[:30]), self.assertRaises(ProvisionError) as caught:

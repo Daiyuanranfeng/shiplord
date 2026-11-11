@@ -10,13 +10,13 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import secrets
 import shutil
 import time
 from pathlib import Path
 from typing import Callable
 
+from . import registries
 from .environment import (EnvironmentError_, edit_environment, load_environment_file, load_environment_text,
                           parse_environment, render_environment, validate_key, validate_value)
 from .installer import DEPLOY_GROUP, DEPLOY_MARKER
@@ -468,10 +468,7 @@ def manage_environment(layout: Layout, application_id: str, operation: str, *, t
     return {"keys": sorted(values), "changed": True, **notice}
 
 
-REGISTRY_HOSTS = ("ghcr.io",)
 REGISTRY_CONFIG = "config.json"
-_LOGIN_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
-_LOGIN_TOKEN = re.compile(r"[\x21-\x7e]{1,512}\Z")
 
 
 def _registry_username(entry: object) -> str:
@@ -484,10 +481,13 @@ def _registry_username(entry: object) -> str:
         raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not valid "
                              "base64") from None
     username, separator, _ = decoded.partition(":")
-    if not separator or not _LOGIN_USER.fullmatch(username):
-        raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
-                             "username:token")
-    return username
+    if separator:
+        try:
+            return registries.validate_username(username)
+        except registries.RegistryPolicyError:
+            pass
+    raise ProvisionError(f"the registry login file {REGISTRY_CONFIG} is invalid: an auth value is not a valid "
+                         "username:token")
 
 
 def _registry_auths(path: Path) -> dict:
@@ -582,21 +582,26 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
     current = _registry_auths(directory / REGISTRY_CONFIG)
 
     def summary() -> dict:  # registries and usernames only; never a token
-        return {"registries": [{"registry": name, "username": _registry_username(entry)}
+        return {"registries": [{"registry": registries.host_for_key(name), "username": _registry_username(entry)}
                                for name, entry in sorted(current.items())]}
 
     if operation == "list":
         return summary()
-    if registry not in REGISTRY_HOSTS:
-        raise ProvisionError(f"registry logins are accepted for {', '.join(REGISTRY_HOSTS)} only")
+    try:
+        host = registries.validate_host(registry)
+    except registries.RegistryPolicyError as error:
+        raise ProvisionError(str(error)) from None
     if operation == "logout":
-        current.pop(registry, None)
+        for key in registries.login_keys(host):
+            current.pop(key, None)
     elif operation == "login":
-        if not isinstance(username, str) or not _LOGIN_USER.fullmatch(username):
-            raise ProvisionError("invalid registry username")
-        if not isinstance(token, str) or not _LOGIN_TOKEN.fullmatch(token):
-            raise ProvisionError("invalid registry token")
-        current[registry] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
+        try:
+            registries.validate_login(host, username, token)
+        except registries.RegistryPolicyError as error:
+            raise ProvisionError(str(error)) from None
+        for key in registries.login_keys(host):  # replace any hand-written bare docker.io entry
+            current.pop(key, None)
+        current[registries.login_key(host)] = {"auth": base64.b64encode(f"{username}:{token}".encode()).decode()}
     else:
         raise ProvisionError("unknown registry operation")
     if not current:

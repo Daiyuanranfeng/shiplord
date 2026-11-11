@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import registries
 from .probes import ReadinessError, validate_interval, validate_status
 from .shutdown import ShutdownError, validate_action, validate_timeout
 from .storage import StorageError, validate_storage
@@ -155,7 +156,8 @@ def load_manifest(path: Path = Path("ship.toml")) -> dict:
 def validate_manifest(raw: dict) -> dict:
     """Validate parsed manifest data and return its nonsecret configuration."""
 
-    root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources", "deploy", "github", "storage"})
+    root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources",
+                                    "deploy", "github", "image", "storage"})
     if type(root.get("schema_version")) is not int or root["schema_version"] != 1:
         raise ManifestError("schema_version must be 1")
     name = validate_app_name(root.get("name"))
@@ -228,6 +230,14 @@ def validate_manifest(raw: dict) -> dict:
             result["storage"] = validate_storage(root["storage"])
         except StorageError as error:
             raise ManifestError(str(error)) from None
+    if "image" in root:
+        if runtime != "docker":
+            raise ManifestError("image applies only to Docker applications")
+        image = _table(root["image"], "image", {"repository"})
+        try:
+            result["image"] = {"repository": registries.validate_repository(image.get("repository"))}
+        except registries.RegistryPolicyError as error:
+            raise ManifestError(str(error)) from None
     if "github" in root:
         github = _table(root["github"], "github", {"repository", "deployment_branch"})
         repository = _string(github.get("repository"), "github.repository")
@@ -235,4 +245,6 @@ def validate_manifest(raw: dict) -> dict:
             raise ManifestError("github.repository must be an owner/repository pair")
         branch = validate_deployment_branch(github.get("deployment_branch", DEFAULT_DEPLOYMENT_BRANCH))
         result["github"] = {"repository": repository, "deployment_branch": branch}
+        if "image" in result and result["image"]["repository"] != registries.github_repository(repository):
+            raise ManifestError("ship.toml names two image repositories; keep [image] or [github], not both")
     return result

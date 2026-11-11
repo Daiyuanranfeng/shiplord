@@ -88,7 +88,7 @@ shiplord env set --from-file .env.production         # runtime secrets; values a
 shiplord env set FEATURE_FLAG=on                     # change one variable, leaving other lines as they are
 shiplord env unset OLD_FLAG                          # remove one variable; safe to repeat
 shiplord restart                                     # apply the environment to the running release
-shiplord registry login --username bot --token-file t   # only for a private image: a read-only pull login
+shiplord registry login --username bot --token-file t   # only for a private image; add --registry docker.io
 
 # every release
 shiplord release                                        # build, push, and deploy this checkout
@@ -217,6 +217,51 @@ Upgrade with `shiplord server bootstrap` when it is missing. Do not downgrade to
 generic release records. Changing the profile replaces the container even with the same image, commit,
 and sequence; rollback and journal recovery restore the recorded profile. Containers without a profile
 label are interpreted as legacy `google-adk` containers.
+
+## Image registries
+
+Shiplord pulls images from GitHub Container Registry (`ghcr.io`) and Docker Hub (`docker.io`). A
+`[github]` table means GHCR: `repository = "owner/name"` allows `ghcr.io/owner/name`. To deploy an image
+that lives on Docker Hub, name it in its own table:
+
+```toml
+[image]
+repository = "docker.io/example/orders"
+```
+
+Exactly these repository forms are accepted, and each is stored in one spelling:
+
+| Written | Stored |
+| --- | --- |
+| `ghcr.io/owner/name` | `ghcr.io/owner/name` |
+| `docker.io/namespace/name` | `docker.io/namespace/name` |
+| `docker.io/library/name` | `docker.io/library/name` |
+| `name` (a Docker Hub official image) | `docker.io/library/name` |
+
+A bare `owner/name` without a host is refused: it could be a GitHub owner/repository or a Docker Hub
+namespace, and guessing would allowlist an image you did not name. `docker.io/name` is refused for the
+same reason: write `docker.io/library/name` or just `name`. No other registry is supported yet, and a
+repository never carries a tag, a port, a scheme, or credentials. `[image]` and `[github]` may both be
+present only when they name the same GHCR repository.
+
+Every deploy is pinned by digest, for either registry:
+
+```sh
+shiplord deploy --image docker.io/example/orders@sha256:<digest> --commit <sha>
+```
+
+For a private image, store a read-only pull login for the registry that serves it. The token comes from a
+file or stdin, never from the command line, and is never printed:
+
+```sh
+shiplord registry login --username <account> --token-file token.txt --registry docker.io
+```
+
+Docker Hub credentials are written under the key Docker looks up (`https://index.docker.io/v1/`), so they
+are found when the image is pulled. `shiplord registry status` lists registry hosts and usernames only.
+
+`github setup` still generates a workflow that publishes to GHCR, because a Docker Hub push needs
+credentials Shiplord does not manage; for a Docker Hub image, use your own workflow and `shiplord deploy`.
 
 ## Persistent storage (Docker)
 
@@ -464,7 +509,7 @@ reach the run page or the calling job.
 | `status`, `logs --tail N [--since D] [--timestamps] [--follow --timeout S]` | Release state, running state, unfinished work; the current release's bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
-| `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
+| `registry login --username U --token-file F \| --token-stdin [--registry ghcr.io\|docker.io]` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R [--deployment-branch B]` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| --all-servers \| (in an app directory)` | Prerequisites; helper probe (`--deep`: OS baseline, Caddy, sshd, ports once deployed, Docker when needed, disk, each application's state and consistency); every registered server read-only; access, helper, DNS. |
 

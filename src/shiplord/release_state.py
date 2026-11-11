@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Iterator
 
+from . import registries
 from .manifest import ManifestError, validate_manifest
 from .protocol import _invalid_constant, _unique_keys
 
@@ -22,7 +23,6 @@ MAX_SEQUENCE = 2**40  # release ordering key: the commit's committer timestamp, 
 _PHASES = ("prepared", "runtime-changing", "runtime-ready", "routing-changing", "routing-ready")
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_IMAGE = re.compile(r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _STOP_PHASES = ("intent", "restart_disabled", "signal_pending", "signalled", "kill_pending", "killed")
 _STOP_SIGNALS = re.compile(r"(?:SIG(?:HUP|INT|QUIT|USR1|USR2|TERM|ALRM|WINCH)|(?:[1-8]|1[0-8]|2[0-8]|3[01]))\Z")
@@ -55,8 +55,12 @@ def _release(value: object, app: str) -> dict:
         raise StateError("invalid release record")
     kind = artifact.get("kind")
     if kind == "docker":
-        if set(artifact) != {"kind", "image"} or not isinstance(artifact["image"], str) or not _IMAGE.fullmatch(artifact["image"]):
+        if set(artifact) != {"kind", "image"} or not isinstance(artifact["image"], str):
             raise StateError("invalid Docker artifact")
+        try:
+            artifact = {"kind": "docker", "image": registries.validate_pinned(artifact["image"])}
+        except registries.RegistryPolicyError:
+            raise StateError("invalid Docker artifact") from None
     elif kind == "native":
         if (set(artifact) != {"kind", "sha256", "size", "architecture"}
                 or not isinstance(artifact["sha256"], str) or not _DIGEST.fullmatch(artifact["sha256"])

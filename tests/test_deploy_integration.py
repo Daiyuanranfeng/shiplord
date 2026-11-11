@@ -25,14 +25,14 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fakes import FakeCaddy  # noqa: E402
-from shiplord import registry, release_state  # noqa: E402
+from shiplord import registries  # noqa: E402
 from shiplord.deploy import Deployer, identity  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
 from shiplord.probes import Probes  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION  # noqa: E402
 from shiplord.privileged_host import serve  # noqa: E402
-from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  # noqa: E402
+from shiplord.registry import PORT_RANGE, Registry, port_is_free, validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
 from shiplord.routing import RoutingError  # noqa: E402
@@ -137,8 +137,22 @@ class RealDockerDeployTests(unittest.TestCase):
     def setUpClass(cls):
         docker("info")
         cls.app = "fixture-" + secrets.token_hex(3)
-        for target, pattern in ((release_state, "_IMAGE"), (registry, "_REPOSITORY")):
-            patcher = patch.object(target, pattern, IMAGE_PATTERN if pattern == "_IMAGE" else REPOSITORY_PATTERN)
+        # The fixture registry is a localhost port, which the shipped policy does not accept. Only the host
+        # rule is replaced; the digest rule and every other check still run.
+        original_repository, original_pinned = registries.validate_repository, registries.validate_pinned
+
+        def local_repository(value):
+            if isinstance(value, str) and REPOSITORY_PATTERN.fullmatch(value):
+                return value
+            return original_repository(value)
+
+        def local_pinned(value):
+            if isinstance(value, str) and IMAGE_PATTERN.fullmatch(value):
+                return value
+            return original_pinned(value)
+
+        for name, replacement in (("validate_repository", local_repository), ("validate_pinned", local_pinned)):
+            patcher = patch.object(registries, name, replacement)
             patcher.start()
             cls.addClassCleanup(patcher.stop)
         cls.temp = tempfile.TemporaryDirectory()
@@ -711,7 +725,7 @@ class RealDockerDeployTests(unittest.TestCase):
         descriptor = os.open(self.layout.registrations, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, descriptor)
         with self.lock.acquire():
-            registration = registry.Registry(descriptor, self.lock).register(
+            registration = Registry(descriptor, self.lock).register(
                 self.app, deployment_uid=1001, deployment_user="ship-fixture", runtime="docker",
                 api_domain="fixture.example.test", image_repository=REPOSITORY,
                 probe=lambda port: port == self.port)

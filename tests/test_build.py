@@ -248,7 +248,8 @@ class ReleaseCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 2, result.output)
         self.assertEqual(docker.calls, [])
         deploy.assert_not_called()
-        self.assertIn("immutable reference", json.loads(result.stdout)["error"])
+        # The registry policy refuses the uppercase repository before Docker runs or the server is contacted.
+        self.assertIn("image repository", json.loads(result.stdout)["error"])
 
     def test_release_reports_the_build_and_deployment_in_readable_output(self):
         result, _docker, _git, deploy = self.invoke(["release"])

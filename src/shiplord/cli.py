@@ -665,7 +665,9 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
 
 @app.command(rich_help_panel="Setup")
 def provision(public_key: Optional[Path] = typer.Option(None, "--public-key", help="Public key to register."),
-              image_repository: Optional[str] = typer.Option(None, "--image-repository"),
+              image_repository: Optional[str] = typer.Option(
+                  None, "--image-repository",
+                  help="Image repository to allow (default: from ship.toml)."),
               max_memory_mb: Optional[int] = typer.Option(None, "--max-memory-mb", help="Ceiling for memory_mb (default 4096)."),
               update: bool = typer.Option(False, "--update", help="Apply a changed hostname or memory ceiling to an "
                                                                   "existing application; keep its state and keys."),
@@ -1023,7 +1025,8 @@ def _tailscale_settings(client_id: Optional[str], audience: Optional[str], tags:
 def registry_login_command(username: str = typer.Option(..., "--username"),
                            token_file: Optional[Path] = typer.Option(None, "--token-file", help="File holding the token."),
                            token_stdin: bool = typer.Option(False, "--token-stdin", help="Read the token from stdin."),
-                           registry: str = typer.Option("ghcr.io", "--registry"),
+                           registry: str = typer.Option("ghcr.io", "--registry",
+                                                        help="Registry host: ghcr.io (default) or docker.io."),
                            json_output: bool = typer.Option(False, "--json")) -> None:
     """Give this application a read-only registry login. The token is never taken from the command line."""
     manifest = _manifest(json_output)
@@ -1042,7 +1045,8 @@ def registry_login_command(username: str = typer.Option(..., "--username"),
 
 
 @registry_app.command("logout", rich_help_panel="Administration")
-def registry_logout_command(registry: str = typer.Option("ghcr.io", "--registry"),
+def registry_logout_command(registry: str = typer.Option("ghcr.io", "--registry",
+                                                         help="Registry host: ghcr.io (default) or docker.io."),
                             json_output: bool = typer.Option(False, "--json")) -> None:
     """Remove this application's registry login from the server."""
     manifest = _manifest(json_output)
