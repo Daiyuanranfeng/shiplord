@@ -125,6 +125,8 @@ class NativeSystemdTests(unittest.TestCase):
         cls.config.mkdir(exist_ok=True)
         cls.executable = shutil.which("shiplord")
         cls.environment = dict(os.environ, XDG_CONFIG_HOME=str(cls.config), HOME="/root")
+        # A developer's real Tailscale token must never reach a test: `github setup` would call the API.
+        cls.environment.pop("TAILSCALE_API_KEY", None)
         cls.setup_ssh()
         cls.build_fixtures()
         cls.addClassCleanup(cls.cleanup)
@@ -170,8 +172,8 @@ class NativeSystemdTests(unittest.TestCase):
         sh("systemctl", "disable", "--now", f"shiplord-{cls.app}.service", check=False)
 
     # helpers ------------------------------------------------------------------
-    def cli(self, *args, check=None, **kwargs):
-        result = subprocess.run([self.executable, *args], cwd=self.project, env=self.environment, capture_output=True,
+    def cli(self, *args, check=None, cwd=None, **kwargs):
+        result = subprocess.run([self.executable, *args], cwd=cwd or self.project, env=self.environment, capture_output=True,
                                 text=True, timeout=900, **kwargs)
         if check is not None and result.returncode != check:
             self.fail(f"shiplord {' '.join(args)} exited {result.returncode}, expected {check}\n{result.stdout}\n{result.stderr}")
@@ -318,10 +320,14 @@ class NativeSystemdTests(unittest.TestCase):
         self.assertIsNotNone(self.cli_json("status")["application"]["unfinished_transaction"])
         blocked = self.deploy("v3", 4001, check=1)
         self.assertEqual(blocked["error"], "recovery_required")
-        recovered = self.cli_json("recover")
+        # Recover by named target from a directory with no checkout; the app-scoped login is enough.
+        empty = ROOT / "empty"
+        empty.mkdir(exist_ok=True)
+        recovered = json.loads(self.cli("recover", self.app, "--server", "production", "--json", cwd=empty, check=0).stdout)
         self.assertEqual(recovered["status"], "recovered")
         self.assertIsNone(self.cli_json("status")["application"]["unfinished_transaction"])
         self.assertEqual(self.get("/version"), "slow")  # the last committed release is serving again
+        self.assertEqual(self.cli_json("recover")["status"], "nothing_to_recover")
 
     def test_11_rollback_restores_the_previous_release(self):
         result = self.cli_json("rollback")
@@ -345,6 +351,42 @@ class NativeSystemdTests(unittest.TestCase):
         releases = list(Path(f"/opt/shiplord/{self.app}").glob("*/app"))
         self.assertEqual(len(releases), 2)  # exactly current and previous: failed and interrupted candidates are gone
         self.assertEqual(list(Path(f"/var/lib/shiplord/apps/{self.app}/staging").glob("*")), [])
+
+    def write_manifest(self, memory_mb, origins, container_port):
+        manifest = self.project / "ship.toml"
+        lines = []
+        for line in manifest.read_text().splitlines():
+            if line.startswith("frontend_origins = "):
+                line = f"frontend_origins = [{', '.join(json.dumps(origin) for origin in origins)}]"
+            elif line.startswith("container_port = "):
+                line = f"container_port = {container_port}"
+            elif line.startswith("memory_mb = "):
+                line = f"memory_mb = {memory_mb}"
+            lines.append(line)
+        manifest.write_text("\n".join(lines) + "\n")
+
+    def test_14_a_failed_route_change_restarts_the_committed_configuration(self):
+        """The unit name does not encode configuration, so the restart must compare the files a start writes."""
+        self.write_manifest(self.MEMORY_MB, [], 8080)
+        self.assertEqual(self.deploy("v2", 6000)["status"], "succeeded")
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.get("/env/ALLOW_ORIGINS"), "[]")
+
+        # Same binary, commit, sequence, and therefore the same unit: only the configuration differs.
+        self.write_manifest(self.MEMORY_MB + 64, ["https://b.example.test"], 8081)
+        prior = Path("/etc/caddy/ship") / f".prior-{self.app}"
+        prior.write_text("# planted: an earlier route change was interrupted\n")  # makes the routing step fail
+        failed = self.deploy("v2", 6000, check=5)
+        self.assertEqual((failed["status"], failed["kind"]), ("rolled_back", "interrupted"))
+        self.assertFalse(prior.exists())  # the verified restore reconciled the route
+
+        self.assertEqual(self.show("MemoryMax")["MemoryMax"], str(self.MEMORY_MB * 1024 * 1024))
+        unit = Path(f"/etc/systemd/system/shiplord-{self.app}.service").read_text()
+        self.assertIn(f"MemoryMax={self.MEMORY_MB}M\n", unit)
+        self.assertIn(f"SocketBindAllow=tcp:{self.port}\n", unit)
+        self.assertIn('ALLOW_ORIGINS="[]"', Path(f"/etc/shiplord/env/{self.app}/native.env").read_text())
+        self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.get("/env/ALLOW_ORIGINS"), "[]")
 
 
 if __name__ == "__main__":
