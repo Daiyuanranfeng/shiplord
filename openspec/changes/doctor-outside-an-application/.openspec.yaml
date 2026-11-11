@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-11-10
+goal: "Fix issue #45: doctor falls back to local checks when there is no ship.toml"
