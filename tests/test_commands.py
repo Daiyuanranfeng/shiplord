@@ -237,6 +237,38 @@ class DeployCommandTests(ClientTestCase):
                 self.deploy(**kwargs)
         self.assertEqual(self.commands, [])
 
+    def test_a_timed_out_deploy_reports_a_copyable_lookup_command(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+        seen = {}
+        ticks = iter(range(0, 1000, 10))
+
+        def wait(client, job_id, **options):
+            seen.update(options)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda seconds: None,
+                                                    clock=lambda: next(ticks)))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        with self.assertRaises(ClientError) as caught:
+            commands.deploy_application(manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000,
+                                        request_id="req-1", timeout=25)
+        lookup = "shiplord status orders --server production --job-id req-1"
+        self.assertEqual(seen["lookup_command"], lookup)
+        self.assertIn(lookup, str(caught.exception))
+        self.assertIn("may still be running", str(caught.exception))
+
+    def test_a_finished_rollback_can_be_looked_up_with_a_zero_exit_code(self):
+        self.deploy()
+        from fakes import record
+        from shiplord.runtime import release_id
+        self.runtime.start_errors[release_id(record(commit="c", image="d", sequence=1001))] = RuntimeFailure("boom", "start")
+        code, result = self.deploy(request_id="req-2", image="ghcr.io/example/orders@sha256:" + "d" * 64,
+                                   commit=OTHER, sequence=1001)
+        self.assertEqual((code, result["status"]), (5, "rolled_back"))
+        code, status = commands.application_status(self.client, "req-2")
+        self.assertEqual((code, status["job"]["state"], status["job"]["outcome"]["status"],
+                          status["job"]["outcome"]["exit_code"]), (0, "finished", "rolled_back", 5))
+
 
 class QueryCommandTests(ClientTestCase):
     def test_plan_status_and_logs_use_read_only_actions(self):
@@ -250,6 +282,27 @@ class QueryCommandTests(ClientTestCase):
                 commands.application_logs(self.client, tail)
         code, status = commands.application_status(self.client)
         self.assertEqual((code, status["application"]["current"], status["job"]), (0, None, None))
+
+    def test_job_lookup_is_read_only_and_reports_the_recorded_outcome(self):
+        commit, arguments = self.deploy_arguments()
+        self.client.call("deploy", request_id="req-1", commit=commit, arguments=arguments)
+        launched = len(self.launcher.launched)
+        code, status = commands.application_status(self.client, "req-1")
+        self.assertEqual((code, status["job"]["state"], status["job"]["phase"]), (0, "queued", "queued"))
+        self.assertEqual(len(self.launcher.launched), launched)  # a lookup starts no new work
+        run_job(self.services, "orders", "req-1")
+        code, status = commands.application_status(self.client, "req-1")
+        self.assertEqual((code, status["job"]["state"], status["job"]["outcome"]["status"]),
+                         (0, "finished", "succeeded"))
+
+    def test_job_lookup_reports_an_unknown_job_and_rejects_a_malformed_id(self):
+        code, status = commands.application_status(self.client, "missing")
+        self.assertEqual((code, status["job"]), (0, None))
+        before = len(self.commands)
+        with self.assertRaises(CommandError) as malformed:
+            commands.application_status(self.client, "../etc/passwd")
+        self.assertEqual(malformed.exception.code, 2)
+        self.assertEqual(len(self.commands), before)  # rejected before any remote request
 
     def test_rollback_and_recover_run_as_jobs_and_return_their_exit_codes(self):
         import shiplord.client as client_module

@@ -613,6 +613,9 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
     target = f"{application} on {server}" if server else application
     typer.echo(f"Target: {target}")
     typer.echo(f"Outcome: {outcome}")
+    job = result.get("job")
+    if isinstance(job, dict):
+        _render_job(job)
     typer.echo(f"Current release: {_short_release(current)}")
     if previous is not None:
         typer.echo(f"Previous release: {_short_release(previous)}")
@@ -624,6 +627,16 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
         typer.echo(f"Unfinished transaction: {phase} ({transaction.get('request_id', 'request ID unavailable')})")
         typer.echo("Why: the server has an unfinished deployment transaction that must be reconciled before another deploy.")
         typer.echo("Next: run `shiplord recover` from this application's repository.")
+
+
+def _render_job(job: dict) -> None:
+    typer.echo(f"Job: {job.get('request_id', 'unknown')}")
+    state = str(job.get("state", "unknown"))
+    typer.echo(f"Job state: {state}")
+    typer.echo(f"Job phase: {job.get('phase', 'unknown')}")
+    outcome = job.get("outcome")
+    if state == "finished" and isinstance(outcome, dict):
+        typer.echo(f"Job outcome: {outcome.get('status', 'unknown')} (exit {outcome.get('exit_code', 'unknown')})")
 
 
 def _render_operation(code: int, result: dict, target: str, operation: str) -> None:
@@ -905,6 +918,7 @@ def deploy(image: Optional[str] = typer.Option(None, "--image", help="Immutable 
 @app.command(rich_help_panel="Quick start")
 def status(application: Optional[str] = typer.Argument(None, metavar="APP"),
            server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
+           job_id: Optional[str] = typer.Option(None, "--job-id", help="Look up a deployment job by request ID."),
            json_output: bool = typer.Option(False, "--json")) -> None:
     """Show the deployed release, the previous release, and any unfinished transaction."""
     try:
@@ -913,10 +927,13 @@ def status(application: Optional[str] = typer.Argument(None, metavar="APP"),
         _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
     try:
-        _code, result = commands.application_status(client)
+        _code, result = commands.application_status(client, job_id)
     except (CommandError, ClientError) as error:
         _fail(_recovery_hint(str(error)), error.code, json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
+    if job_id is not None and result.get("job") is None:
+        target = f"{app_name} on {server_alias}" if server_alias else app_name
+        _fail(f"no job {job_id!r} is recorded for {target}; it may have expired", 1, json_output)
     if json_output:
         _emit(result, True)
     else:

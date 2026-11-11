@@ -47,7 +47,7 @@ application's state including any unfinished transaction.
 | Caddy rejects the route | The previous file is restored and Caddy reloaded; exit 5. | Check the hostname and Caddy logs. |
 | Worker or host dies mid-deployment | Journal stays; deploys refused with `recovery_required`. | `shiplord recover`. |
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
-| Client disconnects | The job continues. | `shiplord status`. |
+| Client disconnects | The job continues. | `shiplord status <app> --server <alias> --job-id <id>`. |
 
 Storage: the application volume is never removed by deploy, rollback, recover, retirement or retention. If a deploy is
 refused with phase `storage`, the volume has another driver, driver options, another application's label, or no retained

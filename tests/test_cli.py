@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
@@ -15,9 +16,10 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from shiplord import cli
-from shiplord.client import ClientError
+from shiplord.client import ClientError, HelperClient
 from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
+from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
 
 MANIFEST = '''schema_version = 1
@@ -844,6 +846,67 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertIn("Outcome: recovery required", result.output)
         self.assertIn("unfinished deployment transaction", result.output)
         self.assertIn("shiplord recover", result.output)
+
+    @staticmethod
+    def empty_application() -> dict:
+        return {"application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": None, "running": None}
+
+    def invoke_status_job(self, status_result: dict, job_id: str = "req-1", *, as_json: bool = False):
+        """Run `status --job-id` against a helper that records every request frame it receives."""
+        calls = []
+
+        def runner(command, payload, timeout):
+            message = read_frame(io.BytesIO(payload))
+            calls.append(message)
+            buffer = io.BytesIO()
+            write_frame(buffer, {"status": "ok", "request_id": message["request_id"], "result": status_result})
+            return buffer.getvalue(), b"", 0
+
+        client = HelperClient("orders", "ship-orders@host.example.com", runner=runner)
+        arguments = ["status", "orders", "--server", "hetzner-vm", "--job-id", job_id]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._app_context", return_value=("orders", "hetzner-vm", client)):
+            return CliRunner().invoke(cli.app, arguments), calls
+
+    def test_status_job_lookup_uses_only_the_read_only_status_action(self):
+        job = {"request_id": "req-1", "action": "deploy", "state": "running", "phase": "preparing",
+               "submitted_at": 1, "started_at": 2, "finished_at": None, "outcome": None}
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": job})
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual([message["action"] for message in calls], ["status"])
+        self.assertEqual(calls[0]["application_id"], "orders")
+        self.assertEqual(calls[0]["arguments"], {"job_id": "req-1"})
+        self.assertIn("Job: req-1", result.stdout)
+        self.assertIn("Job state: running", result.stdout)
+        self.assertIn("Job phase: preparing", result.stdout)
+
+    def test_finished_job_reports_rollback_and_json_keeps_the_helper_record(self):
+        job = {"request_id": "req-1", "action": "deploy", "state": "finished", "phase": "finished",
+               "submitted_at": 1, "started_at": 2, "finished_at": 3,
+               "outcome": {"status": "rolled_back", "exit_code": 5, "detail": {"error": "readiness_failed"}}}
+        result, _ = self.invoke_status_job({"application": self.empty_application(), "job": job})
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Job state: finished", result.stdout)
+        self.assertIn("Job outcome: rolled_back (exit 5)", result.stdout)
+        as_json, _ = self.invoke_status_job({"application": self.empty_application(), "job": job}, as_json=True)
+        self.assertEqual(as_json.exit_code, 0, as_json.output)
+        self.assertEqual(json.loads(as_json.stdout)["job"], job)
+
+    def test_unknown_job_id_is_a_clear_nonzero_error(self):
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": None})
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("no job 'req-1' is recorded for orders on hetzner-vm", result.stdout)
+        self.assertIn("may have expired", result.stdout)
+        self.assertEqual(len(calls), 1)  # the read-only lookup was attempted before reporting it
+
+    def test_malformed_job_id_is_rejected_before_any_remote_request(self):
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": None},
+                                               job_id="../etc/passwd")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("--job-id", result.stdout)
+        self.assertEqual(calls, [])
 
     def invoke_remote_plan(self, plan_result: dict, *, as_json: bool = False):
         arguments = ["plan", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]

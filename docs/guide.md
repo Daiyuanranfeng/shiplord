@@ -393,7 +393,7 @@ reach the run page or the calling job.
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
-| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
+| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
