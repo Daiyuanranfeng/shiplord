@@ -60,6 +60,9 @@ requested optional features in one capabilities call before submitting `plan` or
 `shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
 (`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
 
+`runtime_knobs_v1` means the helper honours `resources.cpu_limit`, `deploy.init`, `deploy.readiness_status`, and
+`deploy.readiness_interval_seconds`, and refuses any value outside their documented ranges before a release is stored.
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered

@@ -80,9 +80,6 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
-        if "owner_uid" in candidate["configuration"].get("storage", {}):
-            # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
-            raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
         if candidate["artifact"]["kind"] == "docker":
             if candidate["artifact"]["image"].split("@", 1)[0] != registration["image_repository"]:
                 raise StateError("the image repository is not the one registered for this application")

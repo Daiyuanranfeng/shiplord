@@ -241,12 +241,36 @@ slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`,
 - Using `[storage]` needs a helper that advertises `docker_storage_v1`; a newer CLI refuses to submit it to an
   older helper (re-run `shiplord server bootstrap`). A helper must not be downgraded after deploying records that
   use `[storage]`.
-- `owner_uid` / `owner_gid` are validated but **not yet supported**: the helper rejects them, because establishing
-  ownership safely needs a pinned initializer image that has not been built and reviewed.
+- `owner_uid` / `owner_gid` are **not supported** and are refused when `ship.toml` is loaded, never at deploy:
+  establishing ownership safely needs a pinned initializer image that has not been built and reviewed. Have the
+  image establish the mount directory's ownership during its build instead.
 - An image can establish the mount directory's ownership during its build. Verify a fresh volume is writable
   by the image's application user with real Docker before deployment. Shiplord does not repair existing
   volume permissions, and changing the mount path does not migrate data from another application.
 
+## Runtime limits and readiness
+
+```toml
+[resources]
+memory_mb = 512
+cpu_limit = 0.5                    # CPUs, 0.01-64; default: no CPU limit
+
+[deploy]
+init = true                        # Docker only; run an init process as PID 1
+readiness_status = 204             # HTTP status that means ready; 100-599, default 200
+readiness_interval_seconds = 5     # seconds between readiness polls; 1-60, default 1
+```
+
+- `resources.cpu_limit` reaches Docker as `--cpus`. It is a number of CPUs, so `0.5` is half a CPU and `2` is two.
+  It is refused for native applications, whose systemd unit has no matching setting yet.
+- `deploy.init` adds Docker's `--init`, so an init process reaps orphaned children and forwards signals. The flag
+  is only added when the value is `true`; omitting it keeps the previous behaviour. It is refused for native
+  applications.
+- `readiness_status` is the one HTTP status that counts as ready, including in the post-deploy public HTTPS check.
+  `readiness_interval_seconds` is the pause between polls; `deploy.readiness_timeout_seconds` still bounds the whole
+  wait. Both apply to Docker and native releases, and omitting them keeps 200 and one second.
+- These settings need a helper that advertises `runtime_knobs_v1`; re-run `shiplord server bootstrap` when a newer
+  CLI refuses to submit them. An older helper also refuses them, because its manifest validator rejects unknown keys.
 ## Application data
 
 Each application gets exactly one persistent location, and Shiplord leaves it alone. This is the supported

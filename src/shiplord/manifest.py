@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import re
 import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .probes import ReadinessError, validate_interval, validate_status
 from .shutdown import ShutdownError, validate_action, validate_timeout
 from .storage import StorageError, validate_storage
 
@@ -21,7 +23,9 @@ _DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 GENERIC_DOCKER_FEATURE = "docker_generic_v1"
 DEFAULT_DEPLOYMENT_BRANCH = "main"
+RUNTIME_KNOBS_FEATURE = "runtime_knobs_v1"  # capability a helper advertises when it honours the knobs below
 MAX_READINESS_SECONDS = 900  # the ceiling for deploy.readiness_timeout_seconds
+MIN_CPUS, MAX_CPUS = 0.01, 64.0
 
 
 def _table(value: object, name: str, allowed: set[str]) -> dict:
@@ -42,6 +46,22 @@ def _integer(value: object, name: str, minimum: int, maximum: int) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ManifestError(f"{name} must be an integer between {minimum} and {maximum}")
     return value
+
+
+def _boolean(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise ManifestError(f"{name} must be true or false")
+    return value
+
+
+def _cpus(value: object) -> float:
+    """A number of CPUs, as Docker's ``--cpus`` takes it (fractions are allowed)."""
+    if type(value) not in (int, float):
+        raise ManifestError(f"resources.cpu_limit must be a number between {MIN_CPUS:g} and {MAX_CPUS:g}")
+    cpus = float(value)
+    if not math.isfinite(cpus) or not MIN_CPUS <= cpus <= MAX_CPUS:
+        raise ManifestError(f"resources.cpu_limit must be a number between {MIN_CPUS:g} and {MAX_CPUS:g}")
+    return cpus
 
 
 def validate_app_name(value: object) -> str:
@@ -160,19 +180,39 @@ def validate_manifest(raw: dict) -> dict:
     if len(set(validated_origins)) != len(validated_origins):
         raise ManifestError("http.frontend_origins must not contain duplicates")
     port = _integer(http.get("container_port"), "http.container_port", 1, 65535)
-    readiness = validate_readiness_path(http.get("readiness_path"))
+    readiness_path = validate_readiness_path(http.get("readiness_path"))
 
-    resources = _table(root.get("resources"), "resources", {"memory_mb"})
+    resources = _table(root.get("resources"), "resources", {"memory_mb", "cpu_limit"})
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
+    cpus = None
+    if "cpu_limit" in resources:
+        if runtime != "docker":
+            raise ManifestError("resources.cpu_limit applies only to Docker applications")
+        cpus = _cpus(resources["cpu_limit"])
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases",
-                                                   "shutdown_timeout_seconds", "shutdown_timeout_action"})
+                                                   "shutdown_timeout_seconds", "shutdown_timeout_action",
+                                                   "readiness_status", "readiness_interval_seconds", "init"})
     timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1,
                        MAX_READINESS_SECONDS)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
+    readiness_knobs = {}
+    for field, check in (("readiness_status", validate_status), ("readiness_interval_seconds", validate_interval)):
+        if field in deploy:
+            try:
+                readiness_knobs[field] = check(deploy[field])
+            except ReadinessError as error:
+                raise ManifestError(str(error)) from None
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
-            "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness},
+            "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness_path},
             "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}
+    if cpus is not None:
+        result["resources"]["cpu_limit"] = cpus
+    result["deploy"].update(readiness_knobs)
+    if "init" in deploy:
+        if runtime != "docker":
+            raise ManifestError("deploy.init applies only to Docker applications")
+        result["deploy"]["init"] = _boolean(deploy["init"], "deploy.init")
     for field, check in (("shutdown_timeout_seconds", validate_timeout), ("shutdown_timeout_action", validate_action)):
         if field in deploy:
             if runtime != "docker":

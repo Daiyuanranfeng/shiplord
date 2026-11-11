@@ -295,7 +295,7 @@ class RegistryCommandTests(unittest.TestCase):
 class DeployCommandTests(ClientTestCase):
     def deploy(self, **overrides):
         options = dict(image=IMAGE, commit=COMMIT, sequence=1000, request_id="req-1", timeout=60,
-                       public_check=lambda domain, path: {"ok": True, "status": 200, "error": None})
+                       public_check=lambda domain, path, **kwargs: {"ok": True, "status": 200, "error": None})
         options.update(overrides)
         import shiplord.client as client_module
         original = client_module.wait_for_job
@@ -313,7 +313,7 @@ class DeployCommandTests(ClientTestCase):
         self.assertEqual((result["request_id"], result["url"]), ("req-1", "https://orders.example.com"))
 
     def test_public_verification_is_reported_but_only_fails_the_command_when_required(self):
-        failing = lambda domain, path: {"ok": False, "status": None, "error": "dns_unresolved"}  # noqa: E731
+        failing = lambda domain, path, **kwargs: {"ok": False, "status": None, "error": "dns_unresolved"}  # noqa: E731
         code, result = self.deploy(public_check=failing)
         self.assertEqual((code, result["ok"], result["public"]["error"]), (0, True, "dns_unresolved"))
         code, result = self.deploy(public_check=failing, request_id="req-2", require_public=True)
@@ -731,6 +731,12 @@ class PublicCheckTests(unittest.TestCase):
     def test_a_verified_200_passes_and_retries_while_the_service_settles(self):
         self.assertEqual(self.check([200]), {"ok": True, "status": 200, "error": None})
         self.assertTrue(self.check([503, 502, 200])["ok"])
+
+    def test_a_configured_readiness_status_is_the_one_that_passes(self):
+        self.assertEqual(self.check([204], ready_status=204), {"ok": True, "status": 204, "error": None})
+        ticks = iter(range(0, 10000, 20))
+        self.assertEqual(self.check([204], clock=lambda: next(ticks)),
+                         {"ok": False, "status": 204, "error": "unexpected_status"})
 
     def test_failures_are_classified_after_the_deadline(self):
         ticks = iter(range(0, 10000, 20))

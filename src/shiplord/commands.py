@@ -19,7 +19,8 @@ from .client import AdminClient, ClientError, HelperClient, new_request_id, subm
 from .jobs import valid_job_id
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
-from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS
+from .manifest import GENERIC_DOCKER_FEATURE, MAX_READINESS_SECONDS, RUNTIME_KNOBS_FEATURE
+from .probes import DEFAULT_READY_STATUS
 from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_LOG_LINES, RuntimeFailure, validate_follow_timeout,
                       validate_since)
 from .servers import ServerError
@@ -241,10 +242,10 @@ def _deploy_arguments(manifest: dict, artifact: str | dict, sequence: int, allow
     return arguments
 
 
-def check_public_https(domain: str, path: str, *, timeout: float = 60, interval: float = 5,
+def check_public_https(domain: str, path: str, *, ready_status: int = 200, timeout: float = 60, interval: float = 5,
                        sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
                        context: ssl.SSLContext | None = None, port: int = 443, host: str | None = None) -> dict:
-    """Does the public name answer 200 over verified TLS? Retries while DNS or certificates settle."""
+    """Does the public name answer the readiness status over verified TLS? Retries while DNS or certificates settle."""
     deadline, last = clock() + timeout, {"ok": False, "status": None, "error": "not_checked"}
     context = context or ssl.create_default_context()
     address = host or domain
@@ -262,7 +263,8 @@ def check_public_https(domain: str, path: str, *, timeout: float = 60, interval:
                 status = connection.getresponse().status
             finally:
                 connection.close()
-            last = {"ok": status == 200, "status": status, "error": None if status == 200 else "unexpected_status"}
+            last = {"ok": status == ready_status, "status": status,
+                    "error": None if status == ready_status else "unexpected_status"}
             if last["ok"]:
                 return last
         except ssl.SSLCertVerificationError:
@@ -291,6 +293,12 @@ def uses_shutdown_policy(manifest: dict) -> bool:
     return any(key in manifest["deploy"] for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
 
 
+def uses_runtime_knobs(manifest: dict) -> bool:
+    """A manifest asks for a knob an older helper would not apply (its validator would refuse it)."""
+    return ("cpu_limit" in manifest["resources"] or "init" in manifest["deploy"]
+            or any(key in manifest["deploy"] for key in ("readiness_status", "readiness_interval_seconds")))
+
+
 def require_feature_support(manifest: dict, client: HelperClient) -> None:
     """Refuse settings an older helper would ignore, before submitting a plan or a job."""
     required = {}
@@ -298,6 +306,8 @@ def require_feature_support(manifest: dict, client: HelperClient) -> None:
         required[STORAGE_FEATURE] = "[storage]"
     if uses_shutdown_policy(manifest):
         required[SHUTDOWN_FEATURE] = "shutdown_timeout_*"
+    if uses_runtime_knobs(manifest):
+        required[RUNTIME_KNOBS_FEATURE] = "cpu_limit, init or the readiness settings"
     if manifest["template"] == "generic":
         required[GENERIC_DOCKER_FEATURE] = "template = generic"
     if not required:
@@ -344,7 +354,8 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     if code == 0:
         result["url"] = "https://" + manifest["http"]["api_domain"]
     if code == 0 and outcome["status"] in ("succeeded", "unchanged", "already_applied") and verify_public:
-        result["public"] = public_check(manifest["http"]["api_domain"], manifest["http"]["readiness_path"])
+        result["public"] = public_check(manifest["http"]["api_domain"], manifest["http"]["readiness_path"],
+                                        ready_status=manifest["deploy"].get("readiness_status", DEFAULT_READY_STATUS))
         if require_public and not result["public"]["ok"]:
             result["ok"], code = False, 1
             result["error"] = "the deployment is live on the server, but the public HTTPS check failed"

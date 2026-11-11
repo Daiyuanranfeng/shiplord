@@ -188,6 +188,14 @@ class HttpsTests(unittest.TestCase):
             port = probe.getsockname()[1]
         self.assertEqual(Probes(https_port=port).https(REGISTRATION, RELEASE)["error"], "connection_failed")
 
+    def test_the_configured_readiness_status_is_the_one_that_verifies(self):
+        trusted = ssl.create_default_context(cafile=str(self.cert))
+        probes = Probes(https_port=self.tls_server(b"HTTP/1.1 204 No Content\r\n\r\n"), https_context=trusted)
+        self.assertFalse(probes.https(REGISTRATION, RELEASE)["verified"])
+        configured = {"configuration": {"http": {"readiness_path": "/ready"},
+                                        "deploy": {"readiness_timeout_seconds": 5, "readiness_status": 204}}}
+        self.assertTrue(probes.https(REGISTRATION, configured)["verified"])
+
 
 class DnsTests(unittest.TestCase):
     def test_resolves_localhost_and_reports_failures_as_empty(self):

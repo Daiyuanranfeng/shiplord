@@ -99,6 +99,11 @@ def _digest(image: str) -> str:
     return image.rpartition("@")[2]
 
 
+def cpu_limit_arg(cpus: float) -> str:
+    """Docker's ``--cpus`` takes a decimal CPU count; a whole number is written without a trailing ``.0``."""
+    return str(int(cpus)) if float(cpus).is_integer() else repr(float(cpus))
+
+
 def _registry(image: str) -> str:
     """The registry host an image reference names, so a message can say where an image has to come from."""
     return image.split("/", 1)[0]
@@ -630,6 +635,10 @@ class DockerRuntime:
         argv += ["--stop-timeout", str(timeout),
                  "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
                  "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
+        if "cpu_limit" in config["resources"]:
+            argv += ["--cpus", cpu_limit_arg(config["resources"]["cpu_limit"])]
+        if config["deploy"].get("init"):  # a manifest that does not ask for it keeps the old container behavior
+            argv.append("--init")
         if custom is not None:
             argv += ["--env-file", str(self.layout.environments / registration["application_id"] / "app.env")]
         for key, value in _managed_environment(registration, config).items():  # after --env-file, so they win

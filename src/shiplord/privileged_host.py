@@ -17,7 +17,7 @@ from .host import HostDeadline, extend_deadline, run_timed
 from .jobs import MAX_PENDING_JOBS, JobError, valid_job_id
 from .native import host_architecture
 from .payload import PayloadError, discard_upload, receive_payload
-from .manifest import GENERIC_DOCKER_FEATURE, ManifestError
+from .manifest import GENERIC_DOCKER_FEATURE, ManifestError, RUNTIME_KNOBS_FEATURE
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
 from .release_state import StateError
 from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_FOLLOW_SECONDS, MAX_LOG_LINES, release_id, validate_follow_timeout,
@@ -33,7 +33,7 @@ UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to fini
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
 ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
-FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE]
+FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE, RUNTIME_KNOBS_FEATURE]
 
 
 class _UploadRejected(Exception):
