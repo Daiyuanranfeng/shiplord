@@ -29,6 +29,11 @@ class AdminDenied(Exception):
     """The caller is not allowed to administer the host."""
 
 
+# Enumerated deliberately: an action that changes host state must take the host lock, so a new action is mutating
+# unless it is listed here. Read-only actions never take it, so a slow deploy cannot block an operator diagnosing one.
+READ_ONLY_ACTIONS = frozenset({"doctor", "apps"})
+
+
 def parse_request(message: object) -> dict:
     request = validate_request(message, require_compatible=False, actions=ADMIN_ACTIONS)
     hostwide = request["action"] in {"doctor", "apps"}
@@ -51,7 +56,7 @@ def _check_caller(layout: Layout, lock: HostLock, environ: dict[str, str]) -> No
 
 
 def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dict:
-    """Run one validated administration request; the caller holds the host lock."""
+    """Run one validated administration request. A read-only action takes no host lock; the caller holds it otherwise."""
     app, args, action = request["application_id"], request["arguments"], request["action"]
     if action == "doctor":
         if args:
@@ -99,9 +104,12 @@ def run(message: object, layout: Layout, system: System, environ: dict[str, str]
         descriptor = os.open(layout.var, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             lock = HostLock(descriptor)
-            with lock.acquire():
-                _check_caller(layout, lock, environ)
+            _check_caller(layout, lock, environ)  # a read of the registry: it needs no lock either
+            if request["action"] in READ_ONLY_ACTIONS:
                 result = handle(request, layout, system, lock)
+            else:
+                with lock.acquire():
+                    result = handle(request, layout, system, lock)
         finally:
             os.close(descriptor)
         return {"status": "ok", "request_id": request_id, "result": result}, 0

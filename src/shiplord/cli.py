@@ -18,7 +18,9 @@ from . import __version__
 from . import commands, github, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
-from .configure import ConfigurationError, collect_answers, create_manifest
+from .configure import (ConfigurationError, collect_answers, create_manifest, resolve_image_repository,
+                        validate_repository)
+from .keys import KeyError_, parse_public_key, validate_label
 from .manifest import ManifestError, load_manifest
 from .layout import deployment_user
 from .protocol import IncompatibleProtocol
@@ -30,7 +32,9 @@ from .transport import TransportError, probe_capabilities
 app = typer.Typer(no_args_is_help=True, help="Create, provision, and ship applications to a server.")
 server_app = typer.Typer(no_args_is_help=True, help="Manage servers.")
 github_app = typer.Typer(no_args_is_help=True, help="Configure GitHub Actions deployments.")
+keys_app = typer.Typer(no_args_is_help=True, help="Manage the SSH keys that may deploy this application.")
 env_app = typer.Typer(no_args_is_help=True, help="Manage an application's runtime environment on the server.")
+app.add_typer(keys_app, name="keys", rich_help_panel="Administration")
 app.add_typer(env_app, name="env", rich_help_panel="Administration")
 registry_app = typer.Typer(no_args_is_help=True, help="Manage the server's read-only pull login for private images.")
 app.add_typer(registry_app, name="registry", rich_help_panel="Administration")
@@ -162,13 +166,9 @@ def _server_inventory(server: dict, json_output: bool) -> tuple[int, dict]:
         version = response.get("helper_version")
     except (TransportError, IncompatibleProtocol, ServerError):
         version = None
-    # Only stable SemVer releases have an unambiguous compatibility ordering.
-    stable_version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-    match = re.fullmatch(stable_version, version) if isinstance(version, str) else None
-    if match and tuple(map(int, match.groups())) < (0, 2, 0):
-        return 4, {"ok": False, "error": "App inventory requires helper 0.2.0 or later.",
-                   "error_code": "helper_upgrade_required", "helper_version": version,
-                   "minimum_helper_version": "0.2.0", "upgrade_command": f"shiplord server bootstrap {server['alias']}"}
+    upgrade = commands.inventory_upgrade(server["alias"], version)
+    if upgrade is not None:
+        return 4, {"ok": False, **upgrade}
     prompt = None if json_output else _interactive_admin_prompt(False)
     return commands.server_applications(AdminClient(server["ssh"], prompt=prompt))
 
@@ -253,9 +253,18 @@ def plan(image: Optional[str] = typer.Option(None, "--image", help="Ask the serv
 @app.command(rich_help_panel="Troubleshooting")
 def doctor(local: bool = typer.Option(False, "--local", help="Check local prerequisites."),
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
+           all_servers: bool = typer.Option(False, "--all-servers",
+                                            help="Probe every registered server (read-only, no sudo)."),
            deep: bool = typer.Option(False, "--deep", help="With --server: also check Caddy, sshd, Docker, disk, and applications (sudo)."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
-    """Check local prerequisites or a server's protocol capabilities."""
+    """Check local prerequisites or a server's protocol capabilities; without a manifest, check local only."""
+    if all_servers:
+        for name, chosen in (("--local", local), ("--server", server is not None), ("--deep", deep)):
+            if chosen:
+                _emit({"ok": False, "error": f"--all-servers cannot be combined with {name}"}, json_output)
+                raise typer.Exit(2)
+        _doctor_all_servers(json_output)
+        return
     if local and server:
         _emit({"ok": False, "error": "choose either --local or --server"}, json_output)
         raise typer.Exit(2)
@@ -291,25 +300,48 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
             typer.echo(f"Client: shiplord {__version__} at {result['client']['executable']}")
             typer.echo(f"Server helper: {response['helper_version']}")
         return
-    if not local:
-        manifest = _manifest(json_output)
-        def action() -> tuple[int, dict]:
-            code, result = commands.application_doctor(manifest, _helper(manifest))
-            result["client"] = _client_details()
-            return code, result
-        _execute(action, json_output, lambda code, result: _render_doctor(
-            result, f"{manifest['name']} on {manifest['server']}"))
+    if local or not _manifest_present():
+        result = _local_checks()
+        if json_output:
+            _emit(result, True)
+        else:
+            _render_doctor(result, "local machine")
+            if not local:
+                typer.echo("Server readiness was not checked: this directory has no ship.toml.")
+                typer.echo("Next: run `shiplord configure` here to create an application, or run "
+                           "`shiplord doctor --server <alias>` to check a registered server.")
+        if not result["ok"]:
+            raise typer.Exit(3)
         return
-    checks = {name: bool(shutil.which(name)) for name in ("ssh", "git", "gh")}
-    ok = all(checks.values())
-    result = {"ok": ok, "scope": "local prerequisites only; server readiness was not checked",
-              "checks": checks, "client": _client_details()}
+    manifest = _manifest(json_output)
+    def action() -> tuple[int, dict]:
+        code, result = commands.application_doctor(manifest, _helper(manifest))
+        result["client"] = _client_details()
+        return code, result
+    _execute(action, json_output, lambda code, result: _render_doctor(
+        result, f"{manifest['name']} on {manifest['server']}"))
+
+
+def _doctor_all_servers(json_output: bool) -> None:
+    """Probe every registered server once, continuing past a failure; sudo and bootstrap are never involved."""
+    try:
+        servers, invalid = list_servers()
+    except ServerError as error:
+        _fail(str(error), 3, json_output)
+    if not servers:
+        _fail("No servers are registered. Run `shiplord server add`, then `shiplord doctor --all-servers`.",
+              3, json_output)
+    code, result = commands.doctor_all_servers(servers)
+    if invalid:
+        result.update(ok=False, partial=True, invalid_entries=invalid)
+        code = 3
+    result["client"] = _client_details()
     if json_output:
         _emit(result, True)
     else:
-        _render_doctor(result, "local machine")
-    if not ok:
-        raise typer.Exit(3)
+        _render_fleet_doctor(result)
+    if code:
+        raise typer.Exit(code)
 
 
 @server_app.command("add", rich_help_panel="Setup")
@@ -321,7 +353,7 @@ def server_add(alias: str, ssh: str = typer.Option(..., "--ssh")) -> None:
         typer.echo(f"error: {exc}", err=True)
         code = 2 if isinstance(exc, (ManifestError, InvalidTarget)) else 3 if isinstance(exc, SSHCheckError) else 1
         raise typer.Exit(code) from None
-    typer.echo("Server alias saved. Run `shiplord server bootstrap` next. CI host-key setup is not implemented yet.")
+    typer.echo("Server alias saved. Run `shiplord server bootstrap` next.")
 
 
 @server_app.command("list", rich_help_panel="Administration")
@@ -353,6 +385,18 @@ def _manifest(json_output: bool = False) -> dict:
         return load_manifest()
     except ManifestError as error:
         _fail(str(error), 2, json_output)
+
+
+def _manifest_present() -> bool:
+    """A ship.toml that exists stays authoritative, even when it is a link that does not resolve."""
+    return Path("ship.toml").exists() or Path("ship.toml").is_symlink()
+
+
+def _local_checks() -> dict:
+    """The local prerequisite report shared by `--local` and the fallback when no manifest is present."""
+    checks = {name: bool(shutil.which(name)) for name in ("ssh", "git", "gh")}
+    return {"ok": all(checks.values()), "scope": "local prerequisites only; server readiness was not checked",
+            "checks": checks, "client": _client_details()}
 
 
 def _helper(manifest: dict) -> HelperClient:
@@ -603,6 +647,9 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
     target = f"{application} on {server}" if server else application
     typer.echo(f"Target: {target}")
     typer.echo(f"Outcome: {outcome}")
+    job = result.get("job")
+    if isinstance(job, dict):
+        _render_job(job)
     typer.echo(f"Current release: {_short_release(current)}")
     if previous is not None:
         typer.echo(f"Previous release: {_short_release(previous)}")
@@ -613,7 +660,28 @@ def _render_status(application: str, server: str | None, result: dict) -> None:
         phase = transaction.get("phase", "unknown")
         typer.echo(f"Unfinished transaction: {phase} ({transaction.get('request_id', 'request ID unavailable')})")
         typer.echo("Why: the server has an unfinished deployment transaction that must be reconciled before another deploy.")
-        typer.echo("Next: run `shiplord recover` from this application's repository.")
+        if server:
+            typer.echo(f"Next: run `shiplord recover {application} --server {server}` to reconcile it.")
+        else:
+            typer.echo("Next: run `shiplord recover` from this application's repository.")
+
+
+def _render_recovery(application: str, server: str | None, result: dict) -> None:
+    """Name the explicit target on stderr; the result body stays the same as manifest mode."""
+    target = f"{application} on {server}" if server else application
+    typer.echo(f"Target: {target}", err=True)
+    typer.echo(f"Outcome: {str(result.get('status') or 'unknown').replace('_', ' ')}", err=True)
+    _emit(result, False)
+
+
+def _render_job(job: dict) -> None:
+    typer.echo(f"Job: {job.get('request_id', 'unknown')}")
+    state = str(job.get("state", "unknown"))
+    typer.echo(f"Job state: {state}")
+    typer.echo(f"Job phase: {job.get('phase', 'unknown')}")
+    outcome = job.get("outcome")
+    if state == "finished" and isinstance(outcome, dict):
+        typer.echo(f"Job outcome: {outcome.get('status', 'unknown')} (exit {outcome.get('exit_code', 'unknown')})")
 
 
 def _render_operation(code: int, result: dict, target: str, operation: str) -> None:
@@ -660,7 +728,8 @@ def _doctor_value(value: object) -> str:
         if "ok" in value:
             state = "passed" if value["ok"] else "failed"
             details = []
-            for key in ("helper_version", "version", "protocol", "current", "running", "unfinished_transaction", "hint"):
+            for key in ("helper_version", "version", "protocol", "id", "version_id", "current", "running",
+                        "unfinished_transaction", "hint", "message"):
                 if value.get(key) is not None:
                     details.append(f"{key.replace('_', ' ')}: {value[key]}")
             return state + (" (" + "; ".join(details) + ")" if details else "")
@@ -679,6 +748,7 @@ def _render_doctor(result: dict, target: str) -> None:
     checks = result.get("checks", {})
     groups = (
         ("Local tools", ("ssh", "git", "gh")),
+        ("Server baseline", ("os",)),
         ("Server access", ("server_access", "helper_actions", "helper")),
         ("Application", ("application", "applications")),
         ("Network", ("dns",)),
@@ -700,9 +770,33 @@ def _render_doctor(result: dict, target: str) -> None:
                     release = "yes" if application.get("deployed") else "no"
                     state = application.get("unfinished_transaction") or "none"
                     typer.echo(f"    {label}: release {release}; unfinished transaction {state}")
+                _render_ignored_files(value.get("ignored_files", []))
     for name, value in checks.items():
         if name not in shown:
             typer.echo(f"Checks ({name.replace('_', ' ')}): {_doctor_value(value)}")
+
+
+def _render_fleet_doctor(result: dict) -> None:
+    typer.echo("Target: all registered servers")
+    typer.echo(f"Outcome: {'compatible' if result.get('ok') else 'attention required'}")
+    client = result.get("client")
+    if client:
+        typer.echo("Client:")
+        typer.echo(f"  shiplord {client['version']}")
+        typer.echo(f"  executable: {client['executable']}")
+    for item in result.get("servers", []):
+        if item.get("reachable"):
+            version = item.get("helper_version") or "unknown"
+            typer.echo(f"{item['server']}: reachable, helper {version}, inventory {item['inventory_support']}")
+        else:
+            typer.echo(f"{item['server']}: unreachable, inventory unknown")
+        if item.get("error_code") == "helper_upgrade_required":
+            typer.echo("  " + _upgrade_message(item))
+        elif item.get("error"):
+            typer.echo(f"  Error: {item['error']}")
+    if result.get("invalid_entries"):
+        count = result["invalid_entries"]
+        typer.echo(f"Ignored {count} invalid server {'entry' if count == 1 else 'entries'}.")
 
 
 @server_app.command("bootstrap", rich_help_panel="Setup")
@@ -751,14 +845,27 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
                                                            help="Port the application listens on in its container."),
               health_path: Optional[str] = typer.Option(None, "--health-path",
                                                         help="Path that returns 200 when the application is ready."),
-              memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB.")) -> None:
+              memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB."),
+              image_repository: Optional[str] = typer.Option(
+                  None, "--image-repository",
+                  help="owner/repository that publishes this app's image (default: from the git remote).")) -> None:
     """Create ship.toml in the current directory without overwriting it. At a terminal, missing values are asked."""
     if frontend and no_frontend:
         typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
         raise typer.Exit(2)
+    if image_repository is not None:
+        if runtime == "native":
+            typer.echo("error: --image-repository applies only to Docker applications", err=True)
+            raise typer.Exit(2)
+        try:
+            image_repository = validate_repository(image_repository)
+        except ManifestError as error:
+            typer.echo(f"error: {error}", err=True)
+            raise typer.Exit(2) from None
     given = {"server": server, "api_domain": api_domain, "name": name, "runtime": runtime, "template": template,
              "origins": list(frontend) if frontend else ([] if no_frontend else None),
-             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory}
+             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory,
+             "image_repository": image_repository}
     directory = Path.cwd()
     if _interactive():
         if (directory / "ship.toml").exists() or (directory / "ship.toml").is_symlink():
@@ -767,11 +874,14 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
         try:
             servers = list_servers()[0] if server is None else []
             answers = collect_answers(given, root=directory, servers=servers, ask=_ask, say=typer.echo)
+            summary = [("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime")]
+            if answers["runtime"] == "docker":
+                summary.append(("image repository", "image_repository"))
+            summary += [("hostname", "api_domain"), ("frontend origins", "origins"),
+                        ("container port", "container_port"), ("health path", "readiness_path"),
+                        ("memory (MiB)", "memory_mb")]
             typer.echo("\nship.toml will contain:")
-            for label, key in (("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime"),
-                               ("hostname", "api_domain"), ("frontend origins", "origins"),
-                               ("container port", "container_port"), ("health path", "readiness_path"),
-                               ("memory (MiB)", "memory_mb")):
+            for label, key in summary:
                 value = answers[key]
                 typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
             if not typer.confirm("Write ship.toml?", default=True):
@@ -795,11 +905,17 @@ def configure(server: Optional[str] = typer.Option(None, "--server", help="Regis
             raise typer.Exit(2)
         answers = dict(given, name=name or directory.name, runtime=runtime or "docker",
                        template=template or "google-adk")
+        answers["image_repository"] = resolve_image_repository(directory, answers["runtime"],
+                                                               answers["image_repository"], ask=None, say=typer.echo)
+        if answers["runtime"] == "docker" and answers["image_repository"] is None:
+            typer.echo("warning: no image repository was recorded, so `shiplord provision` will need "
+                       "--image-repository. Pass --image-repository owner/repository to record it now.", err=True)
     try:
         create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
                         answers["runtime"], answers["template"],
                         **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
-                           if answers[key] is not None})
+                           if answers[key] is not None},
+                        image_repository=answers["image_repository"])
     except (ConfigurationError, ManifestError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from None
@@ -870,6 +986,7 @@ def deploy(image: Optional[str] = typer.Option(None, "--image", help="Immutable 
 @app.command(rich_help_panel="Quick start")
 def status(application: Optional[str] = typer.Argument(None, metavar="APP"),
            server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
+           job_id: Optional[str] = typer.Option(None, "--job-id", help="Look up a deployment job by request ID."),
            json_output: bool = typer.Option(False, "--json")) -> None:
     """Show the deployed release, the previous release, and any unfinished transaction."""
     try:
@@ -878,10 +995,13 @@ def status(application: Optional[str] = typer.Argument(None, metavar="APP"),
         _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
     try:
-        _code, result = commands.application_status(client)
+        _code, result = commands.application_status(client, job_id)
     except (CommandError, ClientError) as error:
         _fail(_recovery_hint(str(error)), error.code, json_output,
               **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
+    if job_id is not None and result.get("job") is None:
+        target = f"{app_name} on {server_alias}" if server_alias else app_name
+        _fail(f"no job {job_id!r} is recorded for {target}; it may have expired", 1, json_output)
     if json_output:
         _emit(result, True)
     else:
@@ -922,12 +1042,39 @@ def rollback(json_output: bool = typer.Option(False, "--json")) -> None:
                                               on_progress=_progress(json_output)), json_output)
 
 
-@app.command(rich_help_panel="Troubleshooting")
-def recover(json_output: bool = typer.Option(False, "--json")) -> None:
-    """Reconcile an interrupted deployment to the last committed release."""
+@app.command(rich_help_panel="Administration")
+def restart(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Restart the deployed release so it reads the current environment."""
     manifest = _manifest(json_output)
-    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover",
+    _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "restart",
                                               on_progress=_progress(json_output)), json_output)
+
+
+@app.command(rich_help_panel="Troubleshooting")
+def recover(application: Optional[str] = typer.Argument(None, metavar="APP"),
+            server: Optional[str] = typer.Option(None, "--server", help="Registered server alias; required with APP."),
+            force_stop: bool = typer.Option(
+                False, "--force-stop",
+                help="Kill a process that outlived a fail-policy shutdown deadline; the application stays stopped."),
+            json_output: bool = typer.Option(False, "--json")) -> None:
+    """Reconcile an interrupted deployment to the last committed release."""
+    if application is None and server is None:
+        manifest = _manifest(json_output)
+        _execute(lambda: commands.run_job_command(manifest, _helper(manifest), "recover", force_stop=force_stop,
+                                                  on_progress=_progress(json_output)), json_output)
+        return
+    if application is None or server is None:
+        _fail("recovery needs both an application and a server alias: run "
+              "`shiplord recover <app> --server <alias>` from anywhere, or `shiplord recover` in the application's "
+              "directory", 2, json_output)
+    try:
+        app_name, server_alias, client = _app_context(application, server, json_output, "recover")
+    except (CommandError, ClientError, ManifestError, ServerError) as error:
+        _fail(_recovery_hint(str(error)), getattr(error, "code", 3), json_output,
+              **({"error_code": error.error_code} if isinstance(error, ClientError) and error.error_code else {}))
+    _execute(lambda: commands.run_job_command(None, client, "recover", force_stop=force_stop,
+                                              on_progress=_progress(json_output)), json_output,
+             lambda _code, result: _render_recovery(app_name, server_alias, result))
 
 
 @env_app.command("set")
@@ -968,14 +1115,36 @@ def env_keys(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command("deprovision", rich_help_panel="Administration")
-def deprovision(retire: bool = typer.Option(False, "--retire", help="Stop the running release and remove its route first."),
+def deprovision(app_name: Optional[str] = typer.Argument(None, metavar="APP",
+                                                       help="Application name; pass with --server to work outside its checkout."),
+                server_alias: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
+                retire: bool = typer.Option(False, "--retire", help="Stop the running release and remove its route first."),
                 yes: bool = typer.Option(False, "--yes", help="Confirm that this application's access is removed."),
                 json_output: bool = typer.Option(False, "--json")) -> None:
-    """Remove this application's server-side account, keys, registration and state. Data is kept."""
-    manifest = _manifest(json_output)
+    """Remove an application's server-side account, keys, registration and state. Data is kept.
+
+    Run it from the application's directory, or name the application and its server from anywhere.
+    """
+    if (app_name is None) != (server_alias is None):
+        _fail("pass both the application name and --server <alias>, or neither to use ship.toml", 2, json_output)
+    manifest = None
+    if app_name is None:
+        manifest = _manifest(json_output)
+        application_id, alias = manifest["name"], manifest["server"]
+    else:
+        try:
+            application_id = validate_target_application(app_name)
+        except ManifestError as error:
+            _fail(str(error), 2, json_output)
+        alias, target = _select_server(server_alias, None, json_output)
     if not yes:
-        _fail(f"this removes {manifest['name']}'s deployment access from the server; rerun with --yes to confirm", 2, json_output)
-    _execute(lambda: commands.deprovision_application(manifest, _admin(manifest, json_output), retire=retire), json_output)
+        _fail(f"this removes the deployment access of {application_id} on {alias}; rerun with --yes to confirm",
+              2, json_output)
+
+    def action() -> tuple[int, dict]:
+        admin = _admin(manifest, json_output) if manifest is not None else _admin_target(target, json_output)
+        return commands.deprovision_application(application_id, admin, retire=retire)
+    _execute(action, json_output)
 
 
 @env_app.command("clear")
@@ -1047,6 +1216,72 @@ def registry_status_command(json_output: bool = typer.Option(False, "--json")) -
     _execute(lambda: commands.registry_other(manifest, _admin(manifest, json_output), "list"), json_output)
 
 
+def _key_label(label: str) -> str:
+    try:
+        return validate_label(label)
+    except KeyError_ as error:
+        raise CommandError(str(error)) from None
+
+
+def _read_public_key(public_key_file: Optional[Path], public_key_stdin: bool) -> tuple[str, str]:
+    """One public key from exactly one source: returns (key line without a comment, fingerprint)."""
+    if public_key_stdin == (public_key_file is not None):
+        raise CommandError("provide the public key with exactly one of --public-key-file and --public-key-stdin")
+    try:
+        text = sys.stdin.read() if public_key_stdin else public_key_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise CommandError("could not read the public key") from None
+    try:
+        key = parse_public_key(text)
+    except KeyError_ as error:
+        raise CommandError(str(error)) from None
+    return f"{key.type} {key.blob}", key.fingerprint
+
+
+@keys_app.command("add")
+def keys_add_command(label: str = typer.Option(..., "--label", help="A short name for this key."),
+                     public_key_file: Optional[Path] = typer.Option(None, "--public-key-file", help="File holding the public key."),
+                     public_key_stdin: bool = typer.Option(False, "--public-key-stdin", help="Read the public key from stdin."),
+                     json_output: bool = typer.Option(False, "--json")) -> None:
+    """Register a public key that may deploy this application, without needing a template."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        name = _key_label(label)
+        public_key, fingerprint = _read_public_key(public_key_file, public_key_stdin)
+        result = _admin(manifest, json_output).call("keys", manifest["name"],
+                                                    {"operation": "add", "label": name, "public_key": public_key})
+        return 0, {"ok": True, **result, "label": name, "fingerprint": fingerprint}
+    _execute(action, json_output)
+
+
+@keys_app.command("list")
+def keys_list_command(json_output: bool = typer.Option(False, "--json")) -> None:
+    """List the labels and fingerprints of the keys that may deploy this application."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        listed = _admin(manifest, json_output).call("keys", manifest["name"], {"operation": "list"})
+        return 0, {"ok": True, **listed}
+    _execute(action, json_output)
+
+
+@keys_app.command("remove")
+def keys_remove_command(label: str = typer.Option(..., "--label", help="The label of the key to revoke."),
+                        yes: bool = typer.Option(False, "--yes", help="Confirm that this key loses deploy access."),
+                        json_output: bool = typer.Option(False, "--json")) -> None:
+    """Revoke one key's deploy access. The server refuses to remove the last key."""
+    manifest = _manifest(json_output)
+
+    def action() -> tuple[int, dict]:
+        name = _key_label(label)
+        if not yes:
+            raise CommandError(f"this removes {name}'s deploy access to {manifest['name']}; rerun with --yes to confirm")
+        result = _admin(manifest, json_output).call("keys", manifest["name"], {"operation": "remove", "label": name})
+        return 0, {"ok": True, **result, "label": name}
+    _execute(action, json_output)
+
+
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
@@ -1055,13 +1290,19 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
                          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
+                         quality_workflow: Optional[str] = typer.Option(None, "--quality-workflow",
+                                                                        help="Reusable workflow to run before deploy."),
+                         no_quality_workflow: bool = typer.Option(False, "--no-quality-workflow",
+                                                                  help="Do not run a quality job before deploy."),
                          force_workflow: bool = typer.Option(False, "--force-workflow"),
                          json_output: bool = typer.Option(False, "--json")) -> None:
     """Create the CI key, store it in GitHub, set the repository variables, and write the release workflow."""
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
-        github.validate_setup_profile(manifest)
+        if quality_workflow is not None and no_quality_workflow:
+            raise CommandError("choose either --quality-workflow or --no-quality-workflow")
+        github.validate_setup_request(manifest, repo)
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
         interactive = sys.stdin.isatty() and not json_output
@@ -1074,7 +1315,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
         target = load_server(manifest["server"])
         result = github.github_setup(manifest, repo, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                      admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
-                                     tailscale=settings, force_workflow=force_workflow)
+                                     tailscale=settings, force_workflow=force_workflow, quality_workflow=quality_workflow,
+                                     include_quality=not no_quality_workflow)
         result["tailscale"] = origin
         return 0, result
     _execute(action, json_output)
