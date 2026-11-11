@@ -20,7 +20,10 @@ from shiplord.client import AdminClient, ClientError, HelperClient  # noqa: E402
 from shiplord.commands import CommandError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.manifest import validate_manifest  # noqa: E402
+from shiplord.protocol import IncompatibleProtocol  # noqa: E402
 from shiplord.runtime import RuntimeFailure  # noqa: E402
+from shiplord.servers import ServerError  # noqa: E402
+from shiplord.transport import TransportError  # noqa: E402
 from shiplord.worker import run_job  # noqa: E402
 from test_client import ClientTestCase, FakeSsh, frame, ok  # noqa: E402
 from test_provision import ed25519  # noqa: E402
@@ -421,6 +424,94 @@ class DoctorTests(ClientTestCase):
         lock = HostLock(var_fd)
         with lock.acquire():
             ReleaseState("orders", state_fd, lock).begin("req-x", record())
+
+
+class InventoryCompatibilityTests(unittest.TestCase):
+    def test_only_stable_releases_older_than_the_minimum_are_confirmed_unsupported(self):
+        cases = {"0.0.9": "unsupported", "0.1.99": "unsupported", "0.2.0": "supported",
+                 "0.10.0": "supported", "1.0.0": "supported", "0.2.0+abc.1": "supported",
+                 "0.2.0-rc1": "unknown", "01.2.0": "unknown", "v0.2.0": "unknown", "": "unknown",
+                 None: "unknown", 2: "unknown"}
+        for version, expected in cases.items():
+            with self.subTest(version=version):
+                self.assertEqual(commands.inventory_support(version), expected)
+
+    def test_upgrade_guidance_names_only_the_confirmed_old_helper(self):
+        self.assertIsNone(commands.inventory_upgrade("alpha", "0.2.0"))
+        self.assertIsNone(commands.inventory_upgrade("alpha", "0.2.0-rc1"))
+        self.assertIsNone(commands.inventory_upgrade("alpha", None))
+        self.assertEqual(commands.inventory_upgrade("alpha", "0.1.0"),
+                         {"error": "App inventory requires helper 0.2.0 or later.",
+                          "error_code": "helper_upgrade_required", "helper_version": "0.1.0",
+                          "minimum_helper_version": "0.2.0",
+                          "upgrade_command": "shiplord server bootstrap alpha"})
+
+
+class FleetDoctorTests(unittest.TestCase):
+    SERVERS = [{"alias": "alpha", "ssh": "admin@alpha.example.com"},
+               {"alias": "beta", "ssh": "admin@beta.example.com"},
+               {"alias": "gamma", "ssh": "admin@gamma.example.com"}]
+
+    def probe(self, versions=None, failures=None, calls=None):
+        versions, failures = versions or {}, failures or {}
+
+        def run(target, timeout):
+            if calls is not None:
+                calls.append((target, timeout))
+            alias = target.split("@")[1].split(".")[0]
+            if alias in failures:
+                raise failures[alias]
+            return {"helper_version": versions.get(alias, "0.2.0")}
+        return run
+
+    def test_a_mixed_fleet_reports_every_alias_and_keeps_probing(self):
+        calls = []
+        probe = self.probe(versions={"gamma": "0.1.0"}, failures={"beta": TransportError("timed out")}, calls=calls)
+        code, result = commands.doctor_all_servers(self.SERVERS, probe=probe)
+        self.assertEqual(code, 3)
+        self.assertEqual((result["ok"], result["partial"]), (False, True))
+        self.assertEqual([item["server"] for item in result["servers"]], ["alpha", "beta", "gamma"])
+        self.assertEqual(len(calls), 3)  # a failed probe never stops the sweep
+        self.assertTrue(all(timeout == commands.FLEET_PROBE_TIMEOUT_SECONDS for _, timeout in calls))
+        alpha, beta, gamma = result["servers"]
+        self.assertEqual((alpha["ok"], alpha["reachable"], alpha["inventory_support"]), (True, True, "supported"))
+        self.assertEqual(alpha["helper_version"], "0.2.0")
+        self.assertNotIn("upgrade_command", alpha)
+        self.assertEqual((beta["ok"], beta["reachable"], beta["inventory_support"]), (False, False, "unknown"))
+        self.assertNotIn("upgrade_command", beta)
+        self.assertEqual((gamma["ok"], gamma["reachable"], gamma["inventory_support"]), (False, True, "unsupported"))
+        self.assertEqual(gamma["error_code"], "helper_upgrade_required")
+        self.assertEqual(gamma["upgrade_command"], "shiplord server bootstrap gamma")
+
+    def test_a_complete_compatible_fleet_exits_zero(self):
+        code, result = commands.doctor_all_servers(self.SERVERS, probe=self.probe())
+        self.assertEqual((code, result["ok"], result["partial"]), (0, True, False))
+        self.assertTrue(all(item["inventory_support"] == "supported" for item in result["servers"]))
+
+    def test_an_incompatible_protocol_is_reachable_but_not_confirmed_old(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(failures={"alpha": IncompatibleProtocol("unsupported version")}))
+        self.assertEqual(code, 3)
+        item = result["servers"][0]
+        self.assertEqual((item["reachable"], item["inventory_support"]), (True, "unknown"))
+        self.assertEqual(item["error_code"], "incompatible_protocol")
+        self.assertIsNone(item["helper_version"])
+        self.assertNotIn("upgrade_command", item)
+
+    def test_an_unreadable_registration_is_unreachable_not_old(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(failures={"alpha": ServerError("unreadable")}))
+        self.assertEqual(code, 3)
+        self.assertEqual((result["servers"][0]["reachable"], result["servers"][0]["inventory_support"]),
+                         (False, "unknown"))
+        self.assertNotIn("upgrade_command", result["servers"][0])
+
+    def test_an_unorderable_version_is_not_reported_as_unsupported(self):
+        code, result = commands.doctor_all_servers(
+            [self.SERVERS[0]], probe=self.probe(versions={"alpha": "0.2.0-rc1"}))
+        item = result["servers"][0]
+        self.assertEqual((code, item["ok"], item["inventory_support"]), (0, True, "unknown"))
+        self.assertNotIn("upgrade_command", item)
 
 
 def tls_server(cert: Path, key: Path, statuses: list[int]) -> int:

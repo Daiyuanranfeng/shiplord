@@ -21,6 +21,7 @@ from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
+from shiplord.transport import TransportError
 
 MANIFEST = '''schema_version = 1
 name = "orders"
@@ -616,6 +617,132 @@ class CLIInventoryTests(unittest.TestCase):
             self.assertEqual(data["servers"][1]["applications"], self.inventory["applications"])
             self.assertEqual(probes.call_count, 2)
             self.assertEqual(inventory.call_count, 1)
+
+    def test_doctor_all_servers_reports_a_mixed_fleet_and_keeps_probing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"),
+                               ("beta", "admin@beta.example.com"), ("gamma", "admin@gamma.example.com"))
+
+            def probe(target, timeout):
+                if target.startswith("admin@beta"):
+                    raise TransportError("SSH capabilities check timed out")
+                return {"helper_version": "0.2.0" if target.startswith("admin@alpha") else "0.1.0"}
+
+            with patch("shiplord.commands.probe_capabilities", side_effect=probe) as probes:
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"]), (False, True))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta", "gamma"])
+        self.assertEqual(probes.call_count, 3)  # the failed probe did not stop the sweep
+        alpha, beta, gamma = data["servers"]
+        self.assertEqual((alpha["reachable"], alpha["helper_version"], alpha["inventory_support"]),
+                         (True, "0.2.0", "supported"))
+        self.assertNotIn("upgrade_command", alpha)
+        self.assertEqual((beta["reachable"], beta["inventory_support"]), (False, "unknown"))
+        self.assertNotIn("upgrade_command", beta)
+        self.assertEqual((gamma["reachable"], gamma["helper_version"], gamma["inventory_support"]),
+                         (True, "0.1.0", "unsupported"))
+        self.assertEqual(gamma["upgrade_command"], "shiplord server bootstrap gamma")
+        self.assertEqual(data["client"]["version"], "0.2.0")
+
+    def test_doctor_all_servers_human_output_hints_only_the_confirmed_old_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"),
+                               ("beta", "admin@beta.example.com"), ("gamma", "admin@gamma.example.com"))
+
+            def probe(target, timeout):
+                if target.startswith("admin@beta"):
+                    raise TransportError("SSH capabilities check timed out")
+                return {"helper_version": "0.2.0" if target.startswith("admin@alpha") else "0.1.0"}
+
+            with patch("shiplord.commands.probe_capabilities", side_effect=probe):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers"], env=self.env(config))
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        self.assertEqual(result.exit_code, 3, output)
+        self.assertIn("alpha: reachable, helper 0.2.0, inventory supported", output)
+        self.assertIn("beta: unreachable, inventory unknown", output)
+        self.assertIn("gamma: reachable, helper 0.1.0, inventory unsupported", output)
+        self.assertIn("shiplord server bootstrap gamma", output)
+        self.assertNotIn("server bootstrap alpha", output)
+        self.assertNotIn("server bootstrap beta", output)
+
+    def test_doctor_all_servers_exits_zero_only_for_a_complete_compatible_fleet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.2.0"}):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"]), (True, False))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta"])
+
+    def test_doctor_all_servers_rejects_conflicting_modes_before_connecting(self):
+        for extra in (["--server", "alpha"], ["--local"], ["--deep"]):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temp:
+                config = Path(temp) / "config"
+                with patch("shiplord.commands.probe_capabilities") as probe, \
+                     patch("shiplord.cli.bootstrap_server") as bootstrap, \
+                     patch("shiplord.cli.getpass.getpass") as prompt:
+                    result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", *extra, "--json"],
+                                                env=self.env(config))
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertFalse(json.loads(result.stdout)["ok"])
+                probe.assert_not_called()
+                bootstrap.assert_not_called()
+                prompt.assert_not_called()
+                self.assertFalse(config.exists())
+
+    def test_doctor_all_servers_never_asks_for_sudo_or_runs_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.1.0"}), \
+                 patch("shiplord.cli.bootstrap_server") as bootstrap, \
+                 patch("shiplord.cli._admin_target") as admin, \
+                 patch("shiplord.cli.getpass.getpass") as prompt:
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("server bootstrap alpha", result.output)  # guidance only, never executed
+        bootstrap.assert_not_called()
+        admin.assert_not_called()
+        prompt.assert_not_called()
+
+    def test_doctor_all_servers_counts_unreadable_registrations_as_partial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            bad = config / "shiplord" / "servers" / "bad.json"
+            bad.write_text("invalid")
+            bad.chmod(0o600)
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.2.0"}):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"], data["invalid_entries"]), (False, True, 1))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha"])
+
+    def test_doctor_all_servers_requires_a_registered_server(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"],
+                                        env=self.env(Path(temp) / "config"))
+        self.assertEqual(result.exit_code, 3)
+        self.assertIn("server add", json.loads(result.stdout)["error"])
+
+    def test_single_server_doctor_is_unchanged_for_an_old_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.1.0"}) as probe:
+                result = CliRunner().invoke(cli.app, ["doctor", "--server", "alpha", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["helper_version"]), (True, "0.1.0"))
+        self.assertNotIn("partial", data)
+        probe.assert_called_once_with("admin@alpha.example.com")  # still the single-server probe and default deadline
 
     def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
         directory = config / "shiplord" / "servers"

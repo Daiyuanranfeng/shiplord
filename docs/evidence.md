@@ -214,6 +214,20 @@ What it found:
   real Docker SIGKILL crash gap, shutdown timeout/interruption during rollback or failed-first-deploy cleanup
   against real Docker, and a seeded-baseline demonstration of the regression.
 
+## Fleet doctor (issue #20)
+
+- Unit: `tests/test_commands.py` classifies stable helper releases against the 0.2.0 inventory minimum (pre-releases
+  and unparseable versions stay `unknown`), and sweeps a mixed fleet where the middle probe fails: all three aliases
+  are reported, the sweep continues, every probe gets the bounded five-second deadline, and only the confirmed old
+  helper carries `helper_upgrade_required` and the bootstrap hint.
+- CLI unit: `tests/test_cli.py` checks the JSON aggregate shape and `partial` flag, exit 0 for a complete compatible
+  fleet and 3 otherwise, human output hinting only the old helper, unreadable registrations counted as partial, and
+  rejection of `--server`, `--local`, and `--deep` before any connection. Fleet mode is asserted never to ask for
+  sudo, prompt for a password, or run bootstrap. Single-server `doctor --server` still uses its default probe and
+  keeps its exit statuses.
+- End to end through the real transport: `tests/test_transport.py` registers a current, an unreachable, and an old
+  alias against a fake `ssh`, and checks that the last two are distinguished.
+
 ## Supported server OS baseline (issue #66)
 
 Decision: Shiplord supports **Ubuntu 24.04 or later and Debian 12 or later**, with Caddy installed from its
