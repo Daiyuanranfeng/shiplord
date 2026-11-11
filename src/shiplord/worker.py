@@ -1,7 +1,7 @@
-"""Runs one queued job (deploy, rollback, or recover) as root, outside any SSH session.
+"""Runs one queued job (deploy, rollback, restart, or recover) as root, outside any SSH session.
 
-Started by the privileged helper as a transient service. It takes the host lock, runs
-the transaction, and records the outcome in the job file so a client can read it later.
+Started by the privileged helper as a transient service. It pulls the image the job needs before it takes the host
+lock, runs the transaction under the lock, and records the outcome in the job file so a client can read it later.
 """
 
 from __future__ import annotations
@@ -9,9 +9,11 @@ from __future__ import annotations
 import os
 import sys
 
+from .deploy import Deployer
 from .jobs import JobError
 from .manifest import ManifestError, validate_app_name
 from .release_state import StateError
+from .runtime import RuntimeFailure
 from .services import AppSession, HostServices
 
 
@@ -28,16 +30,19 @@ def run_job(services: HostServices, application_id: str, request_id: str) -> int
         if record["state"] != "queued":
             return 0  # a duplicate worker, or a job that already ran
         session.jobs.start(request_id)
+        deployer = session.deployer(lambda phase, info: session.jobs.set_phase(request_id, phase))
         outcome = None
         try:
+            _pull_image(deployer, record, request_id)
             with session.lock.acquire(timeout=services.lock_timeout):
-                deployer = session.deployer(lambda phase, info: session.jobs.set_phase(request_id, phase))
                 if record["action"] == "deploy":
                     result = deployer.deploy({**record["request"], "request_id": request_id})
                 elif record["action"] == "rollback":
                     result = deployer.rollback(request_id)
+                elif record["action"] == "restart":
+                    result = deployer.restart(request_id)
                 else:
-                    result = deployer.recover()
+                    result = deployer.recover(force_stop=record["request"].get("force_stop") is True)
                 outcome = _outcome(result.status, result.exit_code, result.detail)
         except StateError as error:
             if "host lock is busy" in str(error):
@@ -50,6 +55,33 @@ def run_job(services: HostServices, application_id: str, request_id: str) -> int
                                {"error": "worker_error", "message": type(error).__name__})
         session.jobs.finish(request_id, outcome)
         return outcome["exit_code"]
+
+
+def _pull_image(deployer: Deployer, record: dict, request_id: str) -> None:
+    """Pull the image this job will need, before the host lock is taken.
+
+    A pull is the slow, network-bound part of a deploy and it changes nothing on the host, so holding the host-wide
+    lock through it would let one slow registry block every other application and every admin command. The locked
+    transaction re-checks every condition and ``prepare`` verifies the image on the host, so a pull that fails here
+    is reported there as the prepare failure it would have been. Only a validated, digest-pinned artifact of the
+    registered repository is ever pulled.
+    """
+    pull = getattr(deployer.runtime, "pull", None)
+    if pull is None:
+        return  # a native release installs locally while preparing; only a registry pull leaves the lock's scope
+    try:
+        if record["action"] in ("rollback", "restart"):
+            # Both start a release that is already recorded: the rollback target, or the committed release itself.
+            release = deployer.state.read_state()["previous" if record["action"] == "rollback" else "current"]
+        elif record["action"] == "deploy":
+            request = {**record["request"], "request_id": request_id}
+            release = None if deployer.preflight(request) is not None else record["request"]
+        else:
+            release = None  # recovery starts a recorded release and never prepares an image
+        if release is not None:
+            pull(deployer.registration, release)
+    except (StateError, RuntimeFailure):
+        return
 
 
 def _journal_present(session: AppSession) -> bool:

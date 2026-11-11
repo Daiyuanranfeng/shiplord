@@ -14,7 +14,7 @@ from . import __version__
 from .authorization import AuthorizationError, authorize_application
 from .framing import read_frame, write_frame
 from .host import HostDeadline, extend_deadline, run_timed
-from .jobs import MAX_PENDING_JOBS, JobError
+from .jobs import MAX_PENDING_JOBS, JobError, valid_job_id
 from .native import host_architecture
 from .payload import PayloadError, discard_upload, receive_payload
 from .manifest import GENERIC_DOCKER_FEATURE, ManifestError
@@ -22,7 +22,7 @@ from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
 from .release_state import StateError
 from .runtime import (DEFAULT_FOLLOW_SECONDS, MAX_FOLLOW_SECONDS, MAX_LOG_LINES, release_id, validate_follow_timeout,
                       validate_since)
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 
 if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities probe must stay light
@@ -31,9 +31,9 @@ if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities
 MAX_NATIVE_BYTES = 1024 * 1024 * 1024
 UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to finish in time
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
-ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"]
+ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
-FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE]
+FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE, GENERIC_DOCKER_FEATURE, FORCE_STOP_FEATURE]
 
 
 class _UploadRejected(Exception):
@@ -90,8 +90,10 @@ def _submit(session: "AppSession", request: dict, action: str, payload: dict,
             discard()
         session.jobs.create(request_id, action, payload)
         return {"status": "accepted", "request_id": request_id, "job": job_view(session, existing)}, 0
-    if action == "deploy":
-        refusal = session.deployer().preflight({**payload, "request_id": request_id})
+    if action in ("deploy", "restart"):
+        deployer = session.deployer()
+        refusal = (deployer.preflight({**payload, "request_id": request_id}) if action == "deploy"
+                   else deployer.restart_preflight(request_id))
         if refusal is not None:
             if discard:
                 discard()
@@ -132,6 +134,8 @@ def _prepare(request: dict, destination: BinaryIO | None = None):
 
     if action == "status":
         job_id = _arguments(request, {"job_id"}).get("job_id")
+        if job_id is not None and not valid_job_id(job_id):
+            raise ProtocolError("job_id must be a job ID")
         return (lambda session, source: ok({"application": session.deployer().status(),
                                            "job": _job(session, job_id)})), False
     if action == "logs":
@@ -170,6 +174,21 @@ def _prepare(request: dict, destination: BinaryIO | None = None):
         if isinstance(artifact, dict) and artifact.get("kind") == "native":
             return (lambda session, source: _submit_native(session, request, payload, source)), True
         return (lambda session, source: _submit(session, request, "deploy", payload)), False
+    if action == "recover":
+        arguments = _arguments(request, {"force_stop"})
+        force_stop = arguments.get("force_stop", False)
+        if type(force_stop) is not bool:
+            raise ProtocolError("force_stop must be a boolean")
+        if request["commit"] is not None:
+            raise ProtocolError("invalid request")
+        payload = {"force_stop": True} if force_stop else {}
+
+        def recover(session, source):
+            if force_stop and session.registration["runtime"] != "docker":
+                return ({"status": "error", "request_id": request_id, "error": "invalid_request",
+                         "message": "a native application has no shutdown policy to force"}, 2)
+            return _submit(session, request, action, payload)
+        return recover, False
     _arguments(request, set())
     if request["commit"] is not None:
         raise ProtocolError("invalid request")

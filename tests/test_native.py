@@ -318,10 +318,13 @@ class InspectTests(RuntimeTestCase):
     def state(self, active, sub):
         self.system.results["show"] = CommandResult(0, f"ActiveState={active}\nSubState={sub}\n")
 
-    def test_running_means_this_release_is_active_and_not_restarting(self):
+    def running(self):
         self.install()
         self.runtime.start(REGISTRATION, self.release)
         self.state("active", "running")
+
+    def test_running_means_this_release_is_active_and_not_restarting(self):
+        self.running()
         self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
         for active, sub in (("activating", "auto-restart"), ("failed", "failed"), ("inactive", "dead"), ("active", "exited")):
             self.state(active, sub)
@@ -329,6 +332,59 @@ class InspectTests(RuntimeTestCase):
         self.state("active", "running")
         other = release(self.binary, sequence=2000)
         self.assertFalse(self.runtime.is_running(REGISTRATION, other))  # another release's unit is not "running"
+
+    def test_the_unit_must_match_the_committed_memory_limit(self):
+        self.running()
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(self.binary, memory=512)))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(self.binary, memory=256)))
+
+    def test_the_unit_must_match_the_committed_socket_bind(self):
+        self.running()
+        moved = dict(REGISTRATION, host_port=20008)
+        self.assertFalse(self.runtime.is_running(moved, self.release))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_the_environment_must_match_the_committed_origins(self):
+        self.running()
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(self.binary, origins=["https://new.example"])))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(self.binary)))
+
+    def test_a_unit_that_keeps_the_release_marker_but_not_the_configuration_is_not_running(self):
+        self.running()
+        unit = self.runtime.unit_path(REGISTRATION)
+        unit.write_text(unit.read_text().replace("MemoryMax=256M", "MemoryMax=512M"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_an_environment_file_that_keeps_the_release_but_not_the_configuration_is_not_running(self):
+        self.running()
+        environment = self.layout.environments / "orders" / "native.env"
+        environment.write_text(environment.read_text().replace('ALLOW_ORIGINS="[]"',
+                                                               'ALLOW_ORIGINS="[\\"https://old.example\\"]"'))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_a_changed_custom_environment_value_is_not_running(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=placeholder\n")
+        path.chmod(0o600)
+        self.running()
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        path.write_text("CUSTOM_TOKEN=old\n")
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_an_unusable_environment_file_is_not_a_mismatch_by_itself(self):
+        """A start would fail on the same file, so a restart cannot fix it; the unit still decides."""
+        self.running()
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("PORT=1\n")  # a managed key: the parser refuses it
+        path.chmod(0o600)
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        path.write_text("OK=1\n")
+        path.chmod(0o644)  # not private to the installing account
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        # The record-derived unit is still compared, so a candidate that replaced it is caught.
+        changed = {**self.release, "configuration": {**self.release["configuration"],
+                                                    "resources": {"memory_mb": 512}}}
+        self.assertFalse(self.runtime.is_running(REGISTRATION, changed))
 
     def test_no_unit_means_not_running_without_calling_systemctl(self):
         self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))

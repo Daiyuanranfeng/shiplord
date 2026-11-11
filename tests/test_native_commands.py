@@ -31,6 +31,11 @@ def native_manifest():
     return validate_manifest(native_configuration())
 
 
+def corrupt_payload(payload: bytes) -> bytes:
+    """Complement the final byte, so the copy can never equal the original whatever that byte was."""
+    return payload[:-1] + bytes([payload[-1] ^ 0xFF])
+
+
 class NativeCommandTests(ClientTestCase):
     RUNTIME = "native"
 
@@ -61,6 +66,18 @@ class NativeCommandTests(ClientTestCase):
                        public_check=lambda domain, path: {"ok": True, "status": 200, "error": None})
         options.update(overrides)
         return commands.deploy_application(native_manifest(), self.client, **options)
+
+    def corrupt_uploads(self):
+        original = self.client.payload_runner
+
+        def corrupting(command, header, path, timeout):
+            payload = path.read_bytes()
+            damaged_bytes = corrupt_payload(payload)
+            self.assertNotEqual(damaged_bytes, payload, "the corrupted upload must differ from the original")
+            damaged = Path(self.work.name) / "damaged"
+            damaged.write_bytes(damaged_bytes)
+            return original(command, header, damaged, timeout)
+        self.client.payload_runner = corrupting
 
     def test_the_local_artifact_description_is_exact_and_rejects_non_linux_binaries(self):
         artifact = commands.native_artifact(self.binary_path)
@@ -121,17 +138,25 @@ class NativeCommandTests(ClientTestCase):
         self.assertEqual([p for p in (self.layout.app_state / "orders").iterdir() if p.is_dir()], [])  # nothing staged
 
     def test_a_corrupted_upload_is_refused_by_the_server_and_reported_as_invalid_input(self):
-        original = self.client.payload_runner
-
-        def corrupting(command, header, path, timeout):
-            damaged = Path(self.work.name) / "damaged"
-            damaged.write_bytes(path.read_bytes()[:-1] + b"X")
-            return original(command, header, damaged, timeout)
-        self.client.payload_runner = corrupting
+        self.corrupt_uploads()
         with self.assertRaises(ClientError) as caught:
             self.deploy()
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("checksum", str(caught.exception))
+
+    def test_a_corrupted_upload_is_refused_whatever_its_final_byte_is(self):
+        # The old corruption wrote b"X" over the final byte, so a payload already ending in 0x58 went up unchanged
+        # and was accepted. Every possible final byte is pinned here, each with its own request id.
+        self.corrupt_uploads()
+        for final in range(256):
+            with self.subTest(final=final):
+                payload = elf(body=b"\0" * 2047 + bytes([final]))
+                self.assertNotEqual(corrupt_payload(payload), payload)
+                self.binary_path.write_bytes(payload)
+                with self.assertRaises(ClientError) as caught:
+                    self.deploy(request_id=f"req-{final}", sequence=1000 + final)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("checksum", str(caught.exception))
 
 
 if __name__ == "__main__":

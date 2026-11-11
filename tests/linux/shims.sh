@@ -15,7 +15,12 @@ cat > /usr/bin/systemctl <<'SH'
 case "$1" in
   reload) [ "$2" = caddy ] && exec /usr/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; exit 0;;
   try-reload-or-restart) kill -HUP "$(cat /run/test-sshd.pid)"; exit 0;;
-  is-active) unit="${2%.service}"; pidfile="/run/shiplord-units/$unit.pid"
+  list-unit-files) for unit in "$@"; do case "$unit" in ssh.service|sshd.service) echo "$unit enabled enabled";; esac; done; exit 0;;
+  is-active) unit="${!#}"; unit="${unit%.service}"
+             case "$unit" in
+               ssh|sshd) pidfile=/run/test-sshd.pid;;  # the suite starts sshd directly; no unit exists
+               *) pidfile="/run/shiplord-units/$unit.pid";;
+             esac
              if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then echo active; exit 0; else echo inactive; exit 3; fi;;
   *) exit 1;;
 esac

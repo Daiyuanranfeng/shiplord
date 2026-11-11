@@ -225,11 +225,31 @@ class NativeRuntime:
             raise RuntimeFailure("the service could not be stopped", "stop", result.output)
 
     def is_running(self, registration: dict, release: dict) -> bool:
+        """Is the service running the unit and environment this release's start writes?
+
+        The unit name does not encode configuration, so a marker and an active state alone could accept a service
+        still limited to the previous memory or serving the previous origins. Every value the start writes is
+        compared. An unreadable environment file cannot be compared, but the unit still decides, and a start would
+        fail on that same file: a running release must not look down for something a restart could not fix.
+        """
+        app = registration["application_id"]
         try:
-            marker = MARKER.search(self.unit_path(registration).read_text())
+            unit = self.unit_path(registration).read_bytes()
         except OSError:
+            return False  # not running: the following start reports why a file cannot be used
+        if unit != render_unit(self.layout, registration, release).encode():
             return False
-        if not marker or marker.group(1) != release_id(release):
+        try:
+            custom = load_environment_file(self.layout.environments / app / "app.env")
+        except EnvironmentError_:
+            environment_ok = True  # unreadable: cannot render what a start would write; the unit above decides
+        else:
+            try:
+                environment = (self.layout.environments / app / "native.env").read_bytes()
+            except OSError:
+                return False
+            environment_ok = environment == render_environment(registration, release, custom).encode()
+        if not environment_ok:
             return False
         result = self._systemctl(["show", "--property=ActiveState,SubState", self.unit_name(registration)], "inspect")
         state = dict(line.split("=", 1) for line in result.output.splitlines() if "=" in line)

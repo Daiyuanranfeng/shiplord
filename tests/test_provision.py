@@ -12,7 +12,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shiplord.admin import parse_request, run, serve
+from shiplord.environment import MAX_VALUE_BYTES
 from shiplord.framing import read_frame, write_frame
+from shiplord.installer import DEPLOY_GROUP
 from shiplord.layout import Layout
 from shiplord.protocol import ProtocolError
 from shiplord.registry import Registry
@@ -42,19 +44,29 @@ class FakeSystem:
 
     def __init__(self):
         self.users: dict[str, dict] = {}
+        self.groups: dict[str, set[str]] = {DEPLOY_GROUP: set()}  # bootstrap creates the group
         self.calls: list[list[str]] = []
         self.visudo_code = 0
         self.next_uid = 900
         self.fail = set()
+        self.fail_membership = False
         self.busy_userdel = 0
 
-    def run(self, argv, *, input=None, timeout=60):
+    def run(self, argv, *, input=None, timeout=60, max_output=None):
         argv = list(argv)
         self.calls.append(argv)
         tool = argv[0].rsplit("/", 1)[-1]
         if tool in self.fail:
             return CommandResult(1, "failed")
+        if tool == "getent" and argv[1] == "group":
+            members = self.groups.get(argv[2])
+            return CommandResult(2, "") if members is None else CommandResult(
+                0, f"{argv[2]}:x:990:{','.join(sorted(members))}\n")
         if tool == "getent":
+            if len(argv) == 2:  # the whole passwd database, as bootstrap reads it
+                return CommandResult(0, "".join(f"{name}:x:{user['uid']}:{user['uid']}:{user['comment']}:"
+                                                f"{user['home']}:{user['shell']}\n"
+                                                for name, user in sorted(self.users.items())))
             user = self.users.get(argv[2])
             if user is None:
                 return CommandResult(2, "")
@@ -66,7 +78,12 @@ class FakeSystem:
             self.next_uid += 1
             return CommandResult(0, "")
         if tool == "usermod":
-            self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
+            if "--groups" in argv:
+                if self.fail_membership:
+                    return CommandResult(1, "failed")
+                self.groups.setdefault(argv[argv.index("--groups") + 1], set()).add(argv[-1])
+            else:
+                self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
             return CommandResult(0, "")
         if tool == "userdel":
             if self.busy_userdel:  # a lingering session: userdel reports "currently logged in" until it ends
@@ -116,6 +133,11 @@ class ProvisionTestCase(unittest.TestCase):
         return {str(p.relative_to(self.layout.prefix)): p.read_bytes()
                 for p in self.layout.prefix.rglob("*") if p.is_file() and p.name != "host.lock"}
 
+    def host_state(self):
+        """Every file, account, and group membership: what a provisioning can create and a refusal must not."""
+        return {"files": self.snapshot(), "users": json.dumps(self.system.users, sort_keys=True),
+                "groups": json.dumps({name: sorted(members) for name, members in self.system.groups.items()})}
+
 
 class ProvisionTests(ProvisionTestCase):
     def test_first_provision_creates_every_resource(self):
@@ -151,7 +173,23 @@ class ProvisionTests(ProvisionTestCase):
         self.assertFalse(any(second["created"].values()), second["created"])
         self.assertEqual((second["host_port"], second["deployment_user"]), (first["host_port"], first["deployment_user"]))
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent"])
+        # Two reads in the pre-check (the account and the registry) and the account lookup that verifies it.
+        self.assertEqual([c[0].rsplit("/", 1)[-1] for c in self.system.calls[calls:]], ["getent", "getent", "getent"])
+
+    def test_a_new_deployment_account_joins_the_group_the_sshd_policy_matches(self):
+        """An account created after bootstrap must be covered by the drop-in bootstrap already wrote."""
+        result = self.provision()
+        self.assertTrue(result["created"]["deployment_group"])
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
+        self.assertIn(["/usr/sbin/usermod", "--append", "--groups", DEPLOY_GROUP, "ship-orders"], self.system.calls)
+
+    def test_membership_is_set_before_the_account_can_authenticate(self):
+        self.system.fail_membership = True
+        with self.assertRaisesRegex(ProvisionError, "deployment group"):
+            self.provision()
+        self.assertFalse((self.layout.authorized_keys / "ship-orders").exists())
+        self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], set())
 
     def test_second_application_is_isolated(self):
         self.provision("orders")
@@ -188,10 +226,39 @@ class ProvisionTests(ProvisionTestCase):
 
     def test_changing_registered_identity_is_refused(self):
         self.provision()
-        for change in ({"api_domain": "other.example.com"}, {"runtime": "native", "image_repository": None},
+        for change in ({"api_domain": "other.example.com"}, {"max_memory_mb": 8192},
+                       {"runtime": "native", "image_repository": None},
                        {"image_repository": "ghcr.io/example/other"}):
             with self.subTest(change=change), self.assertRaisesRegex(ProvisionError, "differs"):
                 self.provision(**change)
+
+    def test_a_refused_re_provision_changes_nothing_on_the_host(self):
+        """The key, the account, and the sudoers rule must not exist for a registration that was refused."""
+        self.provision()
+        before = self.host_state()
+        keys = self.layout.authorized_keys / "ship-orders"
+        for change in ({"api_domain": "other.example.com"}, {"runtime": "native", "image_repository": None},
+                       {"image_repository": "ghcr.io/example/other"}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ProvisionError, "differs"):
+                    self.provision(public_key=ed25519(2), key_label="ci", **change)
+                self.assertEqual(self.host_state(), before)
+                self.assertNotIn(ed25519(2).split()[1], keys.read_text())  # the new key was never added
+                self.assertEqual(list(self.layout.sudoers_dir.iterdir()), [self.layout.sudoers_dir / "shiplord-orders"])
+
+    def test_a_hostname_owned_by_another_application_leaves_nothing_behind(self):
+        self.provision("orders")
+        before = self.host_state()
+        with self.assertRaisesRegex(ProvisionError, "hostname is already registered"):
+            self.provision("billing", api_domain="orders.example.com", public_key=ed25519(2))
+        self.assertEqual(self.host_state(), before)
+        self.assertNotIn("ship-billing", self.system.users)
+        self.assertFalse((self.layout.authorized_keys / "ship-billing").exists())
+        self.assertFalse((self.layout.sudoers_dir / "shiplord-billing").exists())
+        self.assertFalse((self.layout.environments / "billing").exists())
+        self.assertFalse((self.layout.app_state / "billing").exists())
+        self.assertFalse((self.layout.registrations / "billing.json").exists())
+        self.assertEqual(self.system.groups[DEPLOY_GROUP], {"ship-orders"})
 
     def test_invalid_inputs_are_rejected_before_creating_accounts(self):
         before_calls = len(self.system.calls)
@@ -225,6 +292,137 @@ class ProvisionTests(ProvisionTestCase):
             self.provision()
 
 
+class UpdateProvisionTests(ProvisionTestCase):
+    def deploy_one(self):
+        state_fd = os.open(self.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            store = ReleaseState("orders", state_fd, self.lock)
+            with self.lock.acquire():
+                store.begin("request-1", release())
+                for phase in ("runtime-changing", "runtime-ready", "routing-changing", "routing-ready"):
+                    store.advance(phase)
+                store.record_commit()
+                store.clear_after_reconciliation()
+        finally:
+            os.close(state_fd)
+
+    def test_update_applies_a_new_hostname_and_ceiling_and_keeps_state_environment_and_keys(self):
+        first = self.provision()
+        self.deploy_one()
+        manage_environment(self.layout, "orders", "set", text="DATABASE_URL=postgres://example/db\n")
+        manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2))
+        before = self.snapshot()
+        calls = len(self.system.calls)
+        applied = []
+        result = self.provision(update=True, api_domain="new.example.com", max_memory_mb=8192,
+                                apply_route=applied.append)
+        record = json.loads((self.layout.registrations / "orders.json").read_text())
+        self.assertEqual((record["api_domain"], record["max_memory_mb"]), ("new.example.com", 8192))
+        self.assertEqual((record["host_port"], record["deployment_uid"], record["deployment_user"]),
+                         (first["host_port"], self.system.users["ship-orders"]["uid"], "ship-orders"))
+        self.assertEqual([entry["api_domain"] for entry in applied], ["new.example.com"])
+        self.assertEqual((applied[0]["host_port"], applied[0]["max_memory_mb"]), (first["host_port"], 8192))
+        self.assertTrue(result["updated"] and result["route_changed"])
+        self.assertEqual(result["changes"], {"api_domain": {"from": "orders.example.com", "to": "new.example.com"},
+                                             "max_memory_mb": {"from": 4096, "to": 8192}})
+        self.assertFalse(any(result["created"].values()), result["created"])
+        after = self.snapshot()
+        self.assertEqual({key for key in after if before.get(key) != after[key]}, {"etc/shiplord/apps/orders.json"})
+        tools = [call[0].rsplit("/", 1)[-1] for call in self.system.calls[calls:]]
+        self.assertEqual(set(tools), {"getent"})  # an update only reads; it creates and changes nothing
+
+    def test_update_with_the_same_settings_changes_nothing(self):
+        self.provision()
+        before = self.snapshot()
+        result = self.provision(update=True)
+        self.assertFalse(result["updated"])
+        self.assertEqual(result["changes"], {})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_update_without_a_ceiling_keeps_a_custom_ceiling(self):
+        self.provision(max_memory_mb=2048)
+        self.deploy_one()
+        applied = []
+        result = self.provision(update=True, api_domain="new.example.com", apply_route=applied.append)
+        record = json.loads((self.layout.registrations / "orders.json").read_text())
+        self.assertEqual(record["max_memory_mb"], 2048)
+        self.assertEqual(result["changes"], {"api_domain": {"from": "orders.example.com", "to": "new.example.com"}})
+        self.assertEqual([entry["max_memory_mb"] for entry in applied], [2048])
+        again = self.provision(update=True, api_domain="new.example.com", apply_route=applied.append)
+        self.assertFalse(again["updated"])
+        self.assertEqual(json.loads((self.layout.registrations / "orders.json").read_text())["max_memory_mb"], 2048)
+
+    def test_update_refuses_a_runtime_or_repository_change_before_any_side_effect(self):
+        self.provision()
+        manage_environment(self.layout, "orders", "set", text="KEEP=1\n")
+        manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2))
+        before = self.snapshot()
+        calls = len(self.system.calls)
+        for change in ({"runtime": "native", "image_repository": None},
+                       {"image_repository": "ghcr.io/example/other"}):
+            with self.subTest(change=change), self.assertRaisesRegex(ProvisionError, "cannot change it"):
+                self.provision(update=True, **change)
+        self.assertEqual(self.snapshot(), before)
+        tools = [call[0].rsplit("/", 1)[-1] for call in self.system.calls[calls:]]
+        self.assertEqual(set(tools), {"getent"})  # an update only reads; it creates and changes nothing
+        self.assertNotIn("useradd", tools)
+
+    def test_update_refuses_an_application_that_was_never_provisioned(self):
+        with self.assertRaisesRegex(ProvisionError, "not provisioned"):
+            self.provision(update=True, api_domain="new.example.com")
+        self.assertEqual(self.system.users, {})
+        self.assertEqual(list(self.layout.app_state.iterdir()), [])
+        self.assertFalse((self.layout.registrations / "orders.json").exists())
+
+    def test_update_refuses_while_a_transaction_is_unfinished(self):
+        self.provision()
+        state_fd = os.open(self.layout.app_state / "orders", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            store = ReleaseState("orders", state_fd, self.lock)
+            with self.lock.acquire():
+                store.begin("request-1", release())
+        finally:
+            os.close(state_fd)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ProvisionError, "unfinished transaction"):
+            self.provision(update=True, api_domain="new.example.com")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_the_route_is_only_moved_for_a_domain_change_of_a_deployed_application(self):
+        self.provision()
+        applied = []
+        result = self.provision(update=True, max_memory_mb=8192, apply_route=applied.append)
+        self.assertEqual(applied, [])
+        self.assertFalse(result["route_changed"])
+        self.deploy_one()
+        result = self.provision(update=True, max_memory_mb=4096, apply_route=applied.append)
+        self.assertEqual(applied, [])
+        self.assertFalse(result["route_changed"])
+        result = self.provision(update=True, api_domain="new.example.com", apply_route=applied.append)
+        self.assertEqual(len(applied), 1)
+        self.assertTrue(result["route_changed"])
+
+    def test_a_domain_change_for_a_deployed_application_requires_the_route_manager(self):
+        self.provision()
+        self.deploy_one()
+        before = self.snapshot()
+        with self.assertRaisesRegex(ProvisionError, "public route"):
+            self.provision(update=True, api_domain="new.example.com")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_failed_route_change_leaves_the_registration_and_state_unchanged(self):
+        self.provision()
+        self.deploy_one()
+        before = self.snapshot()
+
+        def failing(registration):
+            raise ProvisionError("could not change the public route: caddy")
+
+        with self.assertRaisesRegex(ProvisionError, "public route"):
+            self.provision(update=True, api_domain="new.example.com", apply_route=failing)
+        self.assertEqual(self.snapshot(), before)
+
+
 class NativeProvisionTests(ProvisionTestCase):
     def provision_native(self, app="orders", **changes):
         return self.provision(app, runtime="native", image_repository=None, **changes)
@@ -252,9 +450,12 @@ class NativeProvisionTests(ProvisionTestCase):
 
     def test_a_foreign_runtime_account_is_never_adopted(self):
         self.system.users["app-orders"] = {"uid": 800, "comment": "other", "home": "/home/x", "shell": "/bin/bash"}
+        before = self.host_state()
         with self.assertRaisesRegex(ProvisionError, "not a Shiplord"):
             self.provision_native()
         self.assertFalse((self.layout.registrations / "orders.json").exists())
+        self.assertEqual(self.host_state(), before)  # no deployment account, key, or sudoers rule was created
+        self.assertNotIn("ship-orders", self.system.users)
 
     def test_deprovision_removes_binaries_and_the_unit_but_retains_data_and_says_so(self):
         self.provision_native()
@@ -297,6 +498,10 @@ class AccountRemovalTests(ProvisionTestCase):
 
 
 class KeyManagementTests(ProvisionTestCase):
+    def tree(self):
+        """Every path under the layout, so a refused call can be shown to have created nothing."""
+        return sorted(str(path.relative_to(self.layout.prefix)) for path in self.layout.prefix.rglob("*"))
+
     def test_add_list_and_remove_keys(self):
         self.provision()
         self.assertEqual(manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2)), {"changed": True})
@@ -318,6 +523,35 @@ class KeyManagementTests(ProvisionTestCase):
                                   ("add", {"label": "Bad Label", "public_key": ed25519(3)})):
             with self.subTest(operation=operation), self.assertRaises(ProvisionError):
                 manage_key(self.layout, "orders", operation, **kwargs)
+
+    def test_key_operations_on_an_unprovisioned_application_are_refused(self):
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError) as caught:
+                manage_key(self.layout, "orders", operation, **kwargs)
+            self.assertEqual(str(caught.exception), "the application is not provisioned")
+            self.assertNotIn(str(self.layout.authorized_keys), str(caught.exception))
+            self.assertNotIn(str(self.layout.prefix), str(caught.exception))
+            self.assertNotIn(ed25519(2).split()[1], str(caught.exception))
+
+    def test_a_refused_key_operation_creates_no_file_and_no_directory(self):
+        before = self.tree()
+        for operation, kwargs in (("add", {"label": "ci", "public_key": ed25519(2)}), ("list", {}),
+                                  ("remove", {"label": "laptop"})):
+            with self.subTest(operation=operation), self.assertRaises(ProvisionError):
+                manage_key(self.layout, "orders", operation, **kwargs)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(list(self.layout.authorized_keys.iterdir()), [])
+        self.assertFalse((self.layout.environments / "orders").exists())
+
+    def test_a_stray_key_file_does_not_make_an_application_provisioned(self):
+        stray = self.layout.authorized_keys / "ship-orders"
+        stray.write_text("")
+        before = self.tree()
+        with self.assertRaisesRegex(ProvisionError, "not provisioned"):
+            manage_key(self.layout, "orders", "add", label="ci", public_key=ed25519(2))
+        self.assertEqual(stray.read_text(), "")
+        self.assertEqual(self.tree(), before)
 
 
 class EnvironmentTests(ProvisionTestCase):
@@ -475,6 +709,113 @@ class EnvironmentTests(ProvisionTestCase):
                         self.layout, self.system, {})
         self.assertEqual(code, 2)
 
+    def test_set_key_changes_one_line_and_leaves_every_other_byte_identical(self):
+        self.provision()
+        original = ("# kept comment\r\n"
+                    "\r\n"
+                    "DATABASE_URL=postgres://old/db\r\n"
+                    "FLAG=\"quoted value\"\r\n"
+                    "OTHER=keep\r\n")
+        self.path().write_bytes(original.encode())
+        self.path().chmod(0o600)
+        result = manage_environment(self.layout, "orders", "set-key", key="DATABASE_URL", value=self.SECRET)
+        self.assertEqual(result, {"keys": ["DATABASE_URL", "FLAG", "OTHER"], "changed": True})
+        self.assertNotIn("s3cr3t", str(result))
+        self.assertEqual(self.path().read_bytes(), original.replace("postgres://old/db", self.SECRET).encode())
+        self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in self.path().parent.iterdir()], ["app.env"])
+
+    def test_set_key_appends_a_new_key_and_changes_nothing_when_the_value_matches(self):
+        self.provision()
+        self.assertTrue(manage_environment(self.layout, "orders", "set-key", key="A", value="1")["changed"])
+        self.assertEqual(self.path().read_text(), "A=1\n")
+        before = self.path().stat().st_ino
+        self.assertFalse(manage_environment(self.layout, "orders", "set-key", key="A", value="1")["changed"])
+        self.assertEqual(self.path().stat().st_ino, before)
+        self.assertTrue(manage_environment(self.layout, "orders", "set-key", key="B", value="")["changed"])
+        self.assertEqual(self.path().read_text(), "A=1\nB=\n")
+
+    def test_unset_removes_one_key_and_is_idempotent(self):
+        self.provision()
+        self.path().write_text("# keep\nA=1\nB=2\nC=3\n")
+        self.path().chmod(0o600)
+        self.assertEqual(manage_environment(self.layout, "orders", "unset", key="B"), {"keys": ["A", "C"], "changed": True})
+        self.assertEqual(self.path().read_text(), "# keep\nA=1\nC=3\n")
+        self.assertFalse(manage_environment(self.layout, "orders", "unset", key="B")["changed"])
+        self.assertFalse(manage_environment(self.layout, "orders", "unset", key="MISSING")["changed"])
+        self.assertEqual(self.path().read_text(), "# keep\nA=1\nC=3\n")
+
+    def test_unset_on_a_missing_file_is_a_no_op(self):
+        self.provision()
+        self.assertEqual(manage_environment(self.layout, "orders", "unset", key="A"), {"keys": [], "changed": False})
+        self.assertFalse(self.path().exists())
+
+    def test_invalid_one_key_edits_are_refused_and_never_echo_values(self):
+        self.provision()
+        self.path().write_text("KEEP=1\n")
+        self.path().chmod(0o600)
+        cases = (("set-key", {"key": "PORT", "value": self.SECRET}),
+                 ("set-key", {"key": "A-B", "value": self.SECRET}),
+                 ("set-key", {"key": "A", "value": self.SECRET + "\nB=2"}),
+                 ("set-key", {"key": "A", "value": self.SECRET + "\rB=2"}),
+                 ("set-key", {"key": "A", "value": "x" * (MAX_VALUE_BYTES + 1)}),
+                 ("set-key", {"key": "A", "value": None}),
+                 ("unset", {"key": "PORT"}),
+                 ("unset", {"key": "A B"}),
+                 ("unset", {"key": None}))
+        for operation, arguments in cases:
+            with self.subTest(operation=operation, arguments=str(arguments)[:30]), \
+                    self.assertRaises(ProvisionError) as caught:
+                manage_environment(self.layout, "orders", operation, **arguments)
+            self.assertNotIn("s3cr3t", str(caught.exception))
+        self.assertEqual(self.path().read_text(), "KEEP=1\n")
+        self.assertEqual([p.name for p in self.path().parent.iterdir()], ["app.env"])
+
+    def test_one_key_edits_validate_before_the_file_is_read(self):
+        self.provision()
+        self.path().write_text("A=1\n")
+        self.path().chmod(0o644)  # load_environment_text would refuse this file
+        with self.assertRaisesRegex(ProvisionError, "variable name"):
+            manage_environment(self.layout, "orders", "set-key", key="A B", value="x")
+        with self.assertRaisesRegex(ProvisionError, "managed by Shiplord"):
+            manage_environment(self.layout, "orders", "unset", key="PORT")
+
+    def test_one_key_edits_refuse_an_unreadable_file_instead_of_discarding_it(self):
+        self.provision()
+        for kind in ("mode", "encoding", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_unreadable(kind)
+                for operation, arguments in (("set-key", {"key": "A", "value": "1"}),
+                                             ("unset", {"key": "DATABASE_URL"})):
+                    with self.assertRaises(ProvisionError) as caught:
+                        manage_environment(self.layout, "orders", operation, **arguments)
+                    message = str(caught.exception)
+                    self.assertIn("shiplord env clear", message)
+                    self.assertNotIn("s3cr3t", message)
+                    self.assertNotIn(str(self.layout.environments), message)
+                self.assertTrue(self.path().exists() or self.path().is_symlink())
+
+    def test_through_the_admin_entry_point_one_key_edits_never_return_values(self):
+        self.provision()
+        set_key = envelope("environment", arguments={"operation": "set-key", "key": "DATABASE_URL",
+                                                     "value": self.SECRET})
+        response, code = run(encode(set_key), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": ["DATABASE_URL"], "changed": True}))
+        self.assertNotIn("s3cr3t", str(response))
+        unset = envelope("environment", arguments={"operation": "unset", "key": "DATABASE_URL"})
+        response, code = run(encode(unset), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": [], "changed": True}))
+        self.assertEqual(manage_environment(self.layout, "orders", "keys"), {"keys": []})
+        response, code = run(encode(unset), self.layout, self.system, {})
+        self.assertEqual((code, response["result"]), (0, {"keys": [], "changed": False}))
+        bad, code = run(encode(envelope("environment", arguments={"operation": "set-key", "key": "PORT",
+                                                                  "value": self.SECRET})), self.layout, self.system, {})
+        self.assertEqual((code, bad["status"]), (1, "error"))
+        self.assertNotIn("s3cr3t", str(bad))
+        bad, code = run(encode(envelope("environment", arguments={"operation": "set-key", "key": "A", "value": "1",
+                                                                  "extra": 1})), self.layout, self.system, {})
+        self.assertEqual(code, 2)
+
 
 class RegistryLoginTests(ProvisionTestCase):
     TOKEN = "ghp_exampleTOKEN1234567890"
@@ -532,6 +873,81 @@ class RegistryLoginTests(ProvisionTestCase):
         with self.assertRaisesRegex(ProvisionError, "unreadable"):
             self.login()
 
+    def test_a_hand_edited_login_file_is_reported_clearly_without_a_traceback(self):
+        self.provision()
+        self.login()
+        cases = {
+            "top level is not an object": "[]",
+            "auths is not an object": '{"auths": []}',
+            "entry is not an object": '{"auths": {"ghcr.io": "text"}}',
+            "auth is missing": '{"auths": {"ghcr.io": {}}}',
+            "auth is not text": '{"auths": {"ghcr.io": {"auth": 5}}}',
+            "auth is not base64": '{"auths": {"ghcr.io": {"auth": "!!!"}}}',
+            "auth is not username and token": '{"auths": {"ghcr.io": {"auth": "'
+                                              + base64.b64encode(b"nocolon").decode() + '"}}}',
+            "auth is not UTF-8": '{"auths": {"ghcr.io": {"auth": "'
+                                 + base64.b64encode(b"\xff").decode() + '"}}}',
+            "auth has an invalid username": '{"auths": {"ghcr.io": {"auth": "'
+                                            + base64.b64encode(b"a b:secret").decode() + '"}}}',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.config().write_text(text)
+                for operation in ("list", "login"):
+                    with self.assertRaisesRegex(ProvisionError, "config.json") as caught:
+                        if operation == "list":
+                            manage_registry(self.layout, "orders", "list")
+                        else:
+                            self.login()
+                    self.assertNotIn(self.TOKEN, str(caught.exception))
+                self.assertEqual(self.config().read_text(), text)
+
+    def test_a_failed_write_leaves_no_temporary_file_holding_the_token(self):
+        self.provision()
+        for target in ("os.replace", "json.dump"):
+            with self.subTest(target), patch(f"shiplord.provision.{target}", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(ProvisionError, "could not write the registry login") as caught:
+                    self.login()
+                self.assertNotIn(self.TOKEN, str(caught.exception))
+            self.assertEqual(list(self.config().parent.iterdir()), [])
+
+    def test_a_login_file_that_is_not_utf8_or_too_deep_is_reported(self):
+        self.provision()
+        self.config().parent.mkdir(mode=0o700)
+        cases = {"not UTF-8": b'{"auths": {}}\xff', "too deeply nested": ("[" * 100000 + "]" * 100000).encode()}
+        for label, data in cases.items():
+            with self.subTest(label):
+                self.config().write_bytes(data)
+                with self.assertRaisesRegex(ProvisionError, "config.json"):
+                    manage_registry(self.layout, "orders", "list")
+
+    def test_a_login_and_logout_sync_the_login_directory(self):
+        self.provision()
+        modes = []
+        real_fsync = os.fsync
+
+        def record(descriptor):
+            modes.append(os.fstat(descriptor).st_mode)
+            real_fsync(descriptor)
+
+        with patch("shiplord.provision.os.fsync", record):
+            self.login()
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "login must sync the directory")
+        modes.clear()
+        with patch("shiplord.provision.os.fsync", record):
+            manage_registry(self.layout, "orders", "logout", registry="ghcr.io")
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in modes), "logout must sync the directory")
+
+    def test_a_login_preserves_entries_for_other_registries(self):
+        self.provision()
+        other = base64.b64encode(b"someone:other-token").decode()
+        self.config().parent.mkdir(mode=0o700)
+        self.config().write_text(json.dumps({"auths": {"docker.io": {"auth": other}}}))
+        self.login()
+        document = json.loads(self.config().read_text())
+        self.assertEqual(document["auths"]["docker.io"], {"auth": other})
+        self.assertEqual(base64.b64decode(document["auths"]["ghcr.io"]["auth"]).decode(), f"deploy-bot:{self.TOKEN}")
+
     def test_through_the_admin_entry_point_and_removed_with_the_application(self):
         self.provision()
         request = envelope("registry", arguments={"operation": "login", "registry": "ghcr.io", "username": "u", "token": self.TOKEN})
@@ -558,6 +974,39 @@ class DeprovisionTests(ProvisionTestCase):
         with self.lock.acquire():
             again = deprovision(self.layout, self.system, self.lock, "orders")
         self.assertFalse(any(again["removed"].values()), again)
+
+    def make_route(self, application_id="orders"):
+        ship = self.layout.caddy_root / "ship"
+        ship.mkdir(parents=True, exist_ok=True)
+        for directory in (self.layout.caddy_root, ship):
+            directory.chmod(0o755)
+        route = ship / f"{application_id}.caddy"
+        route.write_text(f"{application_id}.example.com {{\n\trespond 200\n}}\n")
+        route.chmod(0o644)
+        return route
+
+    def test_removes_the_job_directory_and_a_stale_route_file(self):
+        self.provision()
+        jobs = self.layout.jobs / "orders"
+        jobs.mkdir(mode=0o700, parents=True)
+        jobs.chmod(0o700)
+        (jobs / "req-1.json").write_text("{}\n")
+        route = self.make_route()
+        (route.parent / ".prior-orders").write_text(route.read_text())
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertTrue(result["removed"]["jobs_directory"])
+        self.assertTrue(result["removed"]["route"])
+        self.assertFalse(jobs.exists())
+        self.assertFalse(route.exists())
+        self.assertFalse((route.parent / ".prior-orders").exists())
+
+    def test_an_application_with_no_jobs_or_route_reports_no_removal_for_them(self):
+        self.provision()
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders")
+        self.assertNotIn("jobs_directory", result["removed"])
+        self.assertNotIn("route", result["removed"])
 
     def test_other_applications_are_untouched(self):
         self.provision("orders")
@@ -727,6 +1176,38 @@ class AdminTests(ProvisionTestCase):
         self.assertEqual(response["result"]["host_port"], 20000)
         response, code = run(encode(envelope("deprovision", arguments={})), self.layout, self.system, {})
         self.assertEqual((code, response["result"]["removed"]["registration"]), (0, True))
+
+    def test_provision_update_through_the_admin_entry_point_keeps_the_account_and_port(self):
+        run(encode(envelope()), self.layout, self.system, {})
+        account = self.system.users["ship-orders"]
+        arguments = dict(envelope()["arguments"], update=True, api_domain="new.example.com", max_memory_mb=8192)
+        response, code = run(encode(envelope("provision", arguments=arguments)), self.layout, self.system, {})
+        self.assertEqual(code, 0, response)
+        self.assertEqual((response["result"]["api_domain"], response["result"]["max_memory_mb"]),
+                         ("new.example.com", 8192))
+        self.assertTrue(response["result"]["updated"])
+        self.assertFalse(any(response["result"]["created"].values()))
+        self.assertEqual(self.system.users["ship-orders"], account)
+        self.assertEqual(json.loads((self.layout.registrations / "orders.json").read_text())["host_port"], 20000)
+
+    def test_provision_update_refuses_a_changed_runtime_through_the_admin_entry_point(self):
+        run(encode(envelope()), self.layout, self.system, {})
+        before = self.snapshot()
+        arguments = dict(envelope()["arguments"], update=True, runtime="native", image_repository=None)
+        response, code = run(encode(envelope("provision", arguments=arguments)), self.layout, self.system, {})
+        self.assertEqual((code, response["error"]), (1, "failed"))
+        self.assertIn("cannot change it", response["message"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_update_must_be_the_boolean_true(self):
+        run(encode(envelope()), self.layout, self.system, {})
+        before = self.snapshot()
+        for value in ("yes", 1, False):
+            with self.subTest(value=value):
+                arguments = dict(envelope()["arguments"], update=value)
+                response, code = run(encode(envelope("provision", arguments=arguments)), self.layout, self.system, {})
+                self.assertEqual((code, response["error"]), (2, "invalid_request"))
+        self.assertEqual(self.snapshot(), before)
 
     def test_retire_must_be_the_boolean_true(self):
         run(encode(envelope()), self.layout, self.system, {})
