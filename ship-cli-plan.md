@@ -242,7 +242,7 @@ removes the old key. Record key fingerprints, not private key material.
 ### Tailscale runner enrollment
 
 Use GitHub OIDC and tailscale/github-action with a pinned version/commit. A
-Tailscale federated identity trusts the intended repository and main-branch job
+Tailscale federated identity trusts the intended repository and deployment-branch job
 claims and grants an application-appropriate CI tag. Network policy permits that
 tag to reach this server's OpenSSH port. Tailscale SSH is not required or enabled.
 
@@ -381,7 +381,7 @@ without relying on local MacBook paths or aliases.
 
 ## 11. GitHub pipeline contract
 
-Pull requests run the existing checks without VM deployment privileges. Main
+Pull requests run the existing checks without VM deployment privileges. Deployment
 branch releases run required checks, build/publish the image, join Tailscale,
 install temporary SSH credentials/known_hosts, invoke the same deploy command,
 verify the result, and clean up. Manual dispatch remains available.

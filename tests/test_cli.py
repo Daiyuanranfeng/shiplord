@@ -63,6 +63,20 @@ class ManifestTests(unittest.TestCase):
         result = self.load(MANIFEST.replace('["https://orders.example.com"]', '[]'))
         self.assertEqual(result["http"]["frontend_origins"], [])
 
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.load(MANIFEST.replace('\ndeployment_branch = "main"', ""))
+        self.assertEqual(result["github"]["deployment_branch"], "main")
+
+    def test_deployment_branch_names_are_validated(self):
+        for branch in ("main", "trunk", "release/prod", "release/2026.01"):
+            with self.subTest(branch=branch):
+                result = self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+                self.assertEqual(result["github"]["deployment_branch"], branch)
+        for branch in ("", " main", "main ", ".main", "-main", "main/", "main.", "main.lock", "a..b", "a//b", "a@{b", "a b"):
+            with self.subTest(branch=branch), self.assertRaises(ManifestError) as caught:
+                self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+            self.assertNotIn("secretvalue", str(caught.exception))
+
     def test_generic_is_an_explicit_docker_profile(self):
         contents = MANIFEST.replace('template = "google-adk"', 'template = "generic"')
         self.assertEqual(self.load(contents)["template"], "generic")
@@ -255,6 +269,17 @@ class CLITests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("tag:ci", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
+
+    def test_github_setup_rejects_an_invalid_deployment_branch_before_using_github_or_a_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--deployment-branch", "main..other", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("valid branch name", json.loads(result.stdout)["error"])
+            self.assertEqual((root / "ship.toml").read_text(), MANIFEST)
+            self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
 
     def test_doctor_rejects_conflicting_modes(self):
         with tempfile.TemporaryDirectory() as directory:

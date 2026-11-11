@@ -1045,12 +1045,14 @@ def keys_remove_command(label: str = typer.Option(..., "--label", help="The labe
 def _github_setup(manifest: dict, repository: str, *, json_output: bool, interactive: bool | None = None,
                   ci_host: Optional[str] = None, tooling_ref: Optional[str] = None, platforms: str = "linux/amd64",
                   tailscale_client_id: Optional[str] = None, tailscale_audience: Optional[str] = None,
-                  tailscale_tags: Optional[str] = None, quality_workflow: Optional[str] = None,
-                  no_quality_workflow: bool = False, force_workflow: bool = False) -> tuple[int, dict]:
+                  tailscale_tags: Optional[str] = None, deployment_branch: Optional[str] = None,
+                  quality_workflow: Optional[str] = None, no_quality_workflow: bool = False,
+                  force_workflow: bool = False) -> tuple[int, dict]:
     """Create the CI key, secret, variables, and workflow for an application. Shared by `github setup` and `setup`."""
     if quality_workflow is not None and no_quality_workflow:
         raise CommandError("choose either --quality-workflow or --no-quality-workflow")
     github.validate_setup_request(manifest, repository)
+    branch = github.resolve_deployment_branch(manifest, deployment_branch)  # before asking for anything
     given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
     gh = github.GitHub()
     if interactive is None:
@@ -1060,14 +1062,14 @@ def _github_setup(manifest: dict, repository: str, *, json_output: bool, interac
     try:
         settings, origin = tailscale.resolve(
             given, ask=_ask_tailscale if interactive else None,
-            guide=lambda: github.tailscale_guidance(gh, repository, manifest),
+            guide=lambda: github.tailscale_guidance(gh, repository, manifest, branch),
             provision=lambda: github.tailscale_credential(gh, repository, manifest, tags=tags))
     except tailscale.TailscaleError as error:
         raise CommandError(str(error)) from None
     result = github.github_setup(manifest, repository, project=Path.cwd(), admin=_admin_target(target, json_output), gh=gh,
                                  admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
-                                 tailscale=settings, force_workflow=force_workflow, quality_workflow=quality_workflow,
-                                 include_quality=not no_quality_workflow)
+                                 tailscale=settings, deployment_branch=branch, force_workflow=force_workflow,
+                                 quality_workflow=quality_workflow, include_quality=not no_quality_workflow)
     result["tailscale"] = origin
     return 0, result
 
@@ -1077,6 +1079,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
                          tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
+                         deployment_branch: Optional[str] = typer.Option(None, "--deployment-branch",
+                                                                        help="Branch releases deploy from (default: the manifest's, or main)."),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
                          tailscale_tags: Optional[str] = typer.Option(None, "--tailscale-tags"),
@@ -1094,8 +1098,8 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
     _execute(lambda: _github_setup(manifest, repo, json_output=json_output, ci_host=ci_host, tooling_ref=tooling_ref,
                                    platforms=platforms, tailscale_client_id=tailscale_client_id,
                                    tailscale_audience=tailscale_audience, tailscale_tags=tailscale_tags,
-                                   quality_workflow=quality_workflow, no_quality_workflow=no_quality_workflow,
-                                   force_workflow=force_workflow), json_output,
+                                   deployment_branch=deployment_branch, quality_workflow=quality_workflow,
+                                   no_quality_workflow=no_quality_workflow, force_workflow=force_workflow), json_output,
              lambda code, result: output.render_github_setup(
                  result, f"{manifest['name']} on {manifest['server']}"))
 
