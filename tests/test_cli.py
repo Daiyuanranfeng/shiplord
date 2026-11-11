@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import re
+import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +17,7 @@ from typer.testing import CliRunner
 
 from shiplord import cli
 from shiplord.client import ClientError, HelperClient
-from shiplord.commands import CommandError
+from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
@@ -38,6 +41,12 @@ retain_successful_releases = 2
 repository = "QueryPlanner/orders"
 deployment_branch = "main"
 '''
+
+
+def public_key_line() -> str:
+    """A syntactically valid ed25519 public key line, without needing ssh-keygen."""
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + bytes(range(32))
+    return "ssh-ed25519 " + base64.b64encode(blob).decode()
 
 
 class ManifestTests(unittest.TestCase):
@@ -119,6 +128,10 @@ class CLITests(unittest.TestCase):
         return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
                               env=env, stdin=subprocess.DEVNULL)
 
+    def git(self, directory: str, *args: str) -> None:
+        result = subprocess.run(["git", "-C", directory, *args], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_plan_uses_local_manifest_and_reports_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
@@ -136,7 +149,7 @@ class CLITests(unittest.TestCase):
 
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
-                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"], ["doctor", "--json"],
+                    ["restart", "--json"], ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
@@ -171,7 +184,7 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
             env = dict(os.environ, XDG_CONFIG_HOME=config)
-            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"]):
+            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"], ["restart", "--json"]):
                 with self.subTest(command=command):
                     self.assertEqual(self.invoke(directory, *command, env=env).returncode, 3)
             self.assertEqual(self.invoke(directory, "server", "bootstrap", "production", env=env).returncode, 3)
@@ -250,6 +263,60 @@ class CLITests(unittest.TestCase):
             self.assertEqual(config["http"]["frontend_origins"], ["https://example.com"])
             self.assertNotIn("github", config)
             self.assertIn("has not been checked", result.stdout)
+            # Without a terminal and without a GitHub remote there is nothing to infer, so say what provision needs.
+            self.assertIn("--image-repository", result.stderr)
+
+    def test_configure_records_the_image_repository_provision_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend",
+                                 "--image-repository", "owner/orders")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual(config["github"], {"repository": "owner/orders", "deployment_branch": "main"})
+            self.assertEqual(image_repository_for(config, None), "ghcr.io/owner/orders")
+            self.assertNotIn("warning", result.stderr)
+
+    @unittest.skipUnless(shutil.which("git"), "git is needed to infer a repository")
+    def test_configure_infers_the_image_repository_from_the_git_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.git(directory, "init", "-q")
+            self.git(directory, "remote", "add", "origin", "git@github.com:owner/orders.git")
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual(config["github"]["repository"], "owner/orders")
+            self.assertEqual(image_repository_for(config, None), "ghcr.io/owner/orders")
+            self.assertNotIn("warning", result.stderr)
+
+    def test_configure_rejects_an_unusable_image_repository_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for repository in ("orders", "../owner/orders", "owner/orders/tree/main"):
+                with self.subTest(repository=repository):
+                    result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                         "--api-domain", "api.example.com", "--no-frontend",
+                                         "--image-repository", repository)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("owner/repository", result.stderr)
+                    self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_refuses_an_image_repository_for_a_native_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend", "--runtime", "native",
+                                 "--image-repository", "owner/orders")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--image-repository applies only to Docker applications", result.stderr)
+            self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_without_a_terminal_warns_when_no_repository_is_known(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--image-repository", result.stderr)
+            self.assertNotIn("github", load_manifest(Path(directory) / "ship.toml"))
 
     def test_configure_supports_an_explicit_empty_frontend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,7 +335,7 @@ class CLITests(unittest.TestCase):
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertEqual(load_manifest(Path(directory) / "ship.toml")["template"], "generic")
 
-    def test_generic_github_setup_rejects_before_saving_tailscale_defaults(self):
+    def test_generic_github_setup_passes_the_profile_gate_and_stops_at_the_server_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ship.toml").write_text(MANIFEST.replace('template = "google-adk"', 'template = "generic"'))
@@ -277,10 +344,57 @@ class CLITests(unittest.TestCase):
                                  "--tailscale-client-id", "throwaway-fixture", "--tailscale-audience",
                                  "api.tailscale.com/throwaway-fixture", "--json",
                                  env=dict(os.environ, XDG_CONFIG_HOME=str(config_home)))
+            self.assertEqual(result.returncode, 3, result.stderr)  # no such server alias in this sandbox
+            self.assertNotIn("generic Docker applications", result.stdout)
+            self.assertFalse((root / ".github").exists())
+            self.assertEqual([p.name for p in root.iterdir() if p.name != "config"], ["ship.toml"])
+
+    def test_github_setup_refuses_conflicting_quality_options_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--quality-workflow", ".github/workflows/checks.yml", "--no-quality-workflow", "--json",
+                                 env=dict(os.environ, XDG_CONFIG_HOME=str(root / "config")))
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("generic Docker applications need a custom workflow", json.loads(result.stdout)["error"])
-            self.assertFalse(config_home.exists())
+            self.assertIn("either --quality-workflow or --no-quality-workflow", json.loads(result.stdout)["error"])
             self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
+
+    def test_keys_add_reads_one_validated_public_key_from_exactly_one_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"))
+            for args in ([], ["--public-key-file", "ci.pub", "--public-key-stdin"]):
+                with self.subTest(args=args):
+                    result = self.invoke(directory, "keys", "add", "--label", "ci", *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("exactly one", json.loads(result.stdout)["error"])
+            broken = root / "broken.pub"
+            broken.write_text("ssh-ed25519 AAAAnotarealkey\n")
+            result = self.invoke(directory, "keys", "add", "--label", "ci", "--public-key-file", str(broken), "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn("AAAAnotarealkey", result.stdout + result.stderr)
+            result = self.invoke(directory, "keys", "add", "--label", "Bad Label", "--public-key-file", str(broken),
+                                 "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("key label", json.loads(result.stdout)["error"])
+            good = root / "ci.pub"
+            good.write_text(public_key_line() + "\n")
+            result = self.invoke(directory, "keys", "add", "--label", "ci", "--public-key-file", str(good), "--json", env=env)
+            self.assertEqual(result.returncode, 3, result.stderr)  # valid input; no server alias exists here
+
+    def test_keys_remove_needs_confirmation_and_keys_commands_need_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"))
+            for command in (["keys", "list"], ["keys", "remove", "--label", "ci"]):
+                with self.subTest(command=command):
+                    self.assertEqual(self.invoke(directory, *command, "--json", env=env).returncode, 2)  # no ship.toml
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "keys", "remove", "--label", "ci", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
 
     def test_configure_refuses_ambiguous_or_invalid_inputs(self):
         cases = [[], ["--frontend", "https://example.com", "--no-frontend"], ["--frontend", "https://example.com/path"]]
@@ -375,6 +489,46 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "doctor", "--local", env=env)
         self.assertEqual(result.returncode, 3)
         self.assertIn("ssh: missing", result.stdout)
+
+    def test_doctor_outside_an_application_runs_the_local_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "doctor")
+        self.assertIn(result.returncode, (0, 3))
+        self.assertIn("Target: local machine", result.stdout)
+        self.assertIn("Local tools:", result.stdout)
+        self.assertNotIn("ship.toml was not found", result.stdout)
+
+    def test_doctor_outside_an_application_reports_the_unchecked_scope_and_next_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "doctor")
+        self.assertIn("Server readiness was not checked", result.stdout)
+        self.assertIn("shiplord configure", result.stdout)
+        self.assertIn("shiplord doctor --server <alias>", result.stdout)
+
+    def test_doctor_outside_an_application_keeps_the_local_json_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fallback = self.invoke(directory, "doctor", "--json")
+            local = self.invoke(directory, "doctor", "--local", "--json")
+        self.assertEqual(fallback.returncode, local.returncode, fallback.stderr)
+        output = json.loads(fallback.stdout)
+        self.assertEqual(set(output), {"ok", "scope", "checks", "client"})
+        self.assertEqual(set(output), set(json.loads(local.stdout)))
+        self.assertIn("server readiness was not checked", output["scope"])
+        self.assertEqual(set(output["checks"]), {"ssh", "git", "gh"})
+
+    def test_doctor_outside_an_application_exits_three_when_a_tool_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, PATH=directory)
+            result = self.invoke(directory, "doctor", env=env)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("ssh: missing", result.stdout)
+
+    def test_doctor_reports_an_invalid_manifest_instead_of_falling_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "ship.toml").write_text("this is not toml")
+            result = self.invoke(directory, "doctor", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
 
     def test_version_and_help_use_shiplord(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -475,6 +629,51 @@ class CLIInventoryTests(unittest.TestCase):
 
     def env(self, config: Path) -> dict[str, str]:
         return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+    def test_doctor_deep_prints_ignored_registry_files_once_and_keeps_the_json_field(self):
+        applications = [{"application": "orders", "deployed": True, "unfinished_transaction": None}]
+        ignored = {"ok": True, "checks": {"applications": {"ok": True, "applications": applications,
+                                                          "ignored_files": ["orders.json~"]}}}
+        clean = {"ok": True, "checks": {"applications": {"ok": True, "applications": applications,
+                                                        "ignored_files": []}}}
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, ignored)):
+                text = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"], env=self.env(config))
+                payload = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep", "--json"],
+                                             env=self.env(config))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, clean)):
+                quiet = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"], env=self.env(config))
+        self.assertEqual(text.exit_code, 0, text.output)
+        self.assertEqual(text.stdout.count("orders.json~"), 1)
+        self.assertIn("Ignored 1 file", text.stdout)
+        self.assertNotIn(str(Path(temp)), text.stdout)
+        self.assertEqual(json.loads(payload.stdout)["checks"]["applications"]["ignored_files"], ["orders.json~"])
+        self.assertEqual(quiet.exit_code, 0, quiet.output)
+        self.assertNotIn("Ignored", quiet.stdout)
+
+    def test_doctor_deep_renders_the_os_baseline_with_the_detected_release(self):
+        refused = {"ok": False, "checks": {"os": {
+            "ok": False, "id": "ubuntu", "version_id": "22.04",
+            "message": "unsupported server operating system: ubuntu 22.04 is older than the supported minimum; "
+                       "Shiplord supports Ubuntu 24.04 or later and Debian 12 or later"}}}
+        supported = {"ok": True, "checks": {"os": {"ok": True, "id": "debian", "version_id": "12"}}}
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(3, refused)):
+                failed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, supported)):
+                passed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+        self.assertEqual(failed.exit_code, 3, failed.output)
+        self.assertIn("Server baseline:", failed.stdout)
+        self.assertIn("os: failed (id: ubuntu; version id: 22.04; message: unsupported server operating system:",
+                      failed.stdout)
+        self.assertEqual(passed.exit_code, 0, passed.output)
+        self.assertIn("os: passed (id: debian; version id: 12)", passed.stdout)
 
     def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -731,6 +930,32 @@ class CLIInventoryTests(unittest.TestCase):
                 patch("shiplord.cli.commands.deploy_application", return_value=(code, deploy_result)):
             return CliRunner().invoke(cli.app, arguments)
 
+    def test_recover_force_stop_reaches_the_command_and_help_lists_it(self):
+        recovered = {"ok": True, "request_id": "rc-1", "status": "recovered", "exit_code": 0,
+                     "running": False, "forced_stop": {"forced": True, "signal": "SIGKILL"}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, recovered)) as run:
+            result = CliRunner().invoke(cli.app, ["recover", "--force-stop", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(run.call_args.kwargs["force_stop"])
+        self.assertEqual(run.call_args.args[2], "recover")
+        plain = CliRunner().invoke(cli.app, ["recover", "--help"], color=True)
+        self.assertIn("--force-stop", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
+
+    def test_restart_reaches_the_command_and_help_lists_it(self):
+        restarted = {"ok": True, "request_id": "rs-1", "status": "succeeded", "exit_code": 0,
+                     "release": {"commit": "a" * 40, "sequence": 1000}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, restarted)) as run:
+            result = CliRunner().invoke(cli.app, ["restart", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run.call_args.args[2], "restart")
+        self.assertIn("succeeded", json.loads(result.stdout)["status"])
+        plain = CliRunner().invoke(cli.app, ["--help"], color=True)
+        self.assertIn("restart", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
+
     def test_plan_renders_release_route_storage_and_shutdown_changes(self):
         plan_result = {
             "ok": True, "scope": "server plan; nothing was changed", "action": "deploy",
@@ -850,3 +1075,124 @@ class CLIInventoryTests(unittest.TestCase):
         server_data = json.loads(server.stdout)
         self.assertEqual(server_data["helper_version"], "0.2.0")
         self.assertEqual(server_data["client"]["version"], "0.2.0")
+
+
+class RecordingAdminClient:
+    """A stand-in for the sudo client that records the resolved target and each request."""
+
+    instances: list["RecordingAdminClient"] = []
+
+    def __init__(self, target, prompt=None):
+        self.target, self.prompt, self.calls = target, prompt, []
+        RecordingAdminClient.instances.append(self)
+
+    def call(self, action, application_id, arguments, **kwargs):
+        self.calls.append((action, application_id, arguments))
+        return {"removed": {"registration": True}}
+
+
+class CLIDeprovisionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = Path(self.temp.name) / "config"
+        self.write_servers(self.config, ("hetzner-vm", "admin@host.example.com"),
+                           ("production", "admin@production.example.com"))
+        self.env = dict(os.environ, XDG_CONFIG_HOME=str(self.config))
+        RecordingAdminClient.instances.clear()
+        patcher = patch("shiplord.cli.AdminClient", RecordingAdminClient)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.directory = Path(self.temp.name) / "work"
+        self.directory.mkdir()
+        current = os.getcwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, current)
+
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def invoke(self, *args: str):
+        return CliRunner().invoke(cli.app, list(args), env=self.env)
+
+    def admin_calls(self) -> list[tuple]:
+        return [call for instance in RecordingAdminClient.instances for call in instance.calls]
+
+    def test_explicit_selectors_work_from_a_directory_without_a_manifest(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual([instance.target for instance in RecordingAdminClient.instances],
+                         ["admin@host.example.com"])
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_explicit_selectors_win_over_a_manifest_for_another_application(self):
+        (self.directory / "ship.toml").write_text(MANIFEST.replace('name = "orders"', 'name = "billing"'))
+        with patch("shiplord.cli.load_manifest", side_effect=AssertionError("explicit mode read ship.toml")):
+            result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual(RecordingAdminClient.instances[0].target, "admin@host.example.com")
+
+    def test_either_selector_alone_is_refused_before_any_request(self):
+        for args in (("orders", "--yes"), ("--server", "hetzner-vm", "--yes")):
+            with self.subTest(args=args):
+                result = self.invoke("deprovision", *args, "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("both", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_invalid_application_name_is_refused_before_any_request(self):
+        for name in ("Orders", "orders_app", "a" * 49):
+            with self.subTest(name=name):
+                result = self.invoke("deprovision", name, "--server", "hetzner-vm", "--yes", "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("lowercase application name", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_unknown_server_alias_is_refused_before_any_request(self):
+        result = self.invoke("deprovision", "orders", "--server", "nowhere", "--yes", "--json")
+        self.assertEqual(result.exit_code, 3, result.output)
+        error = json.loads(result.stdout)["error"]
+        self.assertIn("not registered", error)
+        self.assertIn("hetzner-vm", error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_missing_confirmation_names_the_resolved_target_and_sends_nothing(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "hetzner-vm", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_manifest_mode_keeps_the_existing_request_and_json(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                RecordingAdminClient.instances.clear()
+                args = ["deprovision", "--yes", "--json"] + (["--retire"] if retire else [])
+                result = self.invoke(*args)
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(self.admin_calls(), [("deprovision", "orders", arguments)])
+                self.assertEqual(RecordingAdminClient.instances[0].target, "admin@production.example.com")
+                output = json.loads(result.stdout)
+                self.assertEqual(output["removed"], {"registration": True})
+                self.assertIn("data", output["note"])
+
+    def test_manifest_mode_requires_confirmation_and_names_the_target(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        result = self.invoke("deprovision", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "production", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])

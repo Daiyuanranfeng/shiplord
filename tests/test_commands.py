@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -131,13 +132,24 @@ class AdminCommandTests(unittest.TestCase):
                 commands.set_environment(manifest(), client, "set", text)
         self.assertEqual(ssh.calls, [])
 
+    def test_deprovision_sends_the_application_and_only_the_retire_flag_when_asked(self):
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                ssh = FakeSsh((ok({"removed": {"registration": True}}), b"", 0))
+                code, output = commands.deprovision_application("orders", AdminClient("a@h", runner=ssh), retire=retire)
+                sent = read_frame(io.BytesIO(ssh.calls[0][1]))
+                self.assertEqual((sent["action"], sent["application_id"], sent["arguments"]),
+                                 ("deprovision", "orders", arguments))
+                self.assertEqual((code, output["ok"]), (0, True))
+                self.assertIn("data", output["note"])
+
     def test_environment_values_travel_in_the_frame_and_never_come_back(self):
         secret = "postgres://u:s3cr3t@db/x"
         ssh = FakeSsh((ok({"keys": ["DATABASE_URL"], "changed": True}), b"", 0))
         code, output = commands.set_environment(manifest(), AdminClient("a@h", runner=ssh), "set", f"DATABASE_URL={secret}\n")
         self.assertIn(secret.encode(), ssh.calls[0][1])
         self.assertNotIn("s3cr3t", str(ssh.calls[0][0]) + str(output))
-        self.assertIn("next time a release starts", output["note"])
+        self.assertIn("shiplord restart", output["note"])
         _, listing = commands.set_environment(manifest(), AdminClient("a@h", runner=FakeSsh((ok({"keys": ["A"]}), b"", 0))), "keys")
         self.assertNotIn("note", listing)
 
@@ -308,6 +320,66 @@ class QueryCommandTests(ClientTestCase):
         code, result = commands.run_job_command(manifest(), self.client, "rollback", request_id="rb-1")
         self.assertEqual((code, result["ok"], result["error"]), (1, False, "no_previous_release"))
         self.assertEqual(calls, ["rc-1", "rb-1"])
+
+    def test_a_restart_runs_as_a_job_and_reports_the_unchanged_release(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        code, result = commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+        self.assertEqual((code, result["status"], result["exit_code"]), (0, "succeeded", 0))
+        self.assertEqual(result["release"]["commit"], COMMIT)
+        self.assertEqual(self.state.read_state()["current"]["commit"], COMMIT)
+
+    def test_a_restart_with_nothing_deployed_returns_exit_two_without_a_job(self):
+        code, result = commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+        self.assertEqual((code, result["status"], result["error"]), (2, "rejected", "nothing_deployed"))
+        self.assertIn("nothing to restart", result["message"])
+        self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
+        self.assertEqual(self.launcher.launched, [])
+
+    def test_restart_requires_the_helper_capability_before_any_job(self):
+        old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",
+               "actions": ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
+                           "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]}
+        with patch.object(self.client, "call", return_value=old) as call:
+            with self.assertRaises(CommandError) as caught:
+                commands.run_job_command(manifest(), self.client, "restart", request_id="rs-1")
+            self.assertEqual(caught.exception.code, 4)
+            self.assertIn("does not support restart", str(caught.exception))
+            self.assertIn("shiplord server bootstrap", str(caught.exception))
+            self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])  # no job was submitted
+
+    def test_force_stop_requires_the_helper_capability_before_any_job(self):
+        old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",
+               "actions": ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
+                           "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]}
+        with patch.object(self.client, "call", return_value=old) as call:
+            with self.assertRaisesRegex(CommandError, "does not support --force-stop"):
+                commands.run_job_command(manifest(), self.client, "recover", force_stop=True)
+            self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])
+
+    def test_force_stop_is_recorded_in_the_recovery_outcome(self):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+
+        def wait(client, job_id, **options):
+            run_job(self.services, "orders", job_id)
+            return original(client, job_id, **dict(options, interval=0, sleep=lambda s: None))
+        client_module.wait_for_job = wait
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        code, result = commands.run_job_command(manifest(), self.client, "recover", request_id="rc-force",
+                                                force_stop=True)
+        self.assertEqual((code, result["status"]), (0, "recovered"))
+        self.assertTrue(result["forced_stop"]["forced"])
+        self.assertEqual(result["forced_stop"]["signal"], "SIGKILL")
+        self.assertFalse(result["running"])
 
 
 class DoctorTests(ClientTestCase):

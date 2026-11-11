@@ -18,13 +18,13 @@ from shiplord.layout import Layout  # noqa: E402
 from shiplord.manifest import ManifestError, validate_manifest  # noqa: E402
 from shiplord.release_state import StateError, validate_release  # noqa: E402
 from shiplord.retire import make_retirer  # noqa: E402
-from shiplord.runtime import DockerRuntime, RuntimeFailure, stop_signal  # noqa: E402
+from shiplord.runtime import DockerRuntime, RuntimeFailure, parse_stop_signal, stop_signal  # noqa: E402
 from shiplord.shutdown import check_budget, check_recovery_budget, policy, ShutdownError, worst_case_seconds  # noqa: E402
 from shiplord.system import CommandResult  # noqa: E402
 from test_client import ClientTestCase  # noqa: E402
 from test_commands import COMMIT, IMAGE  # noqa: E402
 from test_deploy import DeployTestCase  # noqa: E402
-from test_runtime import LABELLED_VOLUME, REGISTRATION, release  # noqa: E402
+from test_runtime import LABELLED_VOLUME, REGISTRATION, FakeStopState, release  # noqa: E402
 
 ID_A, ID_B = "a" * 64, "b" * 64
 
@@ -106,6 +106,13 @@ class SignalTests(unittest.TestCase):
             with self.subTest(configured), self.assertRaises(RuntimeFailure):
                 stop_signal(configured)
 
+    def test_the_shared_rule_normalises_a_catchable_signal_and_rejects_an_unusable_one(self):
+        for configured, expected in (("", "SIGTERM"), ("<no value>", "SIGTERM"), ("sigquit", "SIGQUIT"), ("15", "15")):
+            self.assertEqual(parse_stop_signal(configured), expected)
+        for configured in ("SIGKILL", "KILL", "9", "SIGSTOP", "19", "0", "32", "SIGFOO", "TERM;rm", "-15"):
+            with self.subTest(configured), self.assertRaises(ValueError):
+                parse_stop_signal(configured)
+
 
 class ScriptedDocker:
     """A tiny stateful Docker: containers drain for ``drain`` seconds after SIGTERM, or never (``stubborn``)."""
@@ -138,6 +145,8 @@ class ScriptedDocker:
             return self.fail[key]
         if key == "volume inspect":
             return self.volume
+        if key == "image inspect":  # a start checks for the release's image before it replaces anything
+            return CommandResult(0, "sha256:" + ID_A + "\n")
         if verb == "ps":
             return CommandResult(0, "\n".join(self.containers) + "\n")
         if verb == "inspect":
@@ -376,6 +385,57 @@ class StopTests(unittest.TestCase):
         self.runtime.stop(REGISTRATION)
         self.assertEqual(self.docker.sub("kill")[0][3], "SIGTERM")
         self.assertEqual(self.docker.containers, {})
+
+    def fail_record(self):
+        state = FakeStopState()
+        state.record = {"container_id": ID_A, "restart_policy": "unless-stopped", "timeout_seconds": 5,
+                        "action": "fail", "signal": "SIGTERM", "deadline_epoch": 0, "phase": "signalled"}
+        return state
+
+    def test_a_forced_stop_kills_a_fail_record_that_outlived_its_deadline(self):
+        self.docker.add(ID_A, stubborn=True, restart="no", action="fail", timeout="5")
+        state = self.fail_record()
+        self.runtime.force_stop(REGISTRATION, state)
+        self.assertEqual([c[3] for c in self.docker.sub("kill")], ["KILL"])
+        self.assertEqual(self.docker.containers, {})
+        self.assertIsNone(state.record)  # only cleared after the exit and removal were confirmed
+        report = self.runtime.stop_report[0]
+        self.assertTrue(report["forced"])
+        self.assertIn("force_requested", report["stages"])
+
+    def test_a_plain_stop_still_refuses_the_same_fail_record(self):
+        self.docker.add(ID_A, stubborn=True, restart="no", action="fail", timeout="5")
+        state = self.fail_record()
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.stop_with_state(REGISTRATION, state)
+        self.assertEqual(caught.exception.kind, "shutdown_timeout")
+        self.assertEqual(self.docker.sub("kill"), [])
+        self.assertEqual(self.docker.containers[ID_A]["status"], "running")
+        self.assertIsNotNone(state.record)
+
+    def test_a_forced_stop_of_a_legacy_container_persists_no_record(self):
+        self.docker.add(ID_A, stubborn=True, restart="no", action="fail")
+        state = FakeStopState()
+        self.runtime.force_stop(REGISTRATION, state)
+        self.assertEqual([c[3] for c in self.docker.sub("kill")], ["KILL"])  # it was already signalled by the old helper
+        self.assertIsNone(state.record)
+        self.assertEqual(self.docker.containers, {})
+
+    def test_an_unconfirmed_forced_kill_keeps_the_journal(self):
+        self.docker.add(ID_A, stubborn=True, restart="no", action="fail", timeout="5")
+        state = self.fail_record()
+        original = self.docker.run
+
+        def survive(argv, **kwargs):
+            if argv[1] == "kill" and argv[3] == "KILL":
+                return CommandResult(0, "")
+            return original(argv, **kwargs)
+        self.docker.run = survive
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.force_stop(REGISTRATION, state)
+        self.assertEqual(caught.exception.kind, "kill_unconfirmed")
+        self.assertEqual(state.record["phase"], "killed")
+        self.assertEqual(self.docker.containers[ID_A]["status"], "running")
 
 
 class DeployerTests(DeployTestCase):

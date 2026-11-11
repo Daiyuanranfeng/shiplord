@@ -20,7 +20,7 @@ from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
-from .shutdown import FEATURE as SHUTDOWN_FEATURE
+from .shutdown import FEATURE as SHUTDOWN_FEATURE, FORCE_STOP_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
@@ -95,9 +95,9 @@ def provision_application(manifest: dict, admin: AdminClient, *, public_key: Pat
                "next": "Point DNS for the API hostname at the server, then run `shiplord deploy`."}
 
 
-def deprovision_application(manifest: dict, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
+def deprovision_application(application_id: str, admin: AdminClient, *, retire: bool = False) -> tuple[int, dict]:
     """Remove the application's server-side access; with ``retire``, first stop it and take down its route."""
-    result = admin.call("deprovision", manifest["name"], {"retire": True} if retire else {})
+    result = admin.call("deprovision", application_id, {"retire": True} if retire else {})
     return 0, {"ok": True, **result, "note": "Application data is never deleted; remove it by hand when you are sure."}
 
 
@@ -112,7 +112,8 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
             raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
         arguments["text"] = text
     result = admin.call("environment", manifest["name"], arguments)
-    note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
+    note = ("Takes effect when the application next starts; run `shiplord restart` to apply it to the running release."
+            if operation in ("set", "clear") else None)
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
 
 
@@ -316,10 +317,20 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
 
 
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
+                    force_stop: bool = False,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
-                              on_progress=on_progress, lookup_command=status_lookup_command(manifest, request_id))
+    arguments = {"force_stop": True} if force_stop else {}
+    if action == "restart" and "restart" not in client.call("capabilities")["actions"]:
+        # An older helper answers a bare "invalid action" with exit 2, which would blame the operator's input.
+        raise CommandError("the server helper does not support restart; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    if force_stop and FORCE_STOP_FEATURE not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support --force-stop; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+    outcome = submit_and_wait(client, action, request_id=request_id, arguments=arguments,
+                              timeout=job_timeout(manifest), on_progress=on_progress,
+                              lookup_command=status_lookup_command(manifest, request_id))
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
 
