@@ -687,7 +687,22 @@ class CLITests(unittest.TestCase):
         self.assertIn("shiplord", help_result.stdout.lower())
 
 
-class CLIInventoryTests(unittest.TestCase):
+class ServerConfigMixin(unittest.TestCase):
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def env(self, config: Path) -> dict[str, str]:
+        return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+
+class CLIInventoryTests(ServerConfigMixin):
     inventory = {"ok": True, "applications": [{
         "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,
         "release_recorded": True, "unfinished_transaction": None, "ok": True,
@@ -1440,6 +1455,96 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(server_data["client"]["version"], "0.2.0")
 
 
+class ServerUninstallTests(ServerConfigMixin):
+    """`shiplord server uninstall` calls the admin action and reports what it removed."""
+
+    result = {"status": "uninstalled",
+              "removed": {"caddy": {"import": True, "placeholder": True}, "sshd": True,
+                          "wrappers": ["shiplord-host", "shiplord-admin"], "versions": 2,
+                          "directories": ["registrations", "jobs"]},
+              "retained": ["the state directory that holds the host lock"], "applications": []}
+
+    def fake(self, result=None, error=None):
+        calls = []
+
+        class FakeAdmin:
+            def __init__(self, target, prompt=None):
+                self.target = target
+
+            def call(self, action, application_id, arguments, *, timeout=120):
+                calls.append((action, application_id, arguments, timeout))
+                if error is not None:
+                    raise error
+                return dict(self_result if self_result is not None else ServerUninstallTests.result)
+
+        self_result = result
+        return FakeAdmin, calls
+
+    def test_human_output_lists_removals_retained_state_and_the_data_warning(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls, [("uninstall", None, {"force": False}, 300)])
+        self.assertIn("Removed:", result.stdout)
+        self.assertIn("the managed Caddy import", result.stdout)
+        self.assertIn("the launchers: shiplord-host, shiplord-admin", result.stdout)
+        self.assertIn("the helper code (2 versions)", result.stdout)
+        self.assertIn("Left in place:", result.stdout)
+        self.assertIn("Application data is never deleted", result.stdout)
+        self.assertIn("shiplord server bootstrap", result.stdout)
+
+    def test_json_keeps_the_result_and_the_data_warning(self):
+        admin, _calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["removed"]["wrappers"], ["shiplord-host", "shiplord-admin"])
+        self.assertIn("Application data is never deleted", data["note"])
+
+    def test_force_is_passed_to_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--force", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls[0][2], {"force": True})
+
+    def test_a_refused_uninstall_exits_two_and_names_the_applications(self):
+        error = ClientError("2 applications are still provisioned (orders, billing); deprovision them first "
+                            "or pass --force", 2, error_code="rejected")
+        admin, _calls = self.fake(error=error)
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 2, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["error_code"], "rejected")
+        self.assertIn("orders", data["error"])
+
+    def test_an_unknown_alias_exits_three_without_calling_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "absent", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertEqual(calls, [])
 class EnvironmentDiffCLITests(unittest.TestCase):
     SECRET = "postgres://app:cli-secret@db/orders"
     MANIFEST = {"name": "orders", "server": "production"}

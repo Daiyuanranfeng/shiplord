@@ -585,7 +585,8 @@ class AdminLockTests(DoctorTestCase):
         from shiplord.admin import READ_ONLY_ACTIONS
         from shiplord.protocol import ADMIN_ACTIONS
         self.assertEqual(READ_ONLY_ACTIONS, frozenset({"doctor", "apps"}))
-        self.assertEqual(READ_ONLY_ACTIONS | frozenset({"provision", "keys", "environment", "registry", "deprovision"}),
+        self.assertEqual(READ_ONLY_ACTIONS | frozenset({"provision", "keys", "environment", "registry", "deprovision",
+                                                        "uninstall"}),
                          ADMIN_ACTIONS)
 
     def test_a_registered_deployment_account_is_denied_a_read_only_action_too(self):

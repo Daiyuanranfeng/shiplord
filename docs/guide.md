@@ -499,6 +499,7 @@ reach the run page or the calling job.
 | `server remove <alias>` | Delete an alias. Refuses while the current directory's `ship.toml` names it. |
 | `server rename <old> <new>` | Rename an alias. Refuses when the new alias already exists. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
+| `server uninstall <alias> [--force]` | Remove the helper, launchers, sshd drop-in, and Caddy import. Keeps application data. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal; `--json` never prompts). |
 | `setup` | Run configure, provision, env, registry login, github setup, and check-ci in order; resume at the first incomplete step. |
 | `provision [--update]` | Create the application's account, state, port, and key access on the server. `--update` applies a changed hostname or memory ceiling without removing state or keys. |

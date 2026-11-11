@@ -555,6 +555,50 @@ def server_bootstrap(alias: str, json_output: bool = typer.Option(False, "--json
         output.render_bootstrap(payload, f"server {alias}")
 
 
+def _render_uninstall(result: dict) -> None:
+    removed = result.get("removed", {})
+    typer.echo("Removed:")
+    caddy = removed.get("caddy") or {}
+    lines = []
+    if caddy.get("import"):
+        lines.append("the managed Caddy import")
+    if caddy.get("placeholder"):
+        lines.append("the managed Caddy placeholder route")
+    if removed.get("sshd"):
+        lines.append("the sshd drop-in")
+    if removed.get("wrappers"):
+        lines.append("the launchers: " + ", ".join(removed["wrappers"]))
+    if removed.get("versions"):
+        lines.append(f"the helper code ({removed['versions']} version"
+                     f"{'' if removed['versions'] == 1 else 's'})")
+    if removed.get("directories"):
+        lines.append("empty managed directories: " + ", ".join(removed["directories"]))
+    for line in lines or ["nothing (the host was already uninstalled)"]:
+        typer.echo(f"  - {line}")
+    retained = result.get("retained") or []
+    if retained:
+        typer.echo("Left in place:")
+        for item in retained:
+            typer.echo(f"  - {item}")
+    if result.get("note"):
+        typer.echo(str(result["note"]))
+    typer.echo("Run `shiplord server bootstrap` to install the helper again.")
+
+
+@server_app.command("uninstall", rich_help_panel="Administration")
+def server_uninstall(alias: str,
+                     force: bool = typer.Option(
+                         False, "--force",
+                         help="Remove the host even though applications are still provisioned; they keep their data."),
+                     json_output: bool = typer.Option(False, "--json")) -> None:
+    """Remove the helper, launchers, sshd drop-in, and Caddy import from a server. Application data is kept."""
+    def action() -> tuple[int, dict]:
+        result = _admin_target(load_server(alias), json_output).call("uninstall", None, {"force": force}, timeout=300)
+        return 0, {"ok": True, **result,
+                   "note": "Application data is never deleted; remove it by hand when you are sure."}
+    _execute(action, json_output, lambda code, result: _render_uninstall(result))
+
+
 @app.command("init", rich_help_panel="Setup")
 def init(name: str, template: str = typer.Option(..., "--template"),
          json_output: bool = typer.Option(False, "--json")) -> None:

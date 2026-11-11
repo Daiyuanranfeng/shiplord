@@ -41,7 +41,11 @@ LAUNCHER_TEMPLATE = (
     "sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))\n"
     "from {module} import main\n\nmain()\n"
 )
+MANAGED_MARKER = b"# Managed by Shiplord."  # first bytes of every file bootstrap writes into a shared directory
 PLACEHOLDER = b"# Managed by Shiplord. Generated route files live in this directory.\n"
+COMPLETE_MARKER = ".complete"  # written last, so its presence marks a version that finished installing
+VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}-[0-9a-f]{12}\Z")  # "<version>-<digest prefix>"
+KEPT_VERSIONS = 2  # the current version and the one before it, so a rollback target survives an upgrade
 DEPLOY_GROUP = "shiplord-deploy"  # the only accounts the sshd drop-in matches; provisioning adds each new one
 DEPLOY_MARKER = "shiplord-deploy"  # prefix of the passwd comment that marks an account as a deployment account
 SSHD_DROPIN = """\
@@ -203,13 +207,151 @@ def _switch_current(layout: Layout, name: str) -> bool:
 
 def _install_wrappers(layout: Layout) -> bool:
     changed = False
-    wrappers = {layout.host: "host_launcher.py", layout.admin: "admin_launcher.py",
-                layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
-    for target, launcher in wrappers.items():
+    for target, launcher in launcher_targets(layout).items():
         _ensure_dir(target.parent, 0o755)
-        text = f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'
-        changed |= _write_atomic(target, text.encode(), 0o755)
+        changed |= _write_atomic(target, wrapper_text(layout, launcher), 0o755)
     return changed
+
+
+def launcher_targets(layout: Layout) -> dict[Path, str]:
+    """The launcher script bootstrap installs at each entry-point path."""
+    return {layout.host: "host_launcher.py", layout.admin: "admin_launcher.py",
+            layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
+
+
+def wrapper_text(layout: Layout, launcher: str) -> bytes:
+    """The exact text of the launcher bootstrap installs; uninstall recognises its own by this text."""
+    return f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'.encode()
+
+
+def _helper_directory(layout: Layout) -> int:
+    """Open the helper directory, refusing one this account does not own or others may write."""
+    try:
+        descriptor = os.open(layout.lib, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise BootstrapError("could not open the helper directory") from None
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        os.close(descriptor)
+        raise BootstrapError("the helper directory is not trusted")
+    return descriptor
+
+
+def running_version(layout: Layout) -> str | None:
+    """The installed version directory this module is executing from, if it is running from one."""
+    try:
+        relative = Path(__file__).resolve().relative_to(layout.lib.resolve())
+    except (OSError, ValueError):
+        return None
+    return relative.parts[0] if relative.parts else None
+
+
+def live_versions(directory: int, layout: Layout) -> set[str]:
+    """The versions a symlink in the helper directory points at, plus the running one."""
+    live = set()
+    for name in os.listdir(directory):
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISLNK(info.st_mode):
+                continue
+            target = Path(os.readlink(name, dir_fd=directory))
+        except OSError:
+            continue
+        if target.is_absolute():
+            try:
+                target = target.relative_to(layout.lib)
+            except ValueError:
+                continue
+        if target.parts:
+            live.add(target.parts[0])
+    running = running_version(layout)
+    if running is not None:
+        live.add(running)
+    return live
+
+
+def complete_versions(directory: int) -> list[tuple[int, str]]:
+    """Every finished helper version in ``directory``, newest first, as (marker mtime, name).
+
+    Only a directory whose name bootstrap generates and that holds a ``.complete`` marker qualifies, so a
+    hand-made directory or an interrupted install is never mistaken for a version to collect.
+    """
+    versions = []
+    for name in os.listdir(directory):
+        if not VERSION_PATTERN.fullmatch(name):
+            continue
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            marker = os.stat(f"{name}/{COMPLETE_MARKER}", dir_fd=directory, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(marker.st_mode):
+            versions.append((marker.st_mtime_ns, name))
+    return sorted(versions, reverse=True)
+
+
+def remove_version_tree(parent: int, name: str) -> None:
+    """Remove one version directory without following a link, refusing anything this account does not own."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError:
+        raise BootstrapError("could not open an old helper version") from None
+    try:
+        if os.fstat(descriptor).st_uid != os.geteuid():
+            raise BootstrapError("an old helper version is not owned by the installing account")
+        for child in sorted(os.listdir(descriptor)):
+            try:
+                info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            except OSError:
+                raise BootstrapError("could not inspect an old helper version") from None
+            if stat.S_ISDIR(info.st_mode):
+                remove_version_tree(descriptor, child)
+                continue
+            try:
+                os.unlink(child, dir_fd=descriptor)
+            except OSError:
+                raise BootstrapError("could not remove an old helper version") from None
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.rmdir(name, dir_fd=parent)
+    except OSError:
+        raise BootstrapError("could not remove an old helper version") from None
+
+
+def collect_old_versions(layout: Layout) -> list[str]:
+    """Remove helper versions that are neither current nor the previous one; returns what it removed.
+
+    The current version, the version the running helper executes from, and every version a symlink in the
+    helper directory points at are always kept, together with the newest other finished version. Repeating
+    it removes nothing more.
+    """
+    directory = _helper_directory(layout)
+    try:
+        versions = complete_versions(directory)
+        keep = live_versions(directory, layout)
+        kept = sum(1 for _age, name in versions if name in keep)
+        for _age, name in versions:
+            if kept >= KEPT_VERSIONS:
+                break
+            if name in keep:
+                continue
+            keep.add(name)  # the newest version nothing points at: the rollback target
+            kept += 1
+        removed = []
+        for _age, name in versions:
+            if name in keep:
+                continue
+            remove_version_tree(directory, name)
+            removed.append(name)
+        if removed:
+            os.fsync(directory)
+        return sorted(removed)
+    finally:
+        os.close(directory)
 
 
 def _installed_sshd_units(system: System) -> set[str]:
@@ -474,9 +616,25 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
             changed["wrappers"] = _install_wrappers(layout)
             changed["sshd_group"] = _ensure_deployment_group(system)
             changed["sshd"] = _install_sshd(layout, system, unit, socket)
+            collected, warnings = _collect_old_versions(layout)
     finally:
         os.close(descriptor)
-    return {"version": name, "changed": changed}
+    return {"version": name, "changed": changed, "collected": collected,
+            **({"warnings": warnings} if warnings else {})}
+
+
+def _collect_old_versions(layout: Layout) -> tuple[list[str], list[str]]:
+    """Garbage-collect old helper versions after a successful install; a cleanup failure is a warning.
+
+    The host is installed and serving by the time this runs, so a version that cannot be removed must not turn a
+    successful bootstrap into a reported failure. It is reported instead, and the next bootstrap retries it.
+    """
+    try:
+        return collect_old_versions(layout), []
+    except BootstrapError as error:
+        return [], [str(error)]
+    except OSError:
+        return [], ["old helper versions could not be collected"]
 
 
 def main() -> None:

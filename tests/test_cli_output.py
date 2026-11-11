@@ -89,6 +89,12 @@ GITHUB_ROTATED = {"ok": True, "repository": "QueryPlanner/orders", "old_label": 
                   "key_label": "ci-new", "key_fingerprint": "SHA256:new", "steps": {"register": "ci-new"}}
 RESTARTED = {"ok": True, "request_id": "restart-1", "status": "succeeded", "exit_code": 0}
 KEYS = {"keys": [{"label": "ci", "fingerprint": "SHA256:abc"}]}
+UNINSTALLED = {
+    "status": "uninstalled",
+    "removed": {"caddy": {"import": True, "placeholder": False}, "sshd": True,
+                "wrappers": ["shiplord-host", "shiplord-admin"], "versions": 2, "directories": ["registrations"]},
+    "retained": ["the state directory that holds the host lock"], "applications": [],
+}
 SETUP = {"ok": True, "resumed_at": "configure", "steps": [
     {"step": "configure", "status": "ran", "result": {"answers": {}}},
     {"step": "provision", "status": "already complete"},
@@ -404,6 +410,14 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli._helper", {}),
                          ("shiplord.cli.commands.run_job_command", {"return_value": (0, RESTARTED)})]),
                 RESTARTED, ("Outcome: succeeded", "Request ID: restart-1")),
+            Case("server uninstall", lambda as_json: self.invoke(
+                ["server", "uninstall", "production"], as_json,
+                patches=[("shiplord.cli.load_server", {"return_value": "admin@example.com"}),
+                         ("shiplord.cli._admin_target", {"return_value": self.uninstall_admin()})]),
+                {"ok": True, **UNINSTALLED,
+                 "note": "Application data is never deleted; remove it by hand when you are sure."},
+                ("Removed:", "the managed Caddy import", "the launchers: shiplord-host, shiplord-admin",
+                 "Left in place:", "Application data is never deleted", "shiplord server bootstrap")),
             Case("server remove", lambda as_json: self.invoke(
                 ["server", "remove", "production"], as_json,
                 patches=[("shiplord.cli.remove_server", {"return_value": None})]),
@@ -440,6 +454,13 @@ class CommandOutputTests(unittest.TestCase):
                          ("shiplord.cli._admin", {"return_value": self.keys_admin()})]),
                 {"ok": True, **KEYS, "label": "ci"}, ("Outcome: key ci removed", "ci: SHA256:abc")),
         ]
+
+    @staticmethod
+    def uninstall_admin():
+        """An admin client whose only request reports what the server removed."""
+        admin = MagicMock()
+        admin.call.return_value = dict(UNINSTALLED)
+        return admin
 
     @staticmethod
     def keys_admin():
