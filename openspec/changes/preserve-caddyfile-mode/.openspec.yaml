@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-10
+goal: Preserve the Caddyfile's owner and mode when it is rewritten, and create
+  route files with an explicit mode instead of the helper's umask

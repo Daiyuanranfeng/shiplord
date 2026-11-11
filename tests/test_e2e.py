@@ -51,6 +51,8 @@ class EndToEndTests(unittest.TestCase):
         cls.project.mkdir(exist_ok=True)
         cls.executable = shutil.which("shiplord")
         cls.environment = dict(os.environ, XDG_CONFIG_HOME=str(cls.config), HOME="/root")
+        # A developer's real Tailscale token must never reach a test: `github setup` would call the API.
+        cls.environment.pop("TAILSCALE_API_KEY", None)
         cls.setup_fake_gh()
         cls.setup_accounts_and_ssh()
         cls.setup_caddy()
@@ -309,6 +311,15 @@ else: sys.exit("unsupported: " + " ".join(args))
 
     def test_13_recover_with_nothing_to_recover_succeeds(self):
         self.assertEqual(self.cli_json("recover")["status"], "nothing_to_recover")
+        # The named form reconciles the same application from a directory with no checkout.
+        empty = ROOT / "empty"
+        empty.mkdir(exist_ok=True)
+        named = json.loads(self.cli("recover", self.app, "--server", "production", "--json", cwd=empty, check=0).stdout)
+        self.assertEqual(named["status"], "nothing_to_recover")
+        human = self.cli("recover", self.app, "--server", "production", cwd=empty, check=0)
+        self.assertIn(f"Target: {self.app} on production", human.stdout)
+        self.assertIn("Outcome: nothing to recover", human.stdout)
+        self.assertEqual(list(empty.iterdir()), [])
 
     def test_14_a_password_protected_sudo_is_supported_without_the_password_leaving_stdin(self):
         client = AdminClient("adminpw@127.0.0.1", prompt=lambda text: ADMIN_PASSWORD)
@@ -358,10 +369,14 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.assertEqual((variables / "SHIPLORD_SSH_PORT").read_text(), str(PORT))
         self.assertTrue((variables / "SHIPLORD_SSH_KNOWN_HOSTS").read_text().startswith(f"[127.0.0.1]:{PORT} ssh-"))
         self.assertEqual((variables / "SHIPLORD_TS_CLIENT_ID").read_text(), "client123")
-        workflow = (self.project / ".github" / "workflows" / "shiplord-release.yml").read_text()
-        self.assertIn("ab" * 20, workflow)
-        self.assertEqual(oct((self.config / "shiplord" / "ci" / self.app).stat().st_mode & 0o777), "0o700")
-        self.assertEqual([p.name for p in (self.config / "shiplord" / "ci" / self.app).iterdir()], ["state.json"])
+        release = (self.project / ".github" / "workflows" / "shiplord-release.yml").read_text()
+        deploy = (self.project / ".github" / "workflows" / "shiplord-deploy.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/shiplord-deploy.yml", release)
+        self.assertIn("ab" * 20, deploy)
+        ci = self.config / "shiplord" / "ci" / "production" / self.app  # scoped by server as well as application
+        self.assertEqual(oct(ci.stat().st_mode & 0o777), "0o700")
+        self.assertEqual([p.name for p in ci.iterdir()], ["state.json"])
+        self.assertFalse((self.config / "shiplord" / "ci" / self.app).exists())  # nothing is written at the old path
         type(self).first_label = result["key_label"]
         type(self).first_secret = (secrets / "SHIPLORD_SSH_PRIVATE_KEY").read_bytes()
 
@@ -516,6 +531,33 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.assertTrue(config_routes_to(configuration, "fixture.example.test", f"127.0.0.1:{self.port}"))
         self.assertTrue(config_routes_to(configuration, "second.example.test", f"127.0.0.1:{self.port2}"))
         self.assertFalse(config_routes_to(configuration, "second.example.test", f"127.0.0.1:{self.port}"))  # no crossed routes
+
+    def test_25_deprovision_by_name_and_alias_retires_a_live_app_and_keeps_its_data(self):
+        # No ship.toml here: the application and its server are named explicitly.
+        elsewhere = ROOT / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        route = Path(f"/etc/caddy/ship/{self.app}.caddy")
+        volume = f"shiplord-{self.app}-artifacts"
+        self.assertTrue(self.containers_of(self.app))
+        self.assertTrue(route.exists())
+
+        refused = self.cli("deprovision", self.app, "--server", "production", "--yes", "--json", cwd=elsewhere, check=1)
+        self.assertIn("retire it before removing the application", refused.stdout)
+        self.assertTrue(self.containers_of(self.app))  # a refused removal stops and removes nothing
+        self.assertTrue(route.exists())
+
+        result = json.loads(self.cli("deprovision", self.app, "--server", "production", "--retire", "--yes", "--json",
+                                     cwd=elsewhere, check=0).stdout)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("public route", result["retired"]["removed"])
+        self.assertEqual(self.containers_of(self.app), [])
+        self.assertFalse(route.exists())
+        configuration = json.loads(urllib.request.urlopen("http://127.0.0.1:2019/config/apps/http/servers", timeout=5).read())
+        from shiplord.probes import config_routes_to
+        self.assertFalse(config_routes_to(configuration, "fixture.example.test", f"127.0.0.1:{self.port}"))
+        self.assertIn("application data", " ".join(result["retained"]))
+        self.assertEqual(fixtures.docker("volume", "inspect", volume, check=False).returncode, 0)  # data is kept
+        self.assertNotEqual(sh("getent", "passwd", f"ship-{self.app}", check=False).returncode, 0)
 
 
 if __name__ == "__main__":
