@@ -96,6 +96,8 @@ shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # re
 shiplord deploy --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>
 shiplord status
 shiplord logs --tail 100
+shiplord logs --since 15m --timestamps            # the current release's container or unit only
+shiplord logs --follow --timeout 300              # stream until Ctrl-C or the 5-minute bound
 shiplord rollback
 shiplord recover
 ```
@@ -435,7 +437,7 @@ reach the run page or the calling job.
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `release [--image-repository R] [--tag T] [--platform P]` | Build and push this checkout, then deploy the pushed digest. Refuses a dirty tree. |
-| `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
+| `status`, `logs --tail N [--since D] [--timestamps] [--follow --timeout S]` | Release state, running state, unfinished work; the current release's bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
 | `rollback`, `recover [APP --server ALIAS]` | Restore the previous release; reconcile an interrupted deployment, from an app directory or by named target. |
 | `restart` | Restart the deployed release so it reads the current environment. Refused when nothing is deployed. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |

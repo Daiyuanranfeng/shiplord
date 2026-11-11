@@ -87,6 +87,7 @@ If the new version fails its health check, Shiplord restores the last working ve
 ```sh
 shiplord status
 shiplord logs --tail 100
+shiplord logs --follow --timeout 300      # Ctrl-C stops it sooner
 shiplord rollback
 shiplord recover
 ```

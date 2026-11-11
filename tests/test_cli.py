@@ -1095,6 +1095,56 @@ class CLIInventoryTests(unittest.TestCase):
                                                env=self.env(config))
             self.assertEqual(set(json.loads(logs_json.stdout)), {"ok", "logs"})
 
+    def test_logs_forward_since_timestamps_and_follow_to_the_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs",
+                       return_value=(0, {"ok": True, "logs": "one\n"})) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--tail", "25",
+                                                      "--since", "15m", "--timestamps"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(call.call_args.args[1], 25)
+        self.assertEqual(call.call_args.kwargs["since"], "15m")
+        self.assertTrue(call.call_args.kwargs["timestamps"])
+        self.assertFalse(call.call_args.kwargs["follow"])
+
+    def test_follow_and_json_are_refused_before_any_connection(self):
+        with patch("shiplord.cli._app_context") as context:
+            result = CliRunner().invoke(cli.app, ["logs", "orders", "--follow", "--json"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("cannot be combined", json.loads(result.stdout)["error"])
+        context.assert_not_called()
+
+    def test_follow_writes_chunks_as_they_arrive_and_reports_the_stop_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+
+            def stream(client, tail, **options):
+                options["on_chunk"]("one\n")
+                options["on_chunk"]("two\n")
+                return 0, {"ok": True, "logs": "", "stopped": "timeout", "release": "a" * 12}
+
+            with patch("shiplord.cli.commands.application_logs", side_effect=stream) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow",
+                                                      "--timeout", "60"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.stdout, "one\ntwo\n")
+        self.assertIn(f"Outcome: stopped at the timeout (release {'a' * 12})", result.stderr)
+        self.assertEqual(call.call_args.kwargs["timeout"], 60)
+
+    def test_ctrl_c_stops_following_with_exit_130(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs", side_effect=KeyboardInterrupt):
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 130)
+        self.assertIn("Stopped following logs.", result.stderr)
+
+
     def test_status_explains_an_observed_unfinished_transaction(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"

@@ -556,11 +556,12 @@ class FailedCandidateLogTests(DeployTestCase):
         self.deploy()
         restored = release_id(record())
         self.runtime.candidate_logs[restored] = "restored release line\n"
-        self.runtime.logs = lambda registration, tail: self.runtime.candidate_logs.get(
+        self.runtime.logs = lambda registration, release, tail, **options: self.runtime.candidate_logs.get(
             next(iter(self.runtime.running), ""), "")
         _, outcome = self.failed_candidate(commit="c", image="d", sequence=1001)
         self.assertIn("boom", outcome.detail["candidate_logs"]["output"])
-        self.assertEqual(self.runtime.logs(REGISTRATION, 50), "restored release line\n")
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.state.read_state()["current"], 50),
+                         "restored release line\n")
 
     def test_the_captured_tail_still_fits_in_a_job_record(self):
         self.deploy()
