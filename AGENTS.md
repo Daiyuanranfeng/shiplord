@@ -9,10 +9,15 @@ Release, from the application's directory (it contains `ship.toml`):
 
 ```sh
 shiplord doctor --json                                   # prerequisites, SSH access, helper, DNS
-shiplord plan --image <registry/name@sha256:digest> --commit <40-hex sha> --json   # read-only
+shiplord release --json                                  # build and push this checkout, then deploy its digest
+shiplord plan --image <registry/name@sha256:digest> --commit <40-hex sha> --json   # read-only, prebuilt image
 shiplord deploy --image <registry/name@sha256:digest> --commit <40-hex sha> --json
 shiplord status --json
 ```
+
+`shiplord release` refuses a dirty working tree, builds for the server's platform (`--platform`, default
+`linux/amd64`), labels the image with the commit, and deploys the pushed digest. Use `plan`/`deploy` when the image
+was already built elsewhere (for example CI).
 
 Native binaries: `shiplord deploy --binary <path> --commit <sha> --json` (a Linux ELF for the server's CPU).
 
@@ -30,9 +35,28 @@ Read the exit code and the JSON `status`/`error`:
 | 5 | `rolled_back` | The release failed and the previous one is serving. This is a failure: report it, show `logs`. |
 | 6 | `intervention_required`, `interrupted` | Run `shiplord recover`. If it also exits 6, stop and report. |
 
+Every command follows this table, not only `deploy`. `2` is always bad input or configuration, `3` a missing
+prerequisite, and `4` a protocol mismatch; `5` and `6` describe a release transition that failed after it began.
+Every command that reports a result prints readable lines by default and the same result as one stable JSON
+document with `--json`. `--json` never asks for configuration values; a sudo password may still be requested at a
+terminal.
+
 To retry the same deployment safely, repeat the command with the same `--request-id`. To go back deliberately, use
 `shiplord rollback`. To report what is deployed: `shiplord status --json` gives the commit, artifact, running state,
 and any unfinished transaction. Never claim a release is live unless `deploy` exited 0.
+
+If an application's process ignores its stop signal and its release uses `shutdown_timeout_action = "fail"`, deploy,
+recover, and retire stay blocked: the policy never force-kills, and killing it by hand on the server is forbidden.
+The escape hatch is explicit:
+
+```sh
+shiplord recover --force-stop --json   # only when the fail policy is blocking every operation
+```
+
+It sends `SIGKILL` to the process that outlived its deadline, removes it, removes the public route, and leaves the
+application stopped. The job result records what was killed under `forced_stop` (the overridden policy, `SIGKILL`,
+the stages, and the elapsed time). A plain `shiplord recover` keeps the `fail` policy and still waits. Deploy or
+retire afterwards to bring the application back; do not expect the forced stop to restart it.
 
 Secrets: set runtime environment with `shiplord env set --from-file <file>` (use `-` for stdin). Values are never
 printed or logged; do not put them in `ship.toml`, commits, or command-line arguments.

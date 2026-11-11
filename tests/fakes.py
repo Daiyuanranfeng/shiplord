@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from shiplord.probes import ProbeFailure
 from shiplord.registry import validate_registration
 from shiplord.routing import RoutingError
@@ -40,7 +42,17 @@ class FakeRuntime:
         self.pull_error = None
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
+        self.force_stop_error = None
         self.discarded: list[str] = []
+        self.data_root_path: Path | None = None
+        self.log_output = ""
+        self.log_arguments: dict | None = None
+        self.follow_chunks: list[str] = []
+        self.follow_stopped = "ended"
+        self.follow_arguments: dict | None = None
+        self.candidate_logs: dict[str, str] = {}  # container output per release, as `docker logs` would return it
+        self.log_errors: dict[str, Exception] = {}
+        self.release_log_calls: list[tuple] = []
 
     def pull(self, registration, release):
         self.calls.append(("pull", release_id(release)))
@@ -68,15 +80,49 @@ class FakeRuntime:
         self.calls.append(("stop",))
         self.running = set()
 
+    def force_stop(self, registration, state=None):
+        self.calls.append(("force_stop",))
+        if self.force_stop_error:
+            raise self.force_stop_error
+        self.stop_report = [{"timeout_seconds": 10, "action": "fail", "forced": True,
+                             "stages": ["stop_requested", "signalled", "waiting", "force_requested", "forced"],
+                             "elapsed_seconds": 0.2}]
+        self.running = set()
+
     def is_running(self, registration, release):
         return release_id(release) in self.running
 
-    def logs(self, registration, tail):
-        return ""
+    def logs(self, registration, release, tail, *, since=None, timestamps=False):
+        self.log_arguments = {"release": release, "tail": tail, "since": since, "timestamps": timestamps}
+        return self.log_output
+
+    def follow_logs(self, registration, release, *, tail, since=None, timestamps=False, duration=300, emit=lambda c: None):
+        self.follow_arguments = {"release": release, "tail": tail, "since": since, "timestamps": timestamps,
+                                 "duration": duration}
+        for chunk in self.follow_chunks:
+            emit(chunk)
+        return self.follow_stopped
+
+    def release_logs(self, registration, release, tail, *, max_bytes=None):
+        rid = release_id(release)
+        self.calls.append(("release_logs", rid))
+        self.release_log_calls.append((rid, tail, max_bytes))
+        if rid not in self.running:  # a candidate that never produced a container has nothing to read
+            return None
+        if rid in self.log_errors:
+            raise self.log_errors[rid]
+        return self.candidate_logs.get(rid, "")
 
     def discard(self, registration, release):
         self.discarded.append(release["artifact"]["image"])
         return []
+
+    def data_root(self, registration):
+        self.calls.append(("data_root",))
+        if self.data_root_path is None:
+            raise RuntimeFailure("this application has no data volume to back up; nothing was changed", "storage",
+                                 kind="no_data")
+        return self.data_root_path
 
     def names(self):
         return [c[0] for c in self.calls]

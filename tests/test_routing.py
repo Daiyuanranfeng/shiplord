@@ -10,13 +10,17 @@ from unittest.mock import patch
 
 from shiplord import routing
 from shiplord.release_state import HostLock
-from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, render_route
+from shiplord.routing import RouteManager, RoutingError, SubprocessCaddy, probe_caddy, render_route
+from shiplord.system import TRUNCATION_MARKER, CommandError, CommandResult
 
 
-def registration(app="orders", domain="orders.example.com", port=20000):
-    return {"schema_version": 1, "application_id": app, "deployment_uid": 1001, "deployment_user": "ship-orders",
-            "runtime": "docker", "api_domain": domain, "host_port": port,
-            "image_repository": f"ghcr.io/example/{app}", "max_memory_mb": 4096}
+def registration(app="orders", domain="orders.example.com", port=20000, hostnames=()):
+    value = {"schema_version": 1, "application_id": app, "deployment_uid": 1001, "deployment_user": "ship-orders",
+             "runtime": "docker", "api_domain": domain, "host_port": port,
+             "image_repository": f"ghcr.io/example/{app}", "max_memory_mb": 4096}
+    if hostnames:
+        value["hostnames"] = list(hostnames)
+    return value
 
 
 class FakeCaddy:
@@ -27,6 +31,7 @@ class FakeCaddy:
         self.validate_calls: list[dict] = []
         self.reload_calls = 0
         self.fail_validate: set[int] = set()
+        self.unavailable_validate: set[int] = set()
         self.fail_reload: set[int] = set()
         self.on_reload = None
 
@@ -35,6 +40,8 @@ class FakeCaddy:
         self.validate_calls.append({"config": config, "text": config.read_text(),
                                     "mode": stat.S_IMODE(config.stat().st_mode),
                                     "live": {p.name: p.read_bytes() for p in self.ship.glob("*.caddy")}})
+        if number in self.unavailable_validate:
+            raise RoutingError("could not start /usr/bin/caddy", "unavailable")
         if number in self.fail_validate:
             raise RoutingError("Caddy command failed", "validation", detail="bad config")
 
@@ -142,7 +149,8 @@ class ApplyTests(RoutingTestCase):
         before = self.snapshot()
         bad = [registration(domain="a.example.com {\n\tfile_server\n}\nb.example.com"),
                registration(domain="a.example.com }"), registration(domain="A.example.com"),
-               registration(port=2019), registration(port=22), dict(registration(), extra=1)]
+               registration(port=2019), registration(port=22), dict(registration(), extra=1),
+               dict(registration(), hostnames=["a.example.com {\n\tfile_server\n}\nb.example.com"])]
         with self.lock.acquire():
             for value in bad:
                 with self.subTest(value=str(value)[:60]), self.assertRaises(ValueError):
@@ -159,6 +167,39 @@ class ApplyTests(RoutingTestCase):
             render_route("bad domain", 20000)
         with self.assertRaises(RoutingError):
             render_route("orders.example.com", 2019)
+
+    def test_render_route_rejects_an_invalid_alias(self):
+        for hostnames in (["bad domain"], ["orders.example.com"], ["a.example.com", "a.example.com"],
+                          ["Orders.example.com"], ["127.0.0.1"], "legacy.example.com"):
+            with self.subTest(hostnames=hostnames), self.assertRaises(ValueError):
+                render_route("orders.example.com", 20000, hostnames)
+
+    def test_additional_hostnames_are_permanent_redirects_that_keep_the_uri(self):
+        self.assertEqual(render_route("orders.example.com", 20000,
+                                      ["legacy.example.com", "www.orders.example.com"]),
+                         b"orders.example.com {\n\treverse_proxy 127.0.0.1:20000\n}\n"
+                         b"\nlegacy.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n"
+                         b"\nwww.orders.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n")
+
+    def test_a_route_with_aliases_is_applied_and_reloads_once(self):
+        aliases = ["legacy.example.com", "www.orders.example.com"]
+        with self.lock.acquire():
+            result = self.manager.apply(registration(hostnames=aliases))
+        self.assertTrue(result.changed)
+        self.assertIn(b"\nlegacy.example.com {\n\tredir https://orders.example.com{uri} 308\n}\n",
+                      (self.ship / "orders.caddy").read_bytes())
+        self.assertEqual(self.caddy.reload_calls, 1)
+
+    def test_inspecting_a_route_reports_an_alias_change_as_different(self):
+        with self.lock.acquire():
+            self.manager.apply(registration())
+            self.assertEqual(self.manager.inspect_route(registration()), "identical")
+            self.assertEqual(self.manager.inspect_route(registration(hostnames=["legacy.example.com"])),
+                             "different")
+            self.manager.apply(registration(hostnames=["legacy.example.com"]))
+            self.assertEqual(self.manager.inspect_route(registration(hostnames=["legacy.example.com"])),
+                             "identical")
+            self.assertEqual(self.manager.inspect_route(registration()), "different")
 
     def test_a_route_change_leaves_a_0640_caddyfile_at_0640(self):
         (self.root / "Caddyfile").chmod(0o640)
@@ -215,6 +256,17 @@ class FailureTests(RoutingTestCase):
         with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "already invalid"):
             self.manager.apply(registration())
         self.assertEqual(self.caddy.reload_calls, 0)
+
+    def test_an_unavailable_caddy_is_not_blamed_on_the_route_or_the_existing_configuration(self):
+        self.caddy.unavailable_validate = {1, 2}  # candidate and baseline both cannot run Caddy
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertNotIn("already invalid", str(caught.exception))
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertNoTransactionLeftovers()
 
     def test_reload_failure_restores_the_previous_route_and_reconciles(self):
         with self.lock.acquire():
@@ -339,11 +391,11 @@ class RemoveAndReconcileTests(RoutingTestCase):
 
 
 class ConflictTests(RoutingTestCase):
-    def assertConflict(self, kind="conflict", **options):
+    def assertConflict(self, kind="conflict", hostnames=(), **options):
         before = self.snapshot()
         manager = RouteManager(self.root, self.lock, self.caddy, **options)
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
-            manager.apply(registration())
+            manager.apply(registration(hostnames=hostnames))
         self.assertEqual(caught.exception.kind, kind)
         self.assertEqual(self.caddy.validate_calls, [])
         self.assertEqual(self.caddy.reload_calls, 0)
@@ -352,15 +404,15 @@ class ConflictTests(RoutingTestCase):
     def main_with(self, text):
         self.write_main(self.MAIN + text + f"\nimport {self.root}/ship/*.caddy\n")
 
-    def assertApplies(self, text):
+    def assertApplies(self, text, hostnames=()):
         """The hostname is free: the route is installed, then removed for the next case."""
         self.main_with(text)
         with self.lock.acquire():
-            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.apply(registration(hostnames=hostnames)).changed)
             self.assertTrue(self.manager.remove("orders").changed)
 
-    def inspect(self, text):
-        return routing._Inspection("orders.example.com", f"{self.root}/ship/*.caddy", False).scan(text)
+    def inspect(self, text, hostnames=()):
+        return routing._Inspection(["orders.example.com", *hostnames], f"{self.root}/ship/*.caddy", False).scan(text)
 
     def test_hostname_forms_in_the_main_caddyfile_are_conflicts(self):
         forms = ["orders.example.com {\n}", "https://orders.example.com {\n}", "http://orders.example.com:8080 {\n}",
@@ -389,6 +441,37 @@ class ConflictTests(RoutingTestCase):
             with self.subTest(label):
                 self.assertApplies(text)
 
+    def test_an_alias_in_the_main_caddyfile_is_a_conflict(self):
+        for form in ("legacy.example.com {\n}", "https://legacy.example.com/x {\n}",
+                     "a.example.com, legacy.example.com {\n}", "LEGACY.example.com:443 {\n}"):
+            with self.subTest(form=form):
+                self.main_with(form)
+                self.assertConflict(hostnames=["legacy.example.com"])
+
+    def test_an_alias_in_another_managed_route_is_refused(self):
+        self.write_route("billing.caddy", "legacy.example.com {\n\treverse_proxy 127.0.0.1:20001\n}\n")
+        self.assertConflict(hostnames=["legacy.example.com"])
+
+    def test_a_redirect_target_is_not_treated_as_a_site_address(self):
+        # Another site redirecting to the alias is not another site serving it.
+        self.assertApplies("site.example.net {\n\tredir https://legacy.example.com{uri} 308\n}",
+                           hostnames=["legacy.example.com"])
+        self.assertEqual(self.inspect("legacy.example.net {\n\tredir https://www.orders.example.com{uri} 308\n}",
+                                      ["www.orders.example.com"]), [])
+
+    def test_a_wildcard_that_covers_an_alias_is_refused(self):
+        self.main_with("*.orders.example.com {\n}")
+        self.assertConflict(hostnames=["www.orders.example.com"])
+        with self.lock.acquire():
+            RouteManager(self.root, self.lock, self.caddy, allow_wildcard_overlap=True).apply(
+                registration(hostnames=["www.orders.example.com"]))
+        self.assertTrue((self.ship / "orders.caddy").exists())
+
+    def test_unrelated_wildcard_and_similar_hostnames_do_not_conflict_with_an_alias(self):
+        self.main_with("*.example.net {\n}\nlegacy.example.com.evil.test {\n}")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration(hostnames=["legacy.example.com"])).changed)
+
     def test_a_wildcard_inside_a_directive_value_does_not_overlap(self):
         self.assertApplies("site.example.net {\n\treverse_proxy https://*.example.com\n}")
 
@@ -413,9 +496,166 @@ class ConflictTests(RoutingTestCase):
             self.inspect("orders.example.com\n\nreverse_proxy 127.0.0.1:20000\n")
         self.assertEqual(caught.exception.kind, "conflict")
 
-    def test_a_quoted_placeholder_site_address_is_refused(self):
-        self.main_with('"{$SITE_ADDRESS}" {\n}')
+    def test_a_quoted_non_variable_placeholder_site_address_is_refused(self):
+        self.main_with('"{http.request.host}" {\n}')
         self.assertConflict("uninspectable")
+
+    def test_a_quoted_service_variable_address_is_compared(self):
+        # Caddy accepts a quoted address and the expansion is textual, so the quoted value is still the site.
+        self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
+        self.main_with('"{$SITE_ADDRESS}" {\n}')
+        self.assertConflict()
+
+    def test_a_service_variable_address_is_a_conflict(self):
+        self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
+        self.main_with("{$SITE_ADDRESS} {\n}")
+        self.assertConflict()
+
+    def test_a_service_variable_default_is_compared_when_the_variable_is_unset(self):
+        self.caddy.service_environment = lambda: {}
+        self.main_with("{$SITE_ADDRESS:orders.example.com} {\n}")
+        self.assertConflict()
+
+    def test_an_unresolved_service_variable_is_refused_and_names_it(self):
+        self.caddy.service_environment = lambda: {}
+        self.main_with("{$SITE_ADDRESS} {\n}")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("{$SITE_ADDRESS}", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_an_unreadable_service_environment_refuses_a_variable_address(self):
+        self.caddy.service_environment = lambda: None
+        self.main_with("{$SITE_ADDRESS} {\n}")
+        self.assertConflict("uninspectable")
+
+    def test_the_callers_environment_is_never_used_for_a_site_address(self):
+        self.caddy.service_environment = lambda: {}
+        self.main_with("{$SITE_ADDRESS} {\n}")
+        with patch.dict(os.environ, {"SITE_ADDRESS": "orders.example.com"}):
+            self.assertConflict("uninspectable")
+
+    def test_a_variable_that_cannot_be_one_address_is_refused_without_its_value(self):
+        for value in ("orders.example.com other.example.com", "", "orders.example.com{"):
+            with self.subTest(value=value):
+                self.caddy.service_environment = lambda value=value: {"SITE_ADDRESS": value}
+                self.main_with("{$SITE_ADDRESS} {\n}")
+                before = self.snapshot()
+                with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+                    self.manager.apply(registration())
+                self.assertEqual(caught.exception.kind, "uninspectable")
+                self.assertIn("{$SITE_ADDRESS}", str(caught.exception))
+                self.assertEqual(caught.exception.detail, "")
+                if value:
+                    self.assertNotIn(value, str(caught.exception))
+                    self.assertNotIn(value, caught.exception.detail)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_directive_only_snippet_imported_with_an_argument_is_skipped(self):
+        self.write_main(self.MAIN + "(common) {\n\tencode gzip\n}\nimport common 5s\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_snippet_that_declares_its_address_from_an_argument_is_a_conflict(self):
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_a_snippet_argument_for_another_hostname_still_applies(self):
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t\trespond \"legacy\"\n\t}\n}\n"
+                        "import sites legacy.example.net\n" + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_snippet_body_address_from_a_service_variable_is_a_conflict(self):
+        self.caddy.service_environment = lambda: {"SITE_ADDRESS": "orders.example.com"}
+        self.write_main(self.MAIN + "(sites) {\n\t{$SITE_ADDRESS} {\n\t}\n}\nimport sites\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
+
+    def test_a_snippet_argument_the_import_does_not_provide_is_refused_and_names_the_snippet(self):
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("the snippet sites", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_a_snippet_import_never_reads_an_argument_as_a_file_path(self):
+        # The old scan read "orders.example.com" as a path; the argument is the address the snippet declares.
+        (self.root / "orders.example.com").write_text("unrelated.example.net {\n}\n")
+        (self.root / "orders.example.com").chmod(0o644)
+        self.write_main(self.MAIN + "(sites) {\n\t{args[0]} {\n\t}\n}\nimport sites orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "conflict")
+
+    def test_a_file_import_substitutes_its_argument(self):
+        (self.root / "legacy.conf").write_text("{args[0]} {\n}\n")
+        (self.root / "legacy.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
+
+    def test_a_file_import_argument_for_another_hostname_still_applies(self):
+        (self.root / "legacy.conf").write_text("{args[0]} {\n\trespond \"legacy\"\n}\n")
+        (self.root / "legacy.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf legacy.example.net\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def test_a_file_import_argument_it_does_not_provide_is_refused_and_names_the_file(self):
+        (self.root / "legacy.conf").write_text("{args[1]} {\n}\n")
+        (self.root / "legacy.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/legacy.conf legacy.example.net\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("legacy.conf", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_an_unknown_name_with_arguments_is_refused_and_names_it(self):
+        self.write_main(self.MAIN + "import missing_snippet orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertIn("missing_snippet", str(caught.exception))
+
+    def test_a_snippet_defined_by_an_earlier_import_is_known(self):
+        (self.root / "defs.conf").write_text("(sites) {\n\t{args[0]} {\n\t}\n}\n")
+        (self.root / "defs.conf").chmod(0o644)
+        self.write_main(self.MAIN + f"import {self.root}/defs.conf\nimport sites orders.example.com\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        self.assertConflict()
+
+    def test_a_snippet_name_that_looks_like_a_path_is_not_followed(self):
+        (self.root / "common.conf").write_text("orders.example.com {\n}\n")
+        (self.root / "common.conf").chmod(0o644)
+        self.write_main(self.MAIN + "(common.conf) {\n\tencode gzip\n}\nimport common.conf\n"
+                        + f"import {self.root}/ship/*.caddy\n")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
 
     def test_internationalized_spellings_of_a_hostname_are_the_same_site(self):
         self.assertEqual(list(routing._addresses("bücher.example.org.")), ["xn--bcher-kva.example.org"])
@@ -487,6 +727,100 @@ class ConflictTests(RoutingTestCase):
             (many / f"{index}.conf").write_text(f"site{index}.example.net {{\n}}\n")
         self.write_main(self.MAIN + "import many/*.conf\n" + f"import {self.root}/ship/*.caddy\n")
         self.assertConflict("uninspectable")
+
+
+class ImportSymlinkTests(RoutingTestCase):
+    """An imported file may be a link; the target still has to pass every trust check."""
+
+    def import_line(self, name="enabled/*.conf"):
+        self.write_main(self.MAIN + f"import {self.root}/{name}\nimport {self.root}/ship/*.caddy\n")
+
+    def test_a_symlinked_sites_enabled_file_is_followed(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "legacy.conf"
+        target.write_text("orders.example.com {\n}\n")
+        target.chmod(0o644)
+        (enabled / "legacy.conf").symlink_to(target)
+        self.import_line("sites-enabled/*.conf")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "conflict")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_a_symlinked_sites_enabled_file_for_another_hostname_still_applies(self):
+        available, enabled = self.root / "sites-available", self.root / "sites-enabled"
+        available.mkdir()
+        enabled.mkdir()
+        target = available / "legacy.conf"
+        target.write_text("legacy.example.net {\n}\n")
+        target.chmod(0o644)
+        (enabled / "legacy.conf").symlink_to(target)
+        self.import_line("sites-enabled/*.conf")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.apply(registration()).changed)
+            self.assertTrue(self.manager.remove("orders").changed)
+
+    def assertImportRefused(self, target: Path):
+        enabled = self.root / "enabled"
+        enabled.mkdir()
+        (enabled / "legacy.conf").symlink_to(target)
+        self.import_line()
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.caddy.validate_calls, [])
+
+    def test_a_symlink_to_a_directory_is_refused(self):
+        directory = self.root / "target"
+        directory.mkdir()
+        self.assertImportRefused(directory)
+
+    def test_a_symlink_to_a_device_is_refused(self):
+        self.assertImportRefused(Path("/dev/null"))
+
+    def test_a_symlink_loop_is_refused(self):
+        first, second = self.root / "first.conf", self.root / "second.conf"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        self.assertImportRefused(first)
+
+    def test_a_symlink_to_an_oversized_target_is_refused(self):
+        target = self.root / "big.conf"
+        target.write_bytes(b"#" * (routing.MAX_CONFIG_BYTES + 1))
+        target.chmod(0o644)
+        self.assertImportRefused(target)
+
+    def test_a_symlink_to_a_writable_target_is_refused(self):
+        target = self.root / "writable.conf"
+        target.write_text("legacy.example.net {\n}\n")
+        target.chmod(0o666)
+        self.assertImportRefused(target)
+
+    def test_a_plain_import_that_is_writable_is_refused_too(self):
+        target = self.root / "enabled"
+        target.mkdir()
+        (target / "legacy.conf").write_text("legacy.example.net {\n}\n")
+        (target / "legacy.conf").chmod(0o664)
+        self.import_line()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.apply(registration())
+        self.assertEqual(caught.exception.kind, "uninspectable")
+
+    def test_a_symlink_to_another_accounts_file_is_refused(self):
+        target = self.root / "owned.conf"
+        target.write_text("legacy.example.net {\n}\n")
+        target.chmod(0o644)
+        with patch("shiplord.routing.os.geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(RoutingError) as caught:
+                routing._read_path(str(target))
+        self.assertEqual(caught.exception.kind, "uninspectable")
+        self.assertNotIn("legacy.example.net", str(caught.exception))
 
 
 class PreconditionTests(RoutingTestCase):
@@ -597,6 +931,15 @@ class EnsureImportTests(RoutingTestCase):
         self.assertEqual(caught.exception.kind, "validation")
         self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
 
+    def test_an_unavailable_caddy_is_not_reported_as_a_rejected_caddyfile(self):
+        self.caddy.unavailable_validate = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+
     def test_reload_failure_restores_the_caddyfile_and_reloads_again(self):
         self.caddy.fail_reload = {1}
         before = self.snapshot()
@@ -606,13 +949,201 @@ class EnsureImportTests(RoutingTestCase):
         self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 2))
         self.assertNoTransactionLeftovers()
 
-    def test_interrupted_change_and_missing_lock_are_refused(self):
+    def write_prior(self, text):
+        path = self.root / ".prior-Caddyfile"
+        path.write_text(text)
+        path.chmod(0o644)
+        return path
+
+    def test_an_unmatched_prior_and_a_missing_lock_are_refused(self):
         with self.assertRaisesRegex(RoutingError, "lock"):
             self.manager.ensure_import()
-        (self.root / ".prior-Caddyfile").write_text("old")
+        self.write_prior("old")
         with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
             self.manager.ensure_import()
         self.assertTrue(caught.exception.intervention_required)
+
+    def test_a_crash_before_the_publish_drops_the_prior_and_appends_the_import(self):
+        # Crash between the link and the replace: the live Caddyfile is still the prior, hard link intact.
+        os.link(self.root / "Caddyfile", self.root / ".prior-Caddyfile")
+        with self.lock.acquire():
+            self.assertTrue(self.manager.ensure_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN + self.line)
+        self.assertEqual(self.caddy.reload_calls, 1)
+        self.assertNoTransactionLeftovers()
+
+    def test_a_crash_after_the_publish_reports_the_import_as_present(self):
+        # Crash between the replace and the unlink: the live Caddyfile is the candidate, the prior the old file.
+        self.write_main(self.MAIN + self.line)
+        self.write_prior(self.MAIN)
+        with self.lock.acquire():
+            self.assertFalse(self.manager.ensure_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN + self.line)
+        self.assertEqual((self.caddy.validate_calls, self.caddy.reload_calls), ([], 0))
+        self.assertNoTransactionLeftovers()
+
+    def test_a_prior_that_cannot_be_proven_redundant_is_refused_with_the_recovery_step(self):
+        cases = {
+            "a different Caddyfile": lambda: self.write_prior("example.net {\n}\n"),
+            "a prior that imports the managed routes": lambda: self.write_prior(self.MAIN + self.line),
+            "a symbolic link": lambda: (self.root / ".prior-Caddyfile").symlink_to(self.root / "Caddyfile"),
+            "a directory": lambda: (self.root / ".prior-Caddyfile").mkdir(),
+            "a prior another account can write": lambda: self.write_prior(self.MAIN).chmod(0o666),
+        }
+        for name, leave in cases.items():
+            with self.subTest(name):
+                leave()
+                before = (self.root / "Caddyfile").read_bytes()
+                with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+                    self.manager.ensure_import()
+                error = caught.exception
+                self.assertEqual(error.kind, "interrupted")
+                self.assertTrue(error.intervention_required)
+                self.assertIn(".prior-Caddyfile", str(error))
+                self.assertIn("compare .prior-Caddyfile with the Caddyfile", str(error))
+                self.assertIn("remove .prior-Caddyfile", str(error))
+                self.assertEqual((self.root / "Caddyfile").read_bytes(), before)
+                self.assertTrue(os.path.lexists(self.root / ".prior-Caddyfile"))
+                self.assertEqual((self.caddy.validate_calls, self.caddy.reload_calls), ([], 0))
+                prior = self.root / ".prior-Caddyfile"
+                if prior.is_dir() and not prior.is_symlink():
+                    prior.rmdir()
+                else:
+                    prior.unlink()
+
+    def test_a_crash_after_the_publish_reconstructs_a_missing_final_newline(self):
+        self.write_main("example.org {\n}\n" + self.line)
+        self.write_prior("example.org {\n}")
+        with self.lock.acquire():
+            self.assertFalse(self.manager.ensure_import().changed)
+        self.assertNoTransactionLeftovers()
+
+    def test_an_identical_pair_that_already_imports_is_refused(self):
+        # The transaction only links a Caddyfile that lacks the import, so this pair was not produced by a crash.
+        self.write_main(self.MAIN + self.line)
+        self.write_prior(self.MAIN + self.line)
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+
+    def test_a_missing_caddyfile_beside_a_prior_is_refused(self):
+        self.write_prior(self.MAIN)
+        (self.root / "Caddyfile").unlink()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "interrupted")
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+        self.assertFalse((self.root / "Caddyfile").exists())
+        self.assertTrue((self.root / ".prior-Caddyfile").exists())
+
+    def test_an_untrusted_caddyfile_beside_a_prior_is_refused(self):
+        self.write_prior(self.MAIN)
+        (self.root / "Caddyfile").chmod(0o666)
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.ensure_import()
+        self.assertEqual(caught.exception.kind, "interrupted")
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertIn(".prior-Caddyfile", str(caught.exception))
+        self.assertTrue((self.root / ".prior-Caddyfile").exists())
+
+
+class RemoveImportTests(RoutingTestCase):
+    """Uninstall removes the managed import once, and only when it is the one Shiplord wrote."""
+
+    def setUp(self):
+        super().setUp()
+        self.line = f"import {self.root}/ship/*.caddy\n"
+
+    def test_removes_only_the_managed_import_and_reloads_once(self):
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+            self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual(self.caddy.reload_calls, 1)
+        self.assertNotIn(self.line, self.caddy.validate_calls[0]["text"])
+        self.assertIn("example.org", self.caddy.validate_calls[0]["text"])
+        self.assertNoTransactionLeftovers()
+        self.assertEqual(self.mode(self.root / "Caddyfile"), 0o644)
+
+    def test_a_caddyfile_without_the_import_is_left_untouched(self):
+        self.write_main(self.MAIN)
+        before = self.snapshot()
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls, self.caddy.validate_calls), (before, 0, []))
+
+    def test_rewriting_the_caddyfile_preserves_its_owner_and_mode(self):
+        path = self.root / "Caddyfile"
+        path.chmod(0o640)
+        before = path.stat()
+        with self.lock.acquire():
+            self.manager.remove_import()
+        after = path.stat()
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o640, before.st_uid, before.st_gid))
+
+    def test_duplicate_imports_missing_file_and_missing_lock_are_refused(self):
+        with self.assertRaisesRegex(RoutingError, "lock"):
+            self.manager.remove_import()
+        self.write_main(self.MAIN + self.line + self.line)
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "more than once"):
+            self.manager.remove_import()
+        self.assertEqual(self.snapshot(), before)
+        (self.root / "Caddyfile").unlink()
+        with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "missing"):
+            self.manager.remove_import()
+
+    def test_an_interrupted_change_is_refused_without_touching_anything(self):
+        (self.root / ".prior-Caddyfile").write_text("old")
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertTrue(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertEqual((self.root / ".prior-Caddyfile").read_text(), "old")
+        self.assertEqual([p.name for p in self.root.rglob(".tmp-*")], [])
+        self.assertEqual([p.name for p in self.root.rglob(".shiplord-validate-*")], [])
+
+    def test_a_redundant_prior_is_settled_and_the_import_is_removed(self):
+        self.write_main(self.MAIN + self.line)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertTrue(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertNoTransactionLeftovers()
+
+    def test_a_prior_from_a_change_that_never_published_is_settled_without_a_rewrite(self):
+        self.write_main(self.MAIN)
+        (self.root / ".prior-Caddyfile").write_text(self.MAIN)
+        (self.root / ".prior-Caddyfile").chmod(0o644)
+        with self.lock.acquire():
+            self.assertFalse(self.manager.remove_import().changed)
+        self.assertEqual((self.root / "Caddyfile").read_text(), self.MAIN)
+        self.assertFalse((self.root / ".prior-Caddyfile").exists())
+        self.assertEqual((self.caddy.reload_calls, self.caddy.validate_calls), (0, []))
+
+    def test_validation_failure_leaves_the_caddyfile_untouched(self):
+        self.caddy.fail_validate = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertEqual(caught.exception.kind, "validation")
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 0))
+        self.assertNoTransactionLeftovers()
+
+    def test_reload_failure_restores_the_caddyfile_and_reloads_again(self):
+        self.caddy.fail_reload = {1}
+        before = self.snapshot()
+        with self.lock.acquire(), self.assertRaises(RoutingError) as caught:
+            self.manager.remove_import()
+        self.assertFalse(caught.exception.intervention_required)
+        self.assertEqual((self.snapshot(), self.caddy.reload_calls), (before, 2))
+        self.assertNoTransactionLeftovers()
 
 
 class TokenizerTests(unittest.TestCase):
@@ -632,6 +1163,30 @@ class SubprocessCaddyTests(unittest.TestCase):
         path.write_text("#!/bin/sh\n" + textwrap.dedent(body))
         path.chmod(0o755)
         return str(path)
+
+    def test_the_caddy_binary_defaults_to_the_packaged_path(self):
+        self.assertEqual(routing.caddy_binary({}), "/usr/bin/caddy")
+        self.assertEqual(routing.caddy_binary({"SHIPLORD_CADDY_BINARY": ""}), "/usr/bin/caddy")
+
+    def test_an_absolute_caddy_binary_override_is_used(self):
+        self.assertEqual(routing.caddy_binary({"SHIPLORD_CADDY_BINARY": "/opt/caddy/caddy"}), "/opt/caddy/caddy")
+
+    def test_a_relative_or_empty_caddy_binary_override_is_ignored(self):
+        for value in ("bin/caddy", "./caddy", "", "/opt/caddy\0"):
+            with self.subTest(value=value):
+                self.assertEqual(routing.caddy_binary({"SHIPLORD_CADDY_BINARY": value}), "/usr/bin/caddy")
+
+    def test_subprocess_caddy_reads_the_override_from_its_own_environment(self):
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": "/opt/caddy/caddy"}):
+            self.assertEqual(SubprocessCaddy().caddy, "/opt/caddy/caddy")
+        self.assertEqual(SubprocessCaddy("/bin/true").caddy, "/bin/true")  # an explicit path still wins
+
+    def test_the_override_is_not_passed_to_the_caddy_child(self):
+        out = self.directory / "env"
+        caddy = self.script("caddy", f'env > {out}\n')
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": "/opt/caddy/caddy"}):
+            SubprocessCaddy(caddy).validate(Path("/x"))
+        self.assertNotIn("SHIPLORD_CADDY_BINARY", out.read_text())
 
     def test_validate_and_reload_run_fixed_argv_without_a_shell(self):
         log = self.directory / "log"
@@ -676,20 +1231,176 @@ class SubprocessCaddyTests(unittest.TestCase):
         marker = self.directory / "survived"
         caddy = self.script("caddy", f"sleep 5\ntouch {marker}\n")
         started = __import__("time").monotonic()
-        with self.assertRaisesRegex(RoutingError, "timed out"):
+        with self.assertRaisesRegex(RoutingError, "timed out") as caught:
             SubprocessCaddy(caddy, timeout=0.5).validate(Path("/x"))
+        self.assertEqual(caught.exception.kind, "validation")  # a slow Caddy is not an absent one
         self.assertLess(__import__("time").monotonic() - started, 4)
         self.assertFalse(marker.exists())
 
-    def test_missing_executable_is_a_routing_error(self):
-        with self.assertRaises(RoutingError):
-            SubprocessCaddy(str(self.directory / "absent")).validate(Path("/x"))
+    def test_missing_executable_is_unavailable_not_a_rejected_configuration(self):
+        absent = str(self.directory / "absent")
+        with self.assertRaises(RoutingError) as caught:
+            SubprocessCaddy(absent).validate(Path("/x"))
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn(absent, str(caught.exception))
+        self.assertNotIn("rejected", str(caught.exception))
 
     def test_reload_failure_has_reload_kind(self):
         systemctl = self.script("systemctl", "exit 1\n")
         with self.assertRaises(RoutingError) as caught:
             SubprocessCaddy("/bin/true", systemctl).reload()
         self.assertEqual(caught.exception.kind, "reload")
+
+    def test_validation_receives_the_environment_the_caddy_service_runs_with(self):
+        out = self.directory / "token"
+        caddy = self.script("caddy", f'printf "%s" "$CF_API_TOKEN" > {out}\n')
+        SubprocessCaddy(caddy, service_environment=lambda: {"CF_API_TOKEN": "fake-token-value"}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), "fake-token-value")
+
+    def test_the_throwaway_directories_override_ones_the_service_sets(self):
+        out = self.directory / "home"
+        caddy = self.script("caddy", f'printf "%s|%s|%s" "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" > {out}\n')
+        service = {"HOME": "/var/lib/caddy", "XDG_DATA_HOME": "/var/lib/caddy", "XDG_CONFIG_HOME": "/var/lib/caddy"}
+        SubprocessCaddy(caddy, service_environment=lambda: service).validate(Path("/x"))
+        home, data, config = out.read_text().split("|")
+        self.assertEqual((home, config), (data, data))
+        self.assertIn("shiplord-caddy-validate-", home)
+        self.assertFalse(Path(home).exists())  # removed afterwards, with anything Caddy wrote there
+
+    def test_a_service_variable_overrides_the_fixed_defaults(self):
+        out = self.directory / "lang"
+        caddy = self.script("caddy", f'printf "%s" "$LANG" > {out}\n')
+        SubprocessCaddy(caddy, service_environment=lambda: {"LANG": "C.UTF-8"}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), "C.UTF-8")
+
+    def test_an_unreadable_service_environment_keeps_the_fixed_environment(self):
+        out = self.directory / "env"
+        caddy = self.script("caddy", f'env > {out}\n')
+        os.environ["SHIPLORD_SECRET_TEST"] = "do-not-leak"
+        self.addCleanup(os.environ.pop, "SHIPLORD_SECRET_TEST", None)
+        SubprocessCaddy(caddy, service_environment=lambda: None).validate(Path("/x"))
+        names = {line.split("=", 1)[0] for line in out.read_text().splitlines()}
+        self.assertNotIn("SHIPLORD_SECRET_TEST", names)
+        self.assertEqual(names & {"PATH", "LANG", "HOME"}, {"PATH", "LANG", "HOME"})
+
+    def test_service_values_are_removed_from_captured_output_but_reach_the_child(self):
+        out = self.directory / "token"
+        token = "fake-token-value"
+        caddy = self.script("caddy", f'printf "%s" "$CF_API_TOKEN" > {out}\nprintf "failed for {token}\\n"\nexit 3\n')
+        with self.assertRaises(RoutingError) as caught:
+            SubprocessCaddy(caddy, service_environment=lambda: {"CF_API_TOKEN": token}).validate(Path("/x"))
+        self.assertEqual(out.read_text(), token)  # the value is what validation is for
+        self.assertNotIn(token, caught.exception.detail)
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIn("[shiplord:redacted]", caught.exception.detail)
+
+
+class FakeSystem:
+    """Answers the systemd probe with scripted output, and records the command it was asked to run."""
+
+    def __init__(self, output="", code=0, error=None):
+        self.output, self.code, self.error = output, code, error
+        self.calls = []
+
+    def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if self.error is not None:
+            raise self.error
+        return CommandResult(self.code, self.output)
+
+
+class ServiceEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+
+    def test_the_unit_probe_asks_for_the_two_documented_properties(self):
+        system = FakeSystem()
+        routing.service_environment(system, ())
+        self.assertEqual(system.calls, [["/usr/bin/systemctl", "show", "caddy",
+                                         "--property=Environment", "--property=EnvironmentFiles"]])
+
+    def test_environment_words_honour_quotes_and_escapes(self):
+        self.assertEqual(routing.parse_environment_list(r'A=1 B="two words" C=three\ four D="line\nbreak"'),
+                         {"A": "1", "B": "two words", "C": "three four", "D": "line\nbreak"})
+        self.assertEqual(routing.parse_environment_list(""), {})
+
+    def test_environment_files_drop_comments_and_malformed_lines(self):
+        text = ('# comment\n; also a comment\nA=1\nB="two words"\nC=\'literal $x\'\nexport D=4\n'
+                'E="unterminated\nF=has space\nG=\n')
+        self.assertEqual(routing.parse_environment_file(text),
+                         {"A": "1", "B": "two words", "C": "literal $x", "F": "has space", "G": ""})
+
+    def test_the_unit_environment_and_its_environment_files_are_applied(self):
+        env_file = self.directory / "caddy.env"
+        env_file.write_text("FROM_FILE=yes\n")
+        for property in ("EnvironmentFiles", "EnvironmentFile"):  # the singular is what older systemctl printed
+            with self.subTest(property):
+                system = FakeSystem(f"Environment=FROM_UNIT=1\n{property}={env_file} (ignore_errors=no)\n")
+                self.assertEqual(routing.service_environment(system, ()), {"FROM_UNIT": "1", "FROM_FILE": "yes"})
+
+    def test_a_relative_environment_file_is_ignored(self):
+        system = FakeSystem("EnvironmentFiles=caddy.env (ignore_errors=no)\n")
+        self.assertEqual(routing.service_environment(system, ()), {})
+
+    def test_a_failed_or_truncated_systemd_answer_falls_back_to_the_packaged_defaults(self):
+        defaults = self.directory / "default-caddy"
+        defaults.write_text("PACKAGED=yes\n")
+        for label, system in {
+            "non-zero exit": FakeSystem("Environment=PARTIAL=1\n", code=1),
+            "truncated": FakeSystem(TRUNCATION_MARKER + "Environment=PARTIAL=1\n"),
+            "cannot run": FakeSystem(error=CommandError("could not start the command", "start")),
+        }.items():
+            with self.subTest(label):
+                self.assertEqual(routing.service_environment(system, (defaults,)), {"PACKAGED": "yes"})
+
+    def test_no_readable_source_yields_no_variables(self):
+        self.assertEqual(routing.service_environment(FakeSystem("", code=1), (self.directory / "absent",)), {})
+
+    def test_a_source_that_is_not_a_regular_file_is_ignored(self):
+        self.assertEqual(routing.service_environment(FakeSystem(), (self.directory,)), {})
+
+    def test_the_process_environment_is_never_read(self):
+        os.environ["SHIPLORD_SECRET_TEST"] = "do-not-leak"
+        self.addCleanup(os.environ.pop, "SHIPLORD_SECRET_TEST", None)
+        self.assertEqual(routing.service_environment(FakeSystem("Environment=\nEnvironmentFiles=\n"), ()), {})
+
+
+class ProbeTests(unittest.TestCase):
+    def test_the_probe_validates_a_fixed_minimal_configuration(self):
+        seen = {}
+
+        class Recorder:
+            def validate(self, config):
+                seen["path"], seen["text"] = config, config.read_text()
+
+            def reload(self):
+                raise AssertionError("the probe must not reload")
+
+        probe_caddy(Recorder())
+        self.assertEqual(seen["text"], routing.CADDY_PROBE.decode())
+        self.assertFalse(seen["path"].exists())  # the throwaway file is removed, never left on the host
+
+    def test_the_probe_reports_an_absent_binary_as_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            absent = str(Path(directory) / "absent")
+            with self.assertRaises(RoutingError) as caught:
+                probe_caddy(SubprocessCaddy(absent))
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn(absent, str(caught.exception))
+
+    def test_the_probe_propagates_any_other_refusal(self):
+        class Broken:
+            def validate(self, config):
+                raise RoutingError("Caddy command failed", "validation", detail="bad config")
+
+            def reload(self):
+                raise AssertionError("the probe must not reload")
+
+        with self.assertRaises(RoutingError) as caught:
+            probe_caddy(Broken())
+        self.assertEqual(caught.exception.kind, "validation")
 
 
 if __name__ == "__main__":

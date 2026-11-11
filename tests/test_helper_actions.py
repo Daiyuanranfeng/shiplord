@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import signal
 import sys
@@ -16,8 +17,9 @@ from fakes import FakeCaddy, FakeProbes, FakeRuntime, configuration, record, req
 from shiplord.admin import run as admin_run  # noqa: E402
 from shiplord.host import HostDeadline  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
-from shiplord.jobs import JobError  # noqa: E402
+from shiplord.jobs import JobError, JobStore  # noqa: E402
 from shiplord.layout import Layout  # noqa: E402
+from shiplord.probes import ProbeFailure  # noqa: E402
 from shiplord.privileged_host import dispatch, job_view, serve  # noqa: E402
 from shiplord.protocol import PROTOCOL_VERSION, ProtocolError  # noqa: E402
 from shiplord.registry import Registry  # noqa: E402
@@ -113,19 +115,26 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover", "backup", "restore", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1", "runtime_knobs_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
-        bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}) if False else ("logs", {"tail": 0}),
-               ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}), ("deploy", {}),
-               ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}), ("rollback", {"x": 1}),
-               ("recover", {"x": 1})]
+        bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}), ("status", {"job_id": 5}),
+               ("logs", {"tail": 0}), ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}),
+               ("deploy", {}), ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}),
+               ("rollback", {"x": 1}), ("restart", {"x": 1}), ("recover", {"x": 1}),
+               ("recover", {"force_stop": "yes"}), ("recover", {"force_stop": 1}), ("backup", {"x": 1}),
+               ("restore", {}), ("restore", {"archive": "../escape.tar.gz"}),
+               ("restore", {"archive": "a.tar.gz", "latest": True}), ("restore", {"latest": "yes"})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
         with self.assertRaises(ProtocolError):
             self.call("rollback", commit="a" * 40)
+        with self.assertRaises(ProtocolError):
+            self.call("restart", commit="a" * 40)
+        with self.assertRaises(ProtocolError):
+            self.call("backup", commit="a" * 40)
         with self.assertRaises(ProtocolError):
             self.call("deploy", commit="a" * 40, sequence=1, artifact={}, configuration={}, allow_older="yes")
         self.assertEqual(self.factory_calls, 0)
@@ -139,10 +148,70 @@ class ReadOnlyActionTests(HelperTestCase):
         with self.assertRaises(Exception):
             self.call("status", job_id="../etc/passwd")
 
-    def test_logs_return_the_runtime_output(self):
-        self.runtime.logs = lambda registration, tail: f"tail={tail}\n"
-        self.assertEqual(self.call("logs", tail=7)[0]["result"], {"logs": "tail=7\n"})
-        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=100\n"})
+    def test_logs_return_the_runtime_output_with_the_requested_options(self):
+        self.runtime.log_output = "tail=7\n"
+        self.assertEqual(self.call("logs", tail=7, since="15m", timestamps=True)[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 7, "since": "15m", "timestamps": True})
+        self.assertEqual(self.call("logs")[0]["result"], {"logs": "tail=7\n"})
+        self.assertEqual(self.runtime.log_arguments,
+                         {"release": None, "tail": 100, "since": None, "timestamps": False})
+
+    def test_logs_read_the_release_that_is_current(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.call("logs", tail=5)
+        self.assertEqual(self.runtime.log_arguments["release"], self.state.read_state()["current"])
+
+    def test_logs_never_take_the_host_lock(self):
+        output = io.BytesIO()
+        self.runtime.follow_chunks = ["line\n"]
+        with patch.object(HostLock, "acquire", side_effect=AssertionError("logs must not lock the host")):
+            self.assertEqual(self.call("logs")[0]["result"], {"logs": ""})
+            response, code = dispatch(self.envelope("logs", follow=True, timeout=5), self.registration, self.factory,
+                                      destination=output)
+        self.assertEqual((response, code), (None, 0))
+        self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["status"], "stream")
+
+    def test_follow_streams_frames_and_a_final_result(self):
+        self.runtime.follow_chunks, self.runtime.follow_stopped = ["one\n", "two\n"], "timeout"
+        output = io.BytesIO()
+        response, code = dispatch(self.envelope("logs", tail=5, follow=True, timeout=30), self.registration,
+                                  self.factory, destination=output)
+        self.assertEqual((response, code), (None, 0))
+        stream = io.BytesIO(output.getvalue())
+        frames = [read_frame(stream), read_frame(stream), read_frame(stream)]
+        self.assertEqual(frames[0], {"status": "stream", "request_id": "req-1", "chunk": "one\n"})
+        self.assertEqual(frames[1]["chunk"], "two\n")
+        self.assertEqual(frames[2], {"status": "ok", "request_id": "req-1",
+                                     "result": {"stopped": "timeout", "release": None}})
+        self.assertEqual(stream.read(1), b"")  # nothing follows the final frame
+        self.assertEqual(self.runtime.follow_arguments,
+                         {"release": None, "tail": 5, "since": None, "timestamps": False, "duration": 30})
+
+    def test_a_follow_request_needs_a_destination_stream(self):
+        with self.assertRaises(ProtocolError):
+            self.call("logs", follow=True)
+        self.assertEqual(self.factory_calls, 0)
+
+    def test_log_options_are_validated_before_any_host_state_is_opened(self):
+        bad = [{"since": "1d"}, {"since": 5}, {"timestamps": "yes"}, {"follow": "yes"},
+               {"follow": True, "timeout": 0}, {"timeout": 3601}, {"timeout": "60"}, {"unexpected": 1}]
+        for arguments in bad:
+            with self.subTest(arguments=arguments), self.assertRaises(ProtocolError):
+                self.call("logs", **arguments)
+        self.assertEqual(self.factory_calls, 0)
+
+
+    def test_status_job_lookup_is_scoped_to_the_application(self):
+        billing = self.layout.jobs / "billing"
+        billing.mkdir(mode=0o700)
+        descriptor = os.open(billing, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            JobStore("billing", descriptor).create("billing-1", "deploy", request())
+        finally:
+            os.close(descriptor)
+        self.assertIsNone(self.call("status", job_id="billing-1")[0]["result"]["job"])
 
     def test_plan_describes_the_change_and_changes_nothing(self):
         commit, arguments = self.deploy_arguments()
@@ -251,6 +320,65 @@ class DeployJobTests(HelperTestCase):
             self.assertEqual((code, response["job"]["action"]), (0, action))
         self.assertEqual([r for _, r in self.launcher.launched], ["rollback-1", "recover-1"])
 
+    def test_backup_and_restore_become_jobs_and_run_through_the_worker(self):
+        data = self.layout.data / "orders"
+        data.mkdir(parents=True)
+        (data / "state.db").write_bytes(b"sqlite")
+        self.runtime.data_root_path = data
+        response, code = self.call("backup", "backup-1")
+        self.assertEqual((code, response["job"]["action"]), (0, "backup"))
+        self.assertEqual(run_job(self.services, "orders", "backup-1"), 0)
+        backup = self.call("status", job_id="backup-1")[0]["result"]["job"]
+        self.assertEqual((backup["outcome"]["status"], backup["outcome"]["detail"]["verified"]), ("succeeded", True))
+        name = backup["outcome"]["detail"]["archive"]
+        (data / "state.db").write_bytes(b"changed")
+        response, code = self.call("restore", "restore-1", archive=name)
+        self.assertEqual((code, response["job"]["action"]), (0, "restore"))
+        self.assertEqual(run_job(self.services, "orders", "restore-1"), 0)
+        restored = self.call("status", job_id="restore-1")[0]["result"]["job"]
+        self.assertEqual(restored["outcome"]["status"], "succeeded")
+        self.assertEqual((data / "state.db").read_bytes(), b"sqlite")
+
+
+class RestartJobTests(HelperTestCase):
+    """`restart` is submitted, refused, and recorded like the other state-changing actions."""
+
+    def deploy_a_release(self):
+        with AppSession(self.services, "orders") as session:
+            with session.lock.acquire():
+                self.assertEqual(session.deployer().deploy(request(request_id="seed")).status, "succeeded")
+        self.runtime.calls.clear()
+
+    def test_a_restart_becomes_a_job_and_a_repeated_request_id_launches_nothing_new(self):
+        self.deploy_a_release()
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["job"]["action"], response["job"]["state"]),
+                         (0, "accepted", "restart", "queued"))
+        self.assertEqual(self.launcher.launched, [("orders", "restart-1")])
+        again, code = self.call("restart", "restart-1")
+        self.assertEqual((code, again["status"], again["job"]["state"]), (0, "accepted", "queued"))
+        self.assertEqual(len(self.launcher.launched), 1)  # idempotent by request ID
+
+    def test_a_restart_with_nothing_deployed_is_refused_before_a_job_exists(self):
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["outcome"]["status"],
+                          response["outcome"]["detail"]["error"]), (2, "finished", "rejected", "nothing_deployed"))
+        self.assertIn("nothing to restart", response["outcome"]["detail"]["message"])
+        self.assertEqual(self.launcher.launched, [])
+        self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_a_restart_while_a_journal_exists_requires_recovery_before_any_host_work(self):
+        self.deploy_a_release()
+        with AppSession(self.services, "orders") as session:
+            with session.lock.acquire():
+                session.state.begin("interrupted", record(commit="c", image="d", sequence=1001))
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["outcome"]["detail"]["error"]),
+                         (1, "finished", "recovery_required"))
+        self.assertEqual(self.launcher.launched, [])
+        self.assertEqual(self.runtime.calls, [])
+
 
 class WorkerTests(HelperTestCase):
     def finished(self, request_id="req-1"):
@@ -319,6 +447,63 @@ class WorkerTests(HelperTestCase):
         self.call("rollback", "rb-1")
         self.assertEqual(run_job(self.services, "orders", "rb-1"), 0)
         self.assertEqual(seen, [(release_id(record()), "free")])  # the previous committed release, unlocked
+
+    def test_a_restart_pulls_the_committed_release_before_the_lock(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        seen = []
+        self.runtime.pull = lambda registration, release: seen.append((release_id(release), self.lock_state()))
+        self.call("restart", "rs-1")
+        self.assertEqual(run_job(self.services, "orders", "rs-1"), 0)
+        self.assertEqual(seen, [(release_id(record()), "free")])  # the committed release, unlocked
+
+    def test_a_restart_job_restarts_the_committed_release_instead_of_recovering(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.submit_deploy("req-2", commit="c", image="d", sequence=1001)
+        run_job(self.services, "orders", "req-2")
+        before = self.state.read_state()
+        self.runtime.calls.clear()
+        self.call("restart", "rs-1")
+        self.assertEqual(run_job(self.services, "orders", "rs-1"), 0)
+        job = self.finished("rs-1")
+        self.assertEqual((job["action"], job["outcome"]["status"], job["outcome"]["exit_code"]),
+                         ("restart", "succeeded", 0))
+        self.assertEqual(self.runtime.names(), ["pull", "prepare", "start"])  # not a recover, which starts nothing
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"], committed["previous"]), (before["current"], before["previous"]))
+        self.assertEqual(self.runtime.running, {release_id(before["current"])})
+
+    def test_a_failed_restart_keeps_the_journal_and_never_claims_a_rollback(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.probes.not_ready[release_id(record())] = ProbeFailure("the application exited", "exited")
+        self.call("restart", "rs-1")
+        self.assertEqual(run_job(self.services, "orders", "rs-1"), 6)
+        outcome = self.finished("rs-1")["outcome"]
+        self.assertEqual((outcome["status"], outcome["exit_code"]), ("intervention_required", 6))
+        self.assertEqual(outcome["detail"]["error"], "restart_failed")
+        self.assertNotIn("restored_release", outcome["detail"])
+        self.assertIn("shiplord recover", outcome["detail"]["recovery"])
+        self.assertIsNotNone(self.state.read_journal())  # retained: only a verified recovery may clear it
+        self.assertEqual(self.state.read_state()["current"], record())  # the recorded release never moved
+
+    def test_an_interrupted_restart_keeps_the_journal_and_recovers_to_the_committed_release(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        original = self.runtime.start
+        self.runtime.start = lambda registration, release: (_ for _ in ()).throw(RuntimeError("killed"))
+        self.call("restart", "rs-1")
+        self.assertEqual(run_job(self.services, "orders", "rs-1"), 6)  # a half-done transaction, not a success
+        self.assertIsNotNone(self.state.read_journal())
+        self.runtime.start = original
+        self.call("recover", "rc-1")
+        self.assertEqual(run_job(self.services, "orders", "rc-1"), 0)
+        self.assertEqual(self.finished("rc-1")["outcome"]["status"], "recovered")
+        self.assertIsNone(self.state.read_journal())
+        committed = self.state.read_state()
+        self.assertEqual((committed["current"], committed["previous"]), (record(), None))
+        self.assertEqual(self.runtime.running, {release_id(record())})
 
     def test_a_request_that_became_stale_pulls_nothing(self):
         self.submit_deploy("req-1", sequence=1001)  # queued while it was still the newest release
@@ -442,6 +627,32 @@ class WorkerTests(HelperTestCase):
         self.call("recover", "rc-1")
         self.assertEqual(run_job(self.services, "orders", "rc-1"), 0)
         self.assertEqual(self.finished("rc-1")["outcome"]["status"], "nothing_to_recover")
+
+    def test_a_forced_stop_is_carried_into_the_job_and_its_outcome(self):
+        response, code = self.call("recover", "rc-force", force_stop=True)
+        self.assertEqual((code, response["job"]["action"]), (0, "recover"))
+        stored = json.loads((self.layout.jobs / "orders" / "rc-force.json").read_text())
+        self.assertEqual(stored["request"], {"force_stop": True})
+        self.assertEqual(run_job(self.services, "orders", "rc-force"), 0)
+        outcome = self.finished("rc-force")["outcome"]
+        self.assertEqual((outcome["status"], outcome["exit_code"]), ("recovered", 0))
+        self.assertTrue(outcome["detail"]["forced_stop"]["forced"])
+        self.assertFalse(outcome["detail"]["running"])
+
+    def test_a_plain_recovery_job_carries_no_force_stop(self):
+        self.call("recover", "rc-plain")
+        stored = json.loads((self.layout.jobs / "orders" / "rc-plain.json").read_text())
+        self.assertEqual(stored["request"], {})
+
+
+class NativeRecoverTests(HelperTestCase):
+    RUNTIME = "native"
+
+    def test_a_forced_stop_is_refused_for_a_native_application_before_a_job_exists(self):
+        response, code = self.call("recover", "rc-native", force_stop=True)
+        self.assertEqual((code, response["error"]), (2, "invalid_request"))
+        self.assertEqual(self.launcher.launched, [])
+        self.assertFalse((self.layout.jobs / "orders" / "rc-native.json").exists())
 
 
 class ServeTests(HelperTestCase):

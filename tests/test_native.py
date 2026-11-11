@@ -144,6 +144,7 @@ class RenderingTests(unittest.TestCase):
 class FakeSystem:
     def __init__(self):
         self.calls, self.results, self.errors = [], {}, {}
+        self.stream_calls, self.stream_chunks, self.stream_reason = [], ["one\n"], "timeout"
 
     def run(self, argv, *, input=None, timeout=60, max_output=4096):
         self.calls.append(list(argv))
@@ -151,6 +152,12 @@ class FakeSystem:
         if key in self.errors:
             raise self.errors[key]
         return self.results.get(key, CommandResult(0, ""))
+
+    def stream(self, argv, *, timeout, on_chunk):
+        self.stream_calls.append((list(argv), timeout))
+        for chunk in self.stream_chunks:
+            on_chunk(chunk)
+        return self.stream_reason
 
     def systemctl(self):
         return [call[1:] for call in self.calls if call[0] == SYSTEMCTL]
@@ -311,10 +318,13 @@ class InspectTests(RuntimeTestCase):
     def state(self, active, sub):
         self.system.results["show"] = CommandResult(0, f"ActiveState={active}\nSubState={sub}\n")
 
-    def test_running_means_this_release_is_active_and_not_restarting(self):
+    def running(self):
         self.install()
         self.runtime.start(REGISTRATION, self.release)
         self.state("active", "running")
+
+    def test_running_means_this_release_is_active_and_not_restarting(self):
+        self.running()
         self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
         for active, sub in (("activating", "auto-restart"), ("failed", "failed"), ("inactive", "dead"), ("active", "exited")):
             self.state(active, sub)
@@ -323,19 +333,113 @@ class InspectTests(RuntimeTestCase):
         other = release(self.binary, sequence=2000)
         self.assertFalse(self.runtime.is_running(REGISTRATION, other))  # another release's unit is not "running"
 
+    def test_the_unit_must_match_the_committed_memory_limit(self):
+        self.running()
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(self.binary, memory=512)))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(self.binary, memory=256)))
+
+    def test_the_unit_must_match_the_committed_socket_bind(self):
+        self.running()
+        moved = dict(REGISTRATION, host_port=20008)
+        self.assertFalse(self.runtime.is_running(moved, self.release))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_the_environment_must_match_the_committed_origins(self):
+        self.running()
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release(self.binary, origins=["https://new.example"])))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release(self.binary)))
+
+    def test_a_unit_that_keeps_the_release_marker_but_not_the_configuration_is_not_running(self):
+        self.running()
+        unit = self.runtime.unit_path(REGISTRATION)
+        unit.write_text(unit.read_text().replace("MemoryMax=256M", "MemoryMax=512M"))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_an_environment_file_that_keeps_the_release_but_not_the_configuration_is_not_running(self):
+        self.running()
+        environment = self.layout.environments / "orders" / "native.env"
+        environment.write_text(environment.read_text().replace('ALLOW_ORIGINS="[]"',
+                                                               'ALLOW_ORIGINS="[\\"https://old.example\\"]"'))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_a_changed_custom_environment_value_is_not_running(self):
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("CUSTOM_TOKEN=placeholder\n")
+        path.chmod(0o600)
+        self.running()
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        path.write_text("CUSTOM_TOKEN=old\n")
+        self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
+
+    def test_an_unusable_environment_file_is_not_a_mismatch_by_itself(self):
+        """A start would fail on the same file, so a restart cannot fix it; the unit still decides."""
+        self.running()
+        path = self.layout.environments / "orders" / "app.env"
+        path.write_text("PORT=1\n")  # a managed key: the parser refuses it
+        path.chmod(0o600)
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        path.write_text("OK=1\n")
+        path.chmod(0o644)  # not private to the installing account
+        self.assertTrue(self.runtime.is_running(REGISTRATION, self.release))
+        # The record-derived unit is still compared, so a candidate that replaced it is caught.
+        changed = {**self.release, "configuration": {**self.release["configuration"],
+                                                    "resources": {"memory_mb": 512}}}
+        self.assertFalse(self.runtime.is_running(REGISTRATION, changed))
+
     def test_no_unit_means_not_running_without_calling_systemctl(self):
         self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
         self.assertEqual(self.system.calls, [])
 
     def test_logs_come_from_the_journal_bounded_and_empty_on_failure(self):
+        self.install()
+        self.runtime.start(REGISTRATION, self.release)
+        self.system.calls.clear()
         self.system.results[JOURNALCTL] = CommandResult(0, "line\n")
-        self.assertEqual(self.runtime.logs(REGISTRATION, 10**9), "line\n")
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.release, 10**9), "line\n")
         self.assertEqual(self.system.calls[0], [JOURNALCTL, "--unit", "shiplord-orders.service", "--lines", "1000",
                                                "--no-pager", "--output", "cat"])
         self.system.results[JOURNALCTL] = CommandResult(1, "no journal")
-        self.assertEqual(self.runtime.logs(REGISTRATION, 5), "")
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.release, 5), "")
         self.system.errors[JOURNALCTL] = CommandError("x", "start")
-        self.assertEqual(self.runtime.logs(REGISTRATION, 5), "")
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.release, 5), "")
+
+    def test_logs_pass_since_and_timestamps_to_journalctl(self):
+        self.install()
+        self.runtime.start(REGISTRATION, self.release)
+        self.system.calls.clear()
+        self.system.results[JOURNALCTL] = CommandResult(0, "line\n")
+        self.runtime.logs(REGISTRATION, self.release, 25, since="15m", timestamps=True)
+        self.assertEqual(self.system.calls[0], [JOURNALCTL, "--unit", "shiplord-orders.service", "--lines", "25",
+                                               "--since=-15m", "--no-pager", "--output", "short-iso-precise"])
+
+    def test_follow_streams_the_current_releases_journal_for_a_bounded_time(self):
+        self.install()
+        self.runtime.start(REGISTRATION, self.release)
+        self.system.calls.clear()
+        received = []
+        reason = self.runtime.follow_logs(REGISTRATION, self.release, tail=20, since="2h", duration=90,
+                                          emit=received.append)
+        self.assertEqual((reason, received), ("timeout", ["one\n"]))
+        argv, timeout = self.system.stream_calls[0]
+        self.assertEqual(timeout, 90)
+        self.assertEqual(argv, [JOURNALCTL, "--unit", "shiplord-orders.service", "--lines", "20", "--follow",
+                                "--since=-2h", "--no-pager", "--output", "cat"])
+        self.assertEqual(self.system.calls, [])  # following never runs a second command
+
+    def test_a_unit_left_by_another_release_is_never_read(self):
+        self.install()
+        self.runtime.start(REGISTRATION, self.release)
+        self.system.calls.clear()
+        other = release(self.binary, sequence=2000)
+        self.assertEqual(self.runtime.logs(REGISTRATION, other, 20), "")
+        self.assertEqual(self.runtime.follow_logs(REGISTRATION, other, tail=20), "unavailable")
+        self.assertEqual((self.system.calls, self.system.stream_calls), ([], []))
+
+    def test_no_unit_or_no_release_means_there_is_nothing_to_read(self):
+        self.assertEqual(self.runtime.logs(REGISTRATION, self.release, 20), "")
+        self.assertEqual(self.runtime.logs(REGISTRATION, None, 20), "")
+        self.assertEqual(self.runtime.follow_logs(REGISTRATION, None, tail=20), "unavailable")
+        self.assertEqual((self.system.calls, self.system.stream_calls), ([], []))
 
 
 class ScriptSystem:
@@ -360,9 +464,13 @@ class LogTruncationTests(unittest.TestCase):
         script.write_text('#!/bin/sh\nhead -c 300000 /dev/zero | tr "\\0" x; printf "the failure\\n"\n')
         script.chmod(0o755)
         self.runtime = NativeRuntime(ScriptSystem(str(script)), Layout(self.directory.resolve()))
+        self.release = release(elf())
+        unit = self.runtime.unit_path(REGISTRATION)
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(f"# shiplord-release: {release_id(self.release)}\n[Service]\n")
 
     def test_the_newest_journal_lines_survive_the_log_cap(self):
-        logs = self.runtime.logs(REGISTRATION, 50)
+        logs = self.runtime.logs(REGISTRATION, self.release, 50)
         self.assertLessEqual(len(logs), MAX_LOG_BYTES)
         self.assertTrue(logs.endswith("the failure\n"))
 
@@ -389,6 +497,27 @@ class DiscardTests(RuntimeTestCase):
         target.symlink_to(elsewhere)
         self.assertEqual(len(self.runtime.discard(REGISTRATION, self.release)), 1)
         self.assertTrue((elsewhere / "precious").exists())
+
+
+class DataRootTests(RuntimeTestCase):
+    def test_the_data_directory_is_returned_when_it_exists(self):
+        data = self.layout.data / "orders"
+        data.mkdir(parents=True)
+        self.assertEqual(self.runtime.data_root(REGISTRATION), data)
+
+    def test_a_missing_data_directory_is_refused_as_no_data(self):
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.data_root(REGISTRATION)
+        self.assertEqual((caught.exception.phase, caught.exception.kind), ("storage", "no_data"))
+
+    def test_a_symlinked_data_directory_is_refused(self):
+        elsewhere = Path(self.temp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (self.layout.data).mkdir(parents=True)
+        (self.layout.data / "orders").symlink_to(elsewhere)
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime.data_root(REGISTRATION)
+        self.assertEqual(caught.exception.kind, "no_data")
 
 
 if __name__ == "__main__":

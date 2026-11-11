@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
@@ -9,16 +10,19 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from typer.testing import CliRunner
 
-from shiplord import cli
-from shiplord.client import ClientError
+from shiplord import cli, tailscale
+from shiplord.client import AdminClient, ClientError, HelperClient
 from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
+from shiplord.framing import read_frame, write_frame
 from shiplord.manifest import ManifestError, load_manifest
+from shiplord.transport import TransportError
 from shiplord.workflow import DEPLOY_WORKFLOW_PATH, PINS, WORKFLOW_PATH, render_deploy_workflow, render_workflow
 
 MANIFEST = '''schema_version = 1
@@ -61,11 +65,46 @@ class ManifestTests(unittest.TestCase):
         result = self.load(MANIFEST.replace('["https://orders.example.com"]', '[]'))
         self.assertEqual(result["http"]["frontend_origins"], [])
 
+    def test_the_deployment_branch_defaults_to_main(self):
+        result = self.load(MANIFEST.replace('\ndeployment_branch = "main"', ""))
+        self.assertEqual(result["github"]["deployment_branch"], "main")
+
+    def test_deployment_branch_names_are_validated(self):
+        for branch in ("main", "trunk", "release/prod", "release/2026.01"):
+            with self.subTest(branch=branch):
+                result = self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+                self.assertEqual(result["github"]["deployment_branch"], branch)
+        for branch in ("", " main", "main ", ".main", "-main", "main/", "main.", "main.lock", "a..b", "a//b", "a@{b", "a b"):
+            with self.subTest(branch=branch), self.assertRaises(ManifestError) as caught:
+                self.load(MANIFEST.replace('deployment_branch = "main"', f'deployment_branch = "{branch}"'))
+            self.assertNotIn("secretvalue", str(caught.exception))
+
     def test_generic_is_an_explicit_docker_profile(self):
         contents = MANIFEST.replace('template = "google-adk"', 'template = "generic"')
         self.assertEqual(self.load(contents)["template"], "generic")
         with self.assertRaisesRegex(ManifestError, "generic template requires the docker runtime"):
             self.load(contents.replace('runtime = "docker"', 'runtime = "native"'))
+
+    def test_an_image_table_names_a_supported_registry(self):
+        without_github = MANIFEST.split("[github]")[0]
+        hub = self.load(without_github + '[image]\nrepository = "docker.io/example/orders"\n')
+        self.assertEqual(hub["image"], {"repository": "docker.io/example/orders"})
+        self.assertEqual(image_repository_for(hub, None), "docker.io/example/orders")
+        bare = self.load(without_github + '[image]\nrepository = "nginx"\n')
+        self.assertEqual(bare["image"], {"repository": "docker.io/library/nginx"})
+        self.assertEqual(image_repository_for(bare, None), "docker.io/library/nginx")
+        # A [github] table and an [image] table may agree, but never disagree.
+        agreeing = self.load(MANIFEST + '[image]\nrepository = "ghcr.io/queryplanner/orders"\n')
+        self.assertEqual(agreeing["image"]["repository"], "ghcr.io/queryplanner/orders")
+        with self.assertRaisesRegex(ManifestError, "two image repositories"):
+            self.load(MANIFEST + '[image]\nrepository = "docker.io/example/orders"\n')
+        for repository in ("docker.io/nginx", "example/orders", "quay.io/example/orders",
+                           "docker.io/example/orders:latest", "docker.io/Example/orders", ""):
+            with self.subTest(repository=repository), self.assertRaises(ManifestError):
+                self.load(without_github + f'[image]\nrepository = "{repository}"\n')
+        native = without_github.replace('runtime = "docker"', 'runtime = "native"')
+        with self.assertRaisesRegex(ManifestError, "Docker applications"):
+            self.load(native + '[image]\nrepository = "docker.io/example/orders"\n')
 
     def test_invalid_fields_are_rejected_without_echoing_values(self):
         replacements = [
@@ -109,6 +148,37 @@ class ManifestTests(unittest.TestCase):
             self.load('name = "secretvalue')
         self.assertNotIn("secretvalue", str(caught.exception))
 
+    def with_http(self, extra: str) -> dict:
+        return self.load(MANIFEST.replace('api_domain = "orders-api.example.com"',
+                                          'api_domain = "orders-api.example.com"\n' + extra))
+
+    def test_additional_hostnames_and_the_www_alias_are_expanded(self):
+        aliases = self.with_http('hostnames = ["legacy.example.com", "www.orders-api.example.com"]')
+        self.assertEqual(aliases["http"]["hostnames"],
+                         ["legacy.example.com", "www.orders-api.example.com"])
+        self.assertEqual(self.with_http("www_redirect = true")["http"]["hostnames"],
+                         ["www.orders-api.example.com"])
+        # Without aliases the key is absent, so a record written before aliases existed validates unchanged.
+        self.assertNotIn("hostnames", self.load(MANIFEST)["http"])
+
+    def test_unusable_additional_hostnames_are_rejected(self):
+        cases = {
+            "duplicate": 'hostnames = ["legacy.example.com", "legacy.example.com"]',
+            "the canonical hostname": 'hostnames = ["orders-api.example.com"]',
+            "www outside the canonical hostname": 'hostnames = ["www.other.example.com"]',
+            "uppercase": 'hostnames = ["Legacy.example.com"]',
+            "ip address": 'hostnames = ["127.0.0.1"]',
+            "wildcard": 'hostnames = ["*.example.com"]',
+            "not a list": 'hostnames = "legacy.example.com"',
+            "not strings": "hostnames = [1]",
+            "www twice": 'hostnames = ["www.orders-api.example.com"]\nwww_redirect = true',
+            "www_redirect not a boolean": 'www_redirect = "yes"',
+        }
+        for label, extra in cases.items():
+            with self.subTest(label), self.assertRaises(ManifestError) as caught:
+                self.with_http(extra)
+            self.assertNotIn("other.example.com", str(caught.exception))
+
     def test_configuration_reports_unusable_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigurationError, "could not create ship.toml"):
@@ -123,6 +193,8 @@ class CLITests(unittest.TestCase):
             executable = Path(__import__("sys").executable).parent / "shiplord"
         if env is None:  # configure consults the registered servers; never read the developer's own configuration
             env = dict(os.environ, XDG_CONFIG_HOME=str(Path(directory) / ".test-config"))
+        # A real Tailscale token in the developer's environment must never reach a test: it would call the API.
+        env = {name: value for name, value in env.items() if name != tailscale.API_TOKEN_ENV}
         # stdin is not a terminal, so no command may wait for an answer.
         return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
                               env=env, stdin=subprocess.DEVNULL)
@@ -148,7 +220,8 @@ class CLITests(unittest.TestCase):
 
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
-                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["restart", "--json"], ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["release", "--json"],
                     ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
@@ -159,6 +232,13 @@ class CLITests(unittest.TestCase):
                         self.assertIn("ship.toml", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_setup_without_a_manifest_asks_for_a_repository_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "setup", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--repo", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_deprovision_requires_explicit_confirmation_before_any_connection(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
@@ -166,6 +246,40 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "deprovision", "--retire", "--json", env=env)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("--yes", json.loads(result.stdout)["error"])
+
+    def test_restore_requires_confirmation_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)  # no server aliases exist here
+            result = self.invoke(directory, "restore", "--latest", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
+            # With --yes the confirmation passes and the missing server alias is the next failure (exit 3).
+            self.assertEqual(self.invoke(directory, "restore", "--latest", "--yes", "--json", env=env).returncode, 3)
+            self.assertEqual(self.invoke(directory, "backup", "--json", env=env).returncode, 3)
+
+    def test_backup_and_restore_need_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (["backup", "--json"], ["restore", "--latest", "--yes", "--json"]):
+                with self.subTest(command=command):
+                    result = self.invoke(directory, *command)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("ship.toml", json.loads(result.stdout)["error"])
+
+    def test_backup_output_reports_the_verified_archive(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            cli.output.render_operation(
+                0, {"status": "succeeded", "archive": "shiplord-backup-orders-20240101T000000Z.tar.gz",
+                    "sha256": "b" * 64, "size": 10, "entries": 2, "bytes": 4, "verified": True,
+                    "application": {"restarted": True, "running": True}},
+                "orders on production", "backup")
+        text = buffer.getvalue()
+        self.assertIn("Outcome: succeeded", text)
+        self.assertIn("Archive: shiplord-backup-orders-20240101T000000Z.tar.gz", text)
+        self.assertIn("Sha256: " + "b" * 64, text)
+        self.assertIn("Verified: yes", text)
+        self.assertIn("Application: running", text)
 
     def test_deploy_validates_its_input_before_reading_any_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
@@ -183,7 +297,7 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
             env = dict(os.environ, XDG_CONFIG_HOME=config)
-            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"]):
+            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"], ["restart", "--json"]):
                 with self.subTest(command=command):
                     self.assertEqual(self.invoke(directory, *command, env=env).returncode, 3)
             self.assertEqual(self.invoke(directory, "server", "bootstrap", "production", env=env).returncode, 3)
@@ -228,6 +342,40 @@ class CLITests(unittest.TestCase):
             self.assertNotIn("ghp_example", result.stdout + result.stderr)
             result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key), "--json", env=env)
             self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "docker.io", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # Docker Hub is accepted like GHCR
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key),
+                                 "--registry", "quay.io", "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ghcr.io and docker.io", json.loads(result.stdout)["error"])
+
+    def test_env_edits_validate_before_any_server_lookup_and_never_echo_values(self):
+        secret = "postgres://u:s3cr3t@db/x"
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            cases = ((["env", "set", f"PORT={secret}"], "managed by Shiplord"),
+                     (["env", "set", f"BAD LINE {secret}"], "KEY=VALUE"),
+                     (["env", "set", f"A={secret}\nB=2"], "invalid"),
+                     (["env", "unset", "A B"], "variable name"),
+                     (["env", "set"], "exactly one"),
+                     (["env", "set", "A=1", "--from-file", "f"], "exactly one"))
+            for args, expected in cases:
+                with self.subTest(args=args[:2]):
+                    result = self.invoke(directory, *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, json.loads(result.stdout)["error"])
+                    self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            result = self.invoke(directory, "env", "set", f"DATABASE_URL={secret}", "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
+            self.assertEqual(self.invoke(directory, "env", "unset", "OLD", "--json", env=env).returncode, 3)
+            env_file = Path(directory) / "runtime.env"
+            env_file.write_text(f"DATABASE_URL={secret}\n")
+            result = self.invoke(directory, "env", "set", "--from-file", str(env_file), "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # whole-file replacement still works
+            self.assertNotIn("s3cr3t", result.stdout + result.stderr)
 
     def test_github_commands_need_a_manifest_and_a_server_alias(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
@@ -326,11 +474,78 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(output["unverified"]), len(PINS))
         self.assertIn("nothing here says they resolve", output["error"])
 
+    def test_github_setup_rejects_an_invalid_deployment_branch_before_using_github_or_a_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST)
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--deployment-branch", "main..other", "--json")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("valid branch name", json.loads(result.stdout)["error"])
+            self.assertEqual((root / "ship.toml").read_text(), MANIFEST)
+            self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
+
     def test_doctor_rejects_conflicting_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.invoke(directory, "doctor", "--local", "--server", "production", "--json")
         self.assertEqual(result.returncode, 2)
         self.assertFalse(json.loads(result.stdout)["ok"])
+
+    def test_github_setup_creates_the_tailscale_credential_when_a_token_is_in_the_environment(self):
+        token = "tskey-api-throwaway-fixture-value"
+        manifest = load_manifest(Path(self.write_manifest()))
+        requests = []
+
+        def transport(url, headers, body):
+            requests.append((url, headers, body))
+            return 200, json.dumps({"id": "id123456", "audience": "api.tailscale.com/id123456"}).encode()
+
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=transport), \
+                patch.dict(os.environ, {tailscale.API_TOKEN_ENV: token, "XDG_CONFIG_HOME": config}):
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(token, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "created through the Tailscale API")
+        self.assertEqual(setup.call_args.kwargs["tailscale"],
+                         {"SHIPLORD_TS_CLIENT_ID": "id123456", "SHIPLORD_TS_AUDIENCE": "api.tailscale.com/id123456"})
+        payload = json.loads(requests[0][2])
+        self.assertEqual(payload["subject"], "repo:QueryPlanner/*:ref:refs/heads/main")
+        self.assertNotIn(token, json.dumps(payload))
+
+    def test_github_setup_without_a_token_keeps_the_printed_instructions_and_makes_no_request(self):
+        manifest = load_manifest(Path(self.write_manifest()))
+        fake_gh = Mock()
+        fake_gh.oidc_subject_prefix.return_value = ("repo:QueryPlanner/orders", [])
+        with tempfile.TemporaryDirectory() as config, \
+                patch("shiplord.cli._manifest", return_value=manifest), \
+                patch("shiplord.cli.load_server", return_value="appuser@server.example.com"), \
+                patch("shiplord.cli._admin_target"), \
+                patch("shiplord.cli.github.GitHub", return_value=fake_gh), \
+                patch("shiplord.cli.github.github_setup", return_value={"ok": True}) as setup, \
+                patch("shiplord.tailscale._https_post", side_effect=AssertionError("must not call Tailscale")), \
+                patch.dict(os.environ, {"XDG_CONFIG_HOME": config}, clear=False):
+            os.environ.pop(tailscale.API_TOKEN_ENV, None)
+            result = CliRunner().invoke(cli.app, ["github", "setup", "--repo", "QueryPlanner/orders", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.stdout)["tailscale"]["source"], "not configured")
+        self.assertEqual(setup.call_args.kwargs["tailscale"], {})
+
+    def write_manifest(self) -> str:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = Path(directory) / "ship.toml"
+        path.write_text(MANIFEST)
+        return str(path)
 
     def test_configure_creates_a_valid_manifest_without_github_settings(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -620,7 +835,22 @@ class CLITests(unittest.TestCase):
         self.assertIn("shiplord", help_result.stdout.lower())
 
 
-class CLIInventoryTests(unittest.TestCase):
+class ServerConfigMixin(unittest.TestCase):
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def env(self, config: Path) -> dict[str, str]:
+        return dict(os.environ, XDG_CONFIG_HOME=str(config))
+
+
+class CLIInventoryTests(ServerConfigMixin):
     inventory = {"ok": True, "applications": [{
         "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,
         "release_recorded": True, "unfinished_transaction": None, "ok": True,
@@ -697,6 +927,132 @@ class CLIInventoryTests(unittest.TestCase):
             self.assertEqual(probes.call_count, 2)
             self.assertEqual(inventory.call_count, 1)
 
+    def test_doctor_all_servers_reports_a_mixed_fleet_and_keeps_probing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"),
+                               ("beta", "admin@beta.example.com"), ("gamma", "admin@gamma.example.com"))
+
+            def probe(target, timeout):
+                if target.startswith("admin@beta"):
+                    raise TransportError("SSH capabilities check timed out")
+                return {"helper_version": "0.2.0" if target.startswith("admin@alpha") else "0.1.0"}
+
+            with patch("shiplord.commands.probe_capabilities", side_effect=probe) as probes:
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"]), (False, True))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta", "gamma"])
+        self.assertEqual(probes.call_count, 3)  # the failed probe did not stop the sweep
+        alpha, beta, gamma = data["servers"]
+        self.assertEqual((alpha["reachable"], alpha["helper_version"], alpha["inventory_support"]),
+                         (True, "0.2.0", "supported"))
+        self.assertNotIn("upgrade_command", alpha)
+        self.assertEqual((beta["reachable"], beta["inventory_support"]), (False, "unknown"))
+        self.assertNotIn("upgrade_command", beta)
+        self.assertEqual((gamma["reachable"], gamma["helper_version"], gamma["inventory_support"]),
+                         (True, "0.1.0", "unsupported"))
+        self.assertEqual(gamma["upgrade_command"], "shiplord server bootstrap gamma")
+        self.assertEqual(data["client"]["version"], "0.2.0")
+
+    def test_doctor_all_servers_human_output_hints_only_the_confirmed_old_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"),
+                               ("beta", "admin@beta.example.com"), ("gamma", "admin@gamma.example.com"))
+
+            def probe(target, timeout):
+                if target.startswith("admin@beta"):
+                    raise TransportError("SSH capabilities check timed out")
+                return {"helper_version": "0.2.0" if target.startswith("admin@alpha") else "0.1.0"}
+
+            with patch("shiplord.commands.probe_capabilities", side_effect=probe):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers"], env=self.env(config))
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        self.assertEqual(result.exit_code, 3, output)
+        self.assertIn("alpha: reachable, helper 0.2.0, inventory supported", output)
+        self.assertIn("beta: unreachable, inventory unknown", output)
+        self.assertIn("gamma: reachable, helper 0.1.0, inventory unsupported", output)
+        self.assertIn("shiplord server bootstrap gamma", output)
+        self.assertNotIn("server bootstrap alpha", output)
+        self.assertNotIn("server bootstrap beta", output)
+
+    def test_doctor_all_servers_exits_zero_only_for_a_complete_compatible_fleet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"), ("beta", "admin@beta.example.com"))
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.2.0"}):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"]), (True, False))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha", "beta"])
+
+    def test_doctor_all_servers_rejects_conflicting_modes_before_connecting(self):
+        for extra in (["--server", "alpha"], ["--local"], ["--deep"]):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temp:
+                config = Path(temp) / "config"
+                with patch("shiplord.commands.probe_capabilities") as probe, \
+                     patch("shiplord.cli.bootstrap_server") as bootstrap, \
+                     patch("shiplord.cli.getpass.getpass") as prompt:
+                    result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", *extra, "--json"],
+                                                env=self.env(config))
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertFalse(json.loads(result.stdout)["ok"])
+                probe.assert_not_called()
+                bootstrap.assert_not_called()
+                prompt.assert_not_called()
+                self.assertFalse(config.exists())
+
+    def test_doctor_all_servers_never_asks_for_sudo_or_runs_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.1.0"}), \
+                 patch("shiplord.cli.bootstrap_server") as bootstrap, \
+                 patch("shiplord.cli._admin_target") as admin, \
+                 patch("shiplord.cli.getpass.getpass") as prompt:
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertIn("server bootstrap alpha", result.output)  # guidance only, never executed
+        bootstrap.assert_not_called()
+        admin.assert_not_called()
+        prompt.assert_not_called()
+
+    def test_doctor_all_servers_counts_unreadable_registrations_as_partial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            bad = config / "shiplord" / "servers" / "bad.json"
+            bad.write_text("invalid")
+            bad.chmod(0o600)
+            with patch("shiplord.commands.probe_capabilities", return_value={"helper_version": "0.2.0"}):
+                result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["partial"], data["invalid_entries"]), (False, True, 1))
+        self.assertEqual([item["server"] for item in data["servers"]], ["alpha"])
+
+    def test_doctor_all_servers_requires_a_registered_server(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = CliRunner().invoke(cli.app, ["doctor", "--all-servers", "--json"],
+                                        env=self.env(Path(temp) / "config"))
+        self.assertEqual(result.exit_code, 3)
+        self.assertIn("server add", json.loads(result.stdout)["error"])
+
+    def test_single_server_doctor_is_unchanged_for_an_old_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("alpha", "admin@alpha.example.com"))
+            with patch("shiplord.cli.probe_capabilities", return_value={"helper_version": "0.1.0"}) as probe:
+                result = CliRunner().invoke(cli.app, ["doctor", "--server", "alpha", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["ok"], data["helper_version"]), (True, "0.1.0"))
+        self.assertNotIn("partial", data)
+        probe.assert_called_once_with("admin@alpha.example.com")  # still the single-server probe and default deadline
+
     def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
         directory = config / "shiplord" / "servers"
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -710,6 +1066,24 @@ class CLIInventoryTests(unittest.TestCase):
     def env(self, config: Path) -> dict[str, str]:
         return dict(os.environ, XDG_CONFIG_HOME=str(config))
 
+    def test_provision_update_passes_the_flag_through(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "ship.toml").write_text(MANIFEST)
+            self.write_servers(config, ("production", "admin@host.example.com"))
+            original = os.getcwd()
+            self.addCleanup(os.chdir, original)
+            os.chdir(project)
+            with patch("shiplord.cli.commands.provision_application", return_value=(0, {"ok": True})) as provision:
+                result = CliRunner().invoke(cli.app, ["provision", "--update", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(provision.call_args.kwargs["update"])
+            with patch("shiplord.cli.commands.provision_application", return_value=(0, {"ok": True})) as provision:
+                result = CliRunner().invoke(cli.app, ["provision", "--json"], env=self.env(config))
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(provision.call_args.kwargs["update"])
     def test_doctor_deep_prints_ignored_registry_files_once_and_keeps_the_json_field(self):
         applications = [{"application": "orders", "deployed": True, "unfinished_transaction": None}]
         ignored = {"ok": True, "checks": {"applications": {"ok": True, "applications": applications,
@@ -732,6 +1106,28 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(json.loads(payload.stdout)["checks"]["applications"]["ignored_files"], ["orders.json~"])
         self.assertEqual(quiet.exit_code, 0, quiet.output)
         self.assertNotIn("Ignored", quiet.stdout)
+
+    def test_doctor_deep_renders_the_os_baseline_with_the_detected_release(self):
+        refused = {"ok": False, "checks": {"os": {
+            "ok": False, "id": "ubuntu", "version_id": "22.04",
+            "message": "unsupported server operating system: ubuntu 22.04 is older than the supported minimum; "
+                       "Shiplord supports Ubuntu 24.04 or later and Debian 12 or later"}}}
+        supported = {"ok": True, "checks": {"os": {"ok": True, "id": "debian", "version_id": "12"}}}
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(3, refused)):
+                failed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+            with patch("shiplord.cli.commands.server_doctor", return_value=(0, supported)):
+                passed = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--deep"],
+                                            env=self.env(config))
+        self.assertEqual(failed.exit_code, 3, failed.output)
+        self.assertIn("Server baseline:", failed.stdout)
+        self.assertIn("os: failed (id: ubuntu; version id: 22.04; message: unsupported server operating system:",
+                      failed.stdout)
+        self.assertEqual(passed.exit_code, 0, passed.output)
+        self.assertIn("os: passed (id: debian; version id: 12)", passed.stdout)
 
     def test_apps_uses_a_single_server_alias_and_hides_the_port_from_the_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -890,6 +1286,56 @@ class CLIInventoryTests(unittest.TestCase):
                                                env=self.env(config))
             self.assertEqual(set(json.loads(logs_json.stdout)), {"ok", "logs"})
 
+    def test_logs_forward_since_timestamps_and_follow_to_the_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs",
+                       return_value=(0, {"ok": True, "logs": "one\n"})) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--tail", "25",
+                                                      "--since", "15m", "--timestamps"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(call.call_args.args[1], 25)
+        self.assertEqual(call.call_args.kwargs["since"], "15m")
+        self.assertTrue(call.call_args.kwargs["timestamps"])
+        self.assertFalse(call.call_args.kwargs["follow"])
+
+    def test_follow_and_json_are_refused_before_any_connection(self):
+        with patch("shiplord.cli._app_context") as context:
+            result = CliRunner().invoke(cli.app, ["logs", "orders", "--follow", "--json"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("cannot be combined", json.loads(result.stdout)["error"])
+        context.assert_not_called()
+
+    def test_follow_writes_chunks_as_they_arrive_and_reports_the_stop_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+
+            def stream(client, tail, **options):
+                options["on_chunk"]("one\n")
+                options["on_chunk"]("two\n")
+                return 0, {"ok": True, "logs": "", "stopped": "timeout", "release": "a" * 12}
+
+            with patch("shiplord.cli.commands.application_logs", side_effect=stream) as call:
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow",
+                                                      "--timeout", "60"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.stdout, "one\ntwo\n")
+        self.assertIn(f"Outcome: stopped at the timeout (release {'a' * 12})", result.stderr)
+        self.assertEqual(call.call_args.kwargs["timeout"], 60)
+
+    def test_ctrl_c_stops_following_with_exit_130(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.commands.application_logs", side_effect=KeyboardInterrupt):
+                result = CliRunner().invoke(cli.app, ["logs", "orders", "--server", "hetzner-vm", "--follow"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 130)
+        self.assertIn("Stopped following logs.", result.stderr)
+
+
     def test_status_explains_an_observed_unfinished_transaction(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"
@@ -903,7 +1349,90 @@ class CLIInventoryTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Outcome: recovery required", result.output)
         self.assertIn("unfinished deployment transaction", result.output)
-        self.assertIn("shiplord recover", result.output)
+        self.assertIn("shiplord recover orders --server hetzner-vm", result.output)
+
+    def test_status_hint_from_a_manifest_names_the_resolved_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("production", "admin@host.example.com"))
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "ship.toml").write_text(MANIFEST)
+            status_result = {"ok": True, "application": {
+                "application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": {"request_id": "req-1", "phase": "prepared"}, "running": None,
+            }}
+            current = Path.cwd()
+            try:
+                os.chdir(project)
+                with patch("shiplord.cli.commands.application_status", return_value=(0, status_result)), \
+                        patch("shiplord.cli._helper"):
+                    result = CliRunner().invoke(cli.app, ["status"], env=self.env(config))
+            finally:
+                os.chdir(current)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("shiplord recover orders --server production", result.output)
+
+    @staticmethod
+    def empty_application() -> dict:
+        return {"application_id": "orders", "current": None, "previous": None,
+                "unfinished_transaction": None, "running": None}
+
+    def invoke_status_job(self, status_result: dict, job_id: str = "req-1", *, as_json: bool = False):
+        """Run `status --job-id` against a helper that records every request frame it receives."""
+        calls = []
+
+        def runner(command, payload, timeout):
+            message = read_frame(io.BytesIO(payload))
+            calls.append(message)
+            buffer = io.BytesIO()
+            write_frame(buffer, {"status": "ok", "request_id": message["request_id"], "result": status_result})
+            return buffer.getvalue(), b"", 0
+
+        client = HelperClient("orders", "ship-orders@host.example.com", runner=runner)
+        arguments = ["status", "orders", "--server", "hetzner-vm", "--job-id", job_id]
+        if as_json:
+            arguments.append("--json")
+        with patch("shiplord.cli._app_context", return_value=("orders", "hetzner-vm", client)):
+            return CliRunner().invoke(cli.app, arguments), calls
+
+    def test_status_job_lookup_uses_only_the_read_only_status_action(self):
+        job = {"request_id": "req-1", "action": "deploy", "state": "running", "phase": "preparing",
+               "submitted_at": 1, "started_at": 2, "finished_at": None, "outcome": None}
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": job})
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual([message["action"] for message in calls], ["status"])
+        self.assertEqual(calls[0]["application_id"], "orders")
+        self.assertEqual(calls[0]["arguments"], {"job_id": "req-1"})
+        self.assertIn("Job: req-1", result.stdout)
+        self.assertIn("Job state: running", result.stdout)
+        self.assertIn("Job phase: preparing", result.stdout)
+
+    def test_finished_job_reports_rollback_and_json_keeps_the_helper_record(self):
+        job = {"request_id": "req-1", "action": "deploy", "state": "finished", "phase": "finished",
+               "submitted_at": 1, "started_at": 2, "finished_at": 3,
+               "outcome": {"status": "rolled_back", "exit_code": 5, "detail": {"error": "readiness_failed"}}}
+        result, _ = self.invoke_status_job({"application": self.empty_application(), "job": job})
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Job state: finished", result.stdout)
+        self.assertIn("Job outcome: rolled_back (exit 5)", result.stdout)
+        as_json, _ = self.invoke_status_job({"application": self.empty_application(), "job": job}, as_json=True)
+        self.assertEqual(as_json.exit_code, 0, as_json.output)
+        self.assertEqual(json.loads(as_json.stdout)["job"], job)
+
+    def test_unknown_job_id_is_a_clear_nonzero_error(self):
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": None})
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("no job 'req-1' is recorded for orders on hetzner-vm", result.stdout)
+        self.assertIn("may have expired", result.stdout)
+        self.assertEqual(len(calls), 1)  # the read-only lookup was attempted before reporting it
+
+    def test_malformed_job_id_is_rejected_before_any_remote_request(self):
+        result, calls = self.invoke_status_job({"application": self.empty_application(), "job": None},
+                                               job_id="../etc/passwd")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("--job-id", result.stdout)
+        self.assertEqual(calls, [])
 
     def invoke_remote_plan(self, plan_result: dict, *, as_json: bool = False):
         arguments = ["plan", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "b" * 40]
@@ -926,6 +1455,32 @@ class CLIInventoryTests(unittest.TestCase):
                 patch("shiplord.cli.commands.commit_sequence", return_value=1001), \
                 patch("shiplord.cli.commands.deploy_application", return_value=(code, deploy_result)):
             return CliRunner().invoke(cli.app, arguments)
+
+    def test_recover_force_stop_reaches_the_command_and_help_lists_it(self):
+        recovered = {"ok": True, "request_id": "rc-1", "status": "recovered", "exit_code": 0,
+                     "running": False, "forced_stop": {"forced": True, "signal": "SIGKILL"}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, recovered)) as run:
+            result = CliRunner().invoke(cli.app, ["recover", "--force-stop", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(run.call_args.kwargs["force_stop"])
+        self.assertEqual(run.call_args.args[2], "recover")
+        plain = CliRunner().invoke(cli.app, ["recover", "--help"], color=True)
+        self.assertIn("--force-stop", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
+
+    def test_restart_reaches_the_command_and_help_lists_it(self):
+        restarted = {"ok": True, "request_id": "rs-1", "status": "succeeded", "exit_code": 0,
+                     "release": {"commit": "a" * 40, "sequence": 1000}}
+        with patch("shiplord.cli._manifest", return_value={"name": "orders", "server": "hetzner-vm"}), \
+                patch("shiplord.cli._helper"), \
+                patch("shiplord.cli.commands.run_job_command", return_value=(0, restarted)) as run:
+            result = CliRunner().invoke(cli.app, ["restart", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run.call_args.args[2], "restart")
+        self.assertIn("succeeded", json.loads(result.stdout)["status"])
+        plain = CliRunner().invoke(cli.app, ["--help"], color=True)
+        self.assertIn("restart", re.sub(r"\x1b\[[0-9;]*m", "", plain.output))
 
     def test_plan_renders_release_route_storage_and_shutdown_changes(self):
         plan_result = {
@@ -1046,3 +1601,394 @@ class CLIInventoryTests(unittest.TestCase):
         server_data = json.loads(server.stdout)
         self.assertEqual(server_data["helper_version"], "0.2.0")
         self.assertEqual(server_data["client"]["version"], "0.2.0")
+
+
+class ServerUninstallTests(ServerConfigMixin):
+    """`shiplord server uninstall` calls the admin action and reports what it removed."""
+
+    result = {"status": "uninstalled",
+              "removed": {"caddy": {"import": True, "placeholder": True}, "sshd": True,
+                          "wrappers": ["shiplord-host", "shiplord-admin"], "versions": 2,
+                          "directories": ["registrations", "jobs"]},
+              "retained": ["the state directory that holds the host lock"], "applications": []}
+
+    def fake(self, result=None, error=None):
+        calls = []
+
+        class FakeAdmin:
+            def __init__(self, target, prompt=None):
+                self.target = target
+
+            def call(self, action, application_id, arguments, *, timeout=120):
+                calls.append((action, application_id, arguments, timeout))
+                if error is not None:
+                    raise error
+                return dict(self_result if self_result is not None else ServerUninstallTests.result)
+
+        self_result = result
+        return FakeAdmin, calls
+
+    def test_human_output_lists_removals_retained_state_and_the_data_warning(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm"], env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls, [("uninstall", None, {"force": False}, 300)])
+        self.assertIn("Removed:", result.stdout)
+        self.assertIn("the managed Caddy import", result.stdout)
+        self.assertIn("the launchers: shiplord-host, shiplord-admin", result.stdout)
+        self.assertIn("the helper code (2 versions)", result.stdout)
+        self.assertIn("Left in place:", result.stdout)
+        self.assertIn("Application data is never deleted", result.stdout)
+        self.assertIn("shiplord server bootstrap", result.stdout)
+
+    def test_json_keeps_the_result_and_the_data_warning(self):
+        admin, _calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["removed"]["wrappers"], ["shiplord-host", "shiplord-admin"])
+        self.assertIn("Application data is never deleted", data["note"])
+
+    def test_force_is_passed_to_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--force", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls[0][2], {"force": True})
+
+    def test_a_refused_uninstall_exits_two_and_names_the_applications(self):
+        error = ClientError("2 applications are still provisioned (orders, billing); deprovision them first "
+                            "or pass --force", 2, error_code="rejected")
+        admin, _calls = self.fake(error=error)
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            self.write_servers(config, ("hetzner-vm", "admin@host.example.com"))
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "hetzner-vm", "--json"],
+                                            env=self.env(config))
+        self.assertEqual(result.exit_code, 2, result.output)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["error_code"], "rejected")
+        self.assertIn("orders", data["error"])
+
+    def test_an_unknown_alias_exits_three_without_calling_the_server(self):
+        admin, calls = self.fake()
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config"
+            with patch("shiplord.cli.AdminClient", admin):
+                result = CliRunner().invoke(cli.app, ["server", "uninstall", "absent", "--json"], env=self.env(config))
+        self.assertEqual(result.exit_code, 3, result.output)
+        self.assertEqual(calls, [])
+class EnvironmentDiffCLITests(unittest.TestCase):
+    SECRET = "postgres://app:cli-secret@db/orders"
+    MANIFEST = {"name": "orders", "server": "production"}
+
+    def invoke(self, *arguments: str, input_text: str | None = None, current=("KEEP", "REMOVE")):
+        calls = []
+
+        def runner(command, payload, timeout):
+            calls.append((command, payload))
+            buffer = io.BytesIO()
+            write_frame(buffer, {"status": "ok", "request_id": "x", "result": {"keys": list(current)}})
+            return buffer.getvalue(), b"", 0
+
+        with patch("shiplord.cli._manifest", return_value=self.MANIFEST), \
+             patch("shiplord.cli._admin", return_value=AdminClient("admin@server.example.com", runner=runner)):
+            result = CliRunner().invoke(cli.app, list(arguments), input=input_text)
+        return result, calls
+
+    def assert_key_only_requests(self, calls) -> None:
+        for command, payload in calls:
+            sent = read_frame(io.BytesIO(payload))
+            self.assertEqual(sent["action"], "environment")
+            self.assertEqual(sent["arguments"], {"operation": "keys"})
+            self.assertNotIn(self.SECRET.encode(), payload)
+            self.assertNotIn(self.SECRET, " ".join(command))
+
+    def test_text_and_json_report_added_and_removed_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.env"
+            candidate.write_text(f"KEEP={self.SECRET}\nADD={self.SECRET}-added\n")
+            text, calls = self.invoke("env", "diff", "--from-file", str(candidate))
+            data, json_calls = self.invoke("env", "diff", "--from-file", str(candidate), "--json")
+        self.assertEqual(text.exit_code, 0, text.output)
+        self.assertIn("Added: ADD", text.stdout)
+        self.assertIn("Removed: REMOVE", text.stdout)
+        self.assertIn("Key names only", text.stdout)
+        self.assertNotIn("KEEP", text.stdout)
+        self.assertEqual(json.loads(data.stdout)["added"], ["ADD"])
+        self.assertEqual(json.loads(data.stdout)["removed"], ["REMOVE"])
+        self.assertNotIn("KEEP", data.stdout)
+        for result in (text, data):
+            self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assert_key_only_requests(calls + json_calls)
+
+    def test_stdin_is_supported_and_a_value_change_alone_is_not_a_change(self):
+        result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=f"KEEP={self.SECRET}\n",
+                                    current=("KEEP",))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Added: none", result.stdout)
+        self.assertIn("Removed: none", result.stdout)
+        self.assertNotIn("KEEP", result.stdout)
+        self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assert_key_only_requests(calls)
+
+    def test_invalid_input_fails_before_the_remote_call(self):
+        for payload, expected in (("PORT=1\n", "managed by Shiplord"), ("not a line\n", "not KEY=VALUE"),
+                                  ("", "no variables")):
+            with self.subTest(payload=payload):
+                result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=payload)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn(expected, result.stdout)
+                self.assertEqual(calls, [])
+        result, calls = self.invoke("env", "diff", "--from-file", "-", input_text=f"BAD LINE {self.SECRET}\n")
+        self.assertEqual(result.exit_code, 2)
+        self.assertNotIn(self.SECRET, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+        result, calls = self.invoke("env", "diff", "--from-file", "/does/not/exist.env")
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("could not read the environment file", result.stdout)
+        self.assertEqual(calls, [])
+class CLIRecoveryTests(unittest.TestCase):
+    """`recover` keeps manifest mode and adds a named target that works without a checkout."""
+
+    OUTCOMES = (
+        (0, {"ok": True, "status": "recovered", "exit_code": 0}),
+        (0, {"ok": True, "status": "nothing_to_recover", "exit_code": 0}),
+        (6, {"ok": False, "status": "intervention_required", "exit_code": 6, "error": "recovery_failed"}),
+    )
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.config = root / "config"
+        self.project = root / "project"
+        self.project.mkdir()
+        self.write_servers(("hetzner-vm", "admin@host.example.com"))
+
+    def write_servers(self, *servers: tuple[str, str]) -> None:
+        directory = self.config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (self.config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            record = directory / f"{alias}.json"
+            record.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            record.chmod(0o600)
+
+    def invoke(self, *arguments: str, cwd: Path | None = None):
+        """Invoke from a directory with no ship.toml unless the test writes one."""
+        env = {key: value for key, value in os.environ.items() if not key.startswith("SHIPLORD_")}
+        env["XDG_CONFIG_HOME"] = str(self.config)
+        current = Path.cwd()
+        os.chdir(cwd or self.project)
+        try:
+            return CliRunner().invoke(cli.app, list(arguments), env=env)
+        finally:
+            os.chdir(current)
+
+    def test_explicit_recovery_needs_no_manifest_and_uses_the_app_scoped_login(self):
+        self.assertFalse((self.project / "ship.toml").exists())
+        outcome = {"ok": True, "request_id": "rc-1", "status": "recovered", "exit_code": 0}
+        with patch("shiplord.cli.commands.run_job_command", return_value=(0, outcome)) as run:
+            result = self.invoke("recover", "orders", "--server", "hetzner-vm")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIsNone(run.call_args.args[0])  # no local manifest was invented for the wait bound
+        client = run.call_args.args[1]
+        self.assertEqual((client.application_id, client.target), ("orders", "ship-orders@host.example.com"))
+        self.assertEqual(run.call_args.args[2], "recover")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Target: orders on hetzner-vm", result.stdout)
+        self.assertIn("Outcome: recovered", result.stdout)
+
+    def test_explicit_recovery_json_is_the_existing_result_shape(self):
+        outcome = {"ok": True, "request_id": "rc-1", "status": "nothing_to_recover", "exit_code": 0}
+        with patch("shiplord.cli.commands.run_job_command", return_value=(0, outcome)):
+            result = self.invoke("recover", "orders", "--server", "hetzner-vm", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.stdout), outcome)
+        self.assertEqual(result.stderr, "")
+
+    def test_explicit_recovery_requires_both_selectors_before_any_connection(self):
+        for arguments in (("recover", "orders"), ("recover", "--server", "hetzner-vm")):
+            with self.subTest(arguments=arguments), \
+                    patch("shiplord.cli.commands.run_job_command") as run, \
+                    patch("shiplord.cli.HelperClient") as helper:
+                result = self.invoke(*arguments)
+            self.assertEqual(result.exit_code, 2, result.output)
+            self.assertIn("both an application and a server alias", result.stdout)
+            self.assertIn("shiplord recover <app> --server <alias>", result.stdout)
+            run.assert_not_called()
+            helper.assert_not_called()
+
+    def test_explicit_recovery_rejects_invalid_selectors_before_any_connection(self):
+        cases = ((("recover", "Orders", "--server", "hetzner-vm"), 2),
+                 (("recover", "orders", "--server", "unknown"), 3))
+        for arguments, code in cases:
+            with self.subTest(arguments=arguments), \
+                    patch("shiplord.cli.commands.run_job_command") as run, \
+                    patch("shiplord.cli.HelperClient") as helper:
+                result = self.invoke(*arguments, "--json")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertFalse(json.loads(result.stdout)["ok"])
+            run.assert_not_called()
+            helper.assert_not_called()
+
+    def test_recovery_outcomes_keep_their_exit_codes_in_explicit_mode(self):
+        for code, outcome in self.OUTCOMES:
+            with self.subTest(status=outcome["status"]), \
+                    patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)):
+                result = self.invoke("recover", "orders", "--server", "hetzner-vm")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertEqual(result.stderr, "")
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
+            if outcome.get("error"):
+                self.assertIn(f"Reason: {outcome['error'].replace('_', ' ')}", result.stdout)
+
+    def test_recovery_outcomes_keep_their_exit_codes_in_manifest_mode(self):
+        (self.project / "ship.toml").write_text(MANIFEST)
+        for code, outcome in self.OUTCOMES:
+            with self.subTest(status=outcome["status"]), \
+                    patch("shiplord.cli._helper") as helper, \
+                    patch("shiplord.cli.commands.run_job_command", return_value=(code, outcome)) as run:
+                result = self.invoke("recover")
+            self.assertEqual(result.exit_code, code, result.output)
+            self.assertEqual(run.call_args.args[0]["name"], "orders")
+            self.assertEqual(run.call_args.args[1], helper.return_value)
+            self.assertIn(f"Outcome: {outcome['status'].replace('_', ' ')}", result.stdout)
+            self.assertEqual(result.stderr, "")
+class RecordingAdminClient:
+    """A stand-in for the sudo client that records the resolved target and each request."""
+
+    instances: list["RecordingAdminClient"] = []
+
+    def __init__(self, target, prompt=None):
+        self.target, self.prompt, self.calls = target, prompt, []
+        RecordingAdminClient.instances.append(self)
+
+    def call(self, action, application_id, arguments, **kwargs):
+        self.calls.append((action, application_id, arguments))
+        return {"removed": {"registration": True}}
+
+
+class CLIDeprovisionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = Path(self.temp.name) / "config"
+        self.write_servers(self.config, ("hetzner-vm", "admin@host.example.com"),
+                           ("production", "admin@production.example.com"))
+        self.env = dict(os.environ, XDG_CONFIG_HOME=str(self.config))
+        RecordingAdminClient.instances.clear()
+        patcher = patch("shiplord.cli.AdminClient", RecordingAdminClient)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.directory = Path(self.temp.name) / "work"
+        self.directory.mkdir()
+        current = os.getcwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, current)
+
+    def write_servers(self, config: Path, *servers: tuple[str, str]) -> None:
+        directory = config / "shiplord" / "servers"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for path in (config, directory.parent, directory):
+            path.chmod(0o700)
+        for alias, ssh in servers:
+            path = directory / f"{alias}.json"
+            path.write_text(json.dumps({"schema_version": 1, "alias": alias, "ssh": ssh}))
+            path.chmod(0o600)
+
+    def invoke(self, *args: str):
+        return CliRunner().invoke(cli.app, list(args), env=self.env)
+
+    def admin_calls(self) -> list[tuple]:
+        return [call for instance in RecordingAdminClient.instances for call in instance.calls]
+
+    def test_explicit_selectors_work_from_a_directory_without_a_manifest(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual([instance.target for instance in RecordingAdminClient.instances],
+                         ["admin@host.example.com"])
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_explicit_selectors_win_over_a_manifest_for_another_application(self):
+        (self.directory / "ship.toml").write_text(MANIFEST.replace('name = "orders"', 'name = "billing"'))
+        with patch("shiplord.cli.load_manifest", side_effect=AssertionError("explicit mode read ship.toml")):
+            result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--yes", "--json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.admin_calls(), [("deprovision", "orders", {})])
+        self.assertEqual(RecordingAdminClient.instances[0].target, "admin@host.example.com")
+
+    def test_either_selector_alone_is_refused_before_any_request(self):
+        for args in (("orders", "--yes"), ("--server", "hetzner-vm", "--yes")):
+            with self.subTest(args=args):
+                result = self.invoke("deprovision", *args, "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("both", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_invalid_application_name_is_refused_before_any_request(self):
+        for name in ("Orders", "orders_app", "a" * 49):
+            with self.subTest(name=name):
+                result = self.invoke("deprovision", name, "--server", "hetzner-vm", "--yes", "--json")
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("lowercase application name", json.loads(result.stdout)["error"])
+                self.assertEqual(self.admin_calls(), [])
+
+    def test_an_unknown_server_alias_is_refused_before_any_request(self):
+        result = self.invoke("deprovision", "orders", "--server", "nowhere", "--yes", "--json")
+        self.assertEqual(result.exit_code, 3, result.output)
+        error = json.loads(result.stdout)["error"]
+        self.assertIn("not registered", error)
+        self.assertIn("hetzner-vm", error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_missing_confirmation_names_the_resolved_target_and_sends_nothing(self):
+        result = self.invoke("deprovision", "orders", "--server", "hetzner-vm", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "hetzner-vm", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])
+
+    def test_manifest_mode_keeps_the_existing_request_and_json(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        for retire, arguments in ((False, {}), (True, {"retire": True})):
+            with self.subTest(retire=retire):
+                RecordingAdminClient.instances.clear()
+                args = ["deprovision", "--yes", "--json"] + (["--retire"] if retire else [])
+                result = self.invoke(*args)
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(self.admin_calls(), [("deprovision", "orders", arguments)])
+                self.assertEqual(RecordingAdminClient.instances[0].target, "admin@production.example.com")
+                output = json.loads(result.stdout)
+                self.assertEqual(output["removed"], {"registration": True})
+                self.assertIn("data", output["note"])
+
+    def test_manifest_mode_requires_confirmation_and_names_the_target(self):
+        (self.directory / "ship.toml").write_text(MANIFEST)
+        result = self.invoke("deprovision", "--json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        error = json.loads(result.stdout)["error"]
+        for expected in ("orders", "production", "--yes"):
+            self.assertIn(expected, error)
+        self.assertEqual(self.admin_calls(), [])

@@ -2,11 +2,11 @@
 
 Installs the helper code under a content-addressed version directory, switches
 ``current`` to it atomically, creates the managed directories, makes Caddy import
-the managed route directory, and installs an sshd drop-in that confines
-deployment accounts to the forced-command dispatcher. Before the drop-in is
-written, the host's sshd unit is discovered and the main sshd configuration is
-checked to make sure it reads the drop-in directory. Re-running changes nothing
-when everything is already in place.
+the managed route directory, installs a boot-time recovery unit, and installs an
+sshd drop-in that confines deployment accounts to the forced-command dispatcher.
+Before the drop-in is written, the host's sshd unit is discovered and the main sshd
+configuration is checked to make sure it reads the drop-in directory. Re-running
+changes nothing when everything is already in place.
 """
 
 from __future__ import annotations
@@ -22,16 +22,19 @@ from pathlib import Path
 
 from . import __version__
 from .layout import Layout
+from .osbaseline import OS_RELEASE, check_os
 from .release_state import HostLock
-from .routing import CaddyCommands, RouteManager, RoutingError
+from .routing import CaddyCommands, RouteManager, RoutingError, caddy_binary, probe_caddy
 from .system import TRUNCATION_MARKER, CommandError, CommandResult, System
 
-CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "detect.py", "github.py", "servers.py",
-                            "tailscale.py", "template.py", "transport.py", "workflow.py"})
+CLIENT_MODULES = frozenset({"build.py", "cli.py", "client.py", "commands.py", "configure.py", "detect.py",
+                            "github.py", "output.py", "servers.py", "setup.py", "tailscale.py", "template.py",
+                            "transport.py", "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
     "worker_launcher.py": "shiplord.worker",
+    "boot_launcher.py": "shiplord.boot",
     "dispatch_launcher.py": "shiplord.dispatch",
 }
 LAUNCHER_TEMPLATE = (
@@ -39,7 +42,11 @@ LAUNCHER_TEMPLATE = (
     "sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))\n"
     "from {module} import main\n\nmain()\n"
 )
+MANAGED_MARKER = b"# Managed by Shiplord."  # first bytes of every file bootstrap writes into a shared directory
 PLACEHOLDER = b"# Managed by Shiplord. Generated route files live in this directory.\n"
+COMPLETE_MARKER = ".complete"  # written last, so its presence marks a version that finished installing
+VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}-[0-9a-f]{12}\Z")  # "<version>-<digest prefix>"
+KEPT_VERSIONS = 2  # the current version and the one before it, so a rollback target survives an upgrade
 DEPLOY_GROUP = "shiplord-deploy"  # the only accounts the sshd drop-in matches; provisioning adds each new one
 DEPLOY_MARKER = "shiplord-deploy"  # prefix of the passwd comment that marks an account as a deployment account
 SSHD_DROPIN = """\
@@ -61,6 +68,31 @@ Match Group {group}
 """
 SSHD = "/usr/sbin/sshd"
 SYSTEMCTL = "/usr/bin/systemctl"
+BOOT_UNIT = "shiplord-boot-recovery.service"
+# One boot-time recovery for the whole host: it exits as soon as it has looked at every application, so no service
+# runs between boots. Wants=, not Requires=: a host whose Docker or Caddy failed must still boot, and the unit
+# reports what it could not recover instead of holding the boot. The journal is the only place it writes.
+BOOT_UNIT_TEMPLATE = """\
+# Managed by Shiplord. Do not edit.
+[Unit]
+Description=Shiplord recovery for deployments interrupted by a restart
+Documentation=https://github.com/QueryPlanner/shiplord
+Wants=docker.service caddy.service
+After=docker.service caddy.service
+ConditionPathIsDirectory={app_state}
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart={wrapper}
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+"""
 SSHD_SERVICE_UNITS = ("ssh.service", "sshd.service")
 SSHD_SOCKET_UNITS = ("ssh.socket", "sshd.socket")
 SSHD_INCLUDE_DEPTH = 8
@@ -201,13 +233,205 @@ def _switch_current(layout: Layout, name: str) -> bool:
 
 def _install_wrappers(layout: Layout) -> bool:
     changed = False
-    wrappers = {layout.host: "host_launcher.py", layout.admin: "admin_launcher.py",
-                layout.worker: "worker_launcher.py", layout.dispatch: "dispatch_launcher.py"}
-    for target, launcher in wrappers.items():
+    for target, launcher in launcher_targets(layout).items():
         _ensure_dir(target.parent, 0o755)
-        text = f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'
-        changed |= _write_atomic(target, text.encode(), 0o755)
+        changed |= _write_atomic(target, wrapper_text(layout, launcher), 0o755)
     return changed
+
+
+def systemd_running(root: Path = Path("/run/systemd/system")) -> bool:
+    """Whether systemd is the running init system; the directory exists only while it is."""
+    return root.is_dir()
+
+
+def _systemctl(system: System, *arguments: str) -> CommandResult:
+    try:
+        return system.run([SYSTEMCTL, *arguments], timeout=60)
+    except CommandError:
+        raise BootstrapError("could not run systemctl") from None
+
+
+def boot_recovery_unit(layout: Layout) -> bytes:
+    """The rendered boot recovery unit: it runs the installed wrapper, not a path in the source tree."""
+    return BOOT_UNIT_TEMPLATE.format(wrapper=layout.boot, app_state=layout.app_state).encode()
+
+
+def _install_boot_unit(layout: Layout, system: System) -> bool:
+    """Write, reload, and enable the boot recovery unit; return whether anything changed."""
+    path = layout.systemd_units / BOOT_UNIT
+    _ensure_dir(path.parent, 0o755)
+    changed = _write_atomic(path, boot_recovery_unit(layout), 0o644)
+    if not systemd_running():
+        return changed  # nothing can be enabled before the host boots systemd; the unit file waits, inert
+    if changed and _systemctl(system, "daemon-reload").code != 0:
+        raise BootstrapError("systemd could not reload its units")
+    if _systemctl(system, "is-enabled", BOOT_UNIT).code != 0:
+        if _systemctl(system, "enable", BOOT_UNIT).code != 0:
+            raise BootstrapError("systemd could not enable the boot recovery unit")
+        changed = True
+    return changed
+
+
+def remove_boot_recovery(layout: Layout, system: System) -> bool:
+    """Disable and remove the boot recovery unit; idempotent, and safe when it was never installed.
+
+    Removing the unit only stops recovery from running at boot; no application state is touched. This is the
+    hook a ``shiplord server uninstall`` command calls; nothing in the CLI removes units yet.
+    """
+    path = layout.systemd_units / BOOT_UNIT
+    if not path.exists() and not path.is_symlink():
+        return False
+    if systemd_running() and _systemctl(system, "disable", BOOT_UNIT).code != 0:
+        raise BootstrapError("systemd could not disable the boot recovery unit")
+    try:
+        path.unlink()
+    except OSError:
+        raise BootstrapError("could not remove the boot recovery unit") from None
+    if systemd_running() and _systemctl(system, "daemon-reload").code != 0:
+        raise BootstrapError("systemd could not reload its units")
+    return True
+
+
+def launcher_targets(layout: Layout) -> dict[Path, str]:
+    """The launcher script bootstrap installs at each entry-point path."""
+    return {layout.host: "host_launcher.py", layout.admin: "admin_launcher.py",
+            layout.worker: "worker_launcher.py", layout.boot: "boot_launcher.py",
+            layout.dispatch: "dispatch_launcher.py"}
+
+
+def wrapper_text(layout: Layout, launcher: str) -> bytes:
+    """The exact text of the launcher bootstrap installs; uninstall recognises its own by this text."""
+    return f'#!/bin/sh\nexec {SERVER_PYTHON} -I -S -B {layout.lib}/current/{launcher} "$@"\n'.encode()
+
+
+def _helper_directory(layout: Layout) -> int:
+    """Open the helper directory, refusing one this account does not own or others may write."""
+    try:
+        descriptor = os.open(layout.lib, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise BootstrapError("could not open the helper directory") from None
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        os.close(descriptor)
+        raise BootstrapError("the helper directory is not trusted")
+    return descriptor
+
+
+def running_version(layout: Layout) -> str | None:
+    """The installed version directory this module is executing from, if it is running from one."""
+    try:
+        relative = Path(__file__).resolve().relative_to(layout.lib.resolve())
+    except (OSError, ValueError):
+        return None
+    return relative.parts[0] if relative.parts else None
+
+
+def live_versions(directory: int, layout: Layout) -> set[str]:
+    """The versions a symlink in the helper directory points at, plus the running one."""
+    live = set()
+    for name in os.listdir(directory):
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISLNK(info.st_mode):
+                continue
+            target = Path(os.readlink(name, dir_fd=directory))
+        except OSError:
+            continue
+        if target.is_absolute():
+            try:
+                target = target.relative_to(layout.lib)
+            except ValueError:
+                continue
+        if target.parts:
+            live.add(target.parts[0])
+    running = running_version(layout)
+    if running is not None:
+        live.add(running)
+    return live
+
+
+def complete_versions(directory: int) -> list[tuple[int, str]]:
+    """Every finished helper version in ``directory``, newest first, as (marker mtime, name).
+
+    Only a directory whose name bootstrap generates and that holds a ``.complete`` marker qualifies, so a
+    hand-made directory or an interrupted install is never mistaken for a version to collect.
+    """
+    versions = []
+    for name in os.listdir(directory):
+        if not VERSION_PATTERN.fullmatch(name):
+            continue
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            marker = os.stat(f"{name}/{COMPLETE_MARKER}", dir_fd=directory, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(marker.st_mode):
+            versions.append((marker.st_mtime_ns, name))
+    return sorted(versions, reverse=True)
+
+
+def remove_version_tree(parent: int, name: str) -> None:
+    """Remove one version directory without following a link, refusing anything this account does not own."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError:
+        raise BootstrapError("could not open an old helper version") from None
+    try:
+        if os.fstat(descriptor).st_uid != os.geteuid():
+            raise BootstrapError("an old helper version is not owned by the installing account")
+        for child in sorted(os.listdir(descriptor)):
+            try:
+                info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            except OSError:
+                raise BootstrapError("could not inspect an old helper version") from None
+            if stat.S_ISDIR(info.st_mode):
+                remove_version_tree(descriptor, child)
+                continue
+            try:
+                os.unlink(child, dir_fd=descriptor)
+            except OSError:
+                raise BootstrapError("could not remove an old helper version") from None
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.rmdir(name, dir_fd=parent)
+    except OSError:
+        raise BootstrapError("could not remove an old helper version") from None
+
+
+def collect_old_versions(layout: Layout) -> list[str]:
+    """Remove helper versions that are neither current nor the previous one; returns what it removed.
+
+    The current version, the version the running helper executes from, and every version a symlink in the
+    helper directory points at are always kept, together with the newest other finished version. Repeating
+    it removes nothing more.
+    """
+    directory = _helper_directory(layout)
+    try:
+        versions = complete_versions(directory)
+        keep = live_versions(directory, layout)
+        kept = sum(1 for _age, name in versions if name in keep)
+        for _age, name in versions:
+            if kept >= KEPT_VERSIONS:
+                break
+            if name in keep:
+                continue
+            keep.add(name)  # the newest version nothing points at: the rollback target
+            kept += 1
+        removed = []
+        for _age, name in versions:
+            if name in keep:
+                continue
+            remove_version_tree(directory, name)
+            removed.append(name)
+        if removed:
+            os.fsync(directory)
+        return sorted(removed)
+    finally:
+        os.close(directory)
 
 
 def _installed_sshd_units(system: System) -> set[str]:
@@ -414,22 +638,45 @@ def _install_sshd(layout: Layout, system: System, unit: str, socket: str | None)
     return True
 
 
+def _caddy_binary(caddy: CaddyCommands) -> str:
+    """The Caddy path a refusal names: the runner's own when it has one, else the documented resolution."""
+    configured = getattr(caddy, "caddy", None)
+    return configured if isinstance(configured, str) and configured else caddy_binary()
+
+
+def _caddy_preflight(caddy: CaddyCommands) -> None:
+    """Refuse a host whose Caddy cannot run, before any Shiplord directory or helper is written."""
+    try:
+        probe_caddy(caddy)
+    except RoutingError as error:
+        if error.kind == "unavailable":
+            raise BootstrapError(
+                "Caddy is not installed or cannot be started: install the caddy package or put the binary at "
+                f"{_caddy_binary(caddy)}") from None
+        raise BootstrapError(
+            f"Caddy rejected a minimal configuration ({error.kind}): check the Caddy installation") from None
+
+
 def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands, *,
               lock_timeout: float = 20) -> dict:
-    """Install or update the host. Safe to repeat; returns which steps changed something."""
+    """Install or update the host, refusing an unsupported operating system first.
+
+    Safe to repeat; returns which steps changed something.
+    """
     if layout.prefix == Path("/") and os.geteuid() != 0:
         raise BootstrapError("bootstrap must run as root")
+    supported = check_os(layout.path(OS_RELEASE))
+    if not supported["ok"]:
+        raise BootstrapError(supported["message"])
+    _caddy_preflight(caddy)
     unit, socket = _sshd_preflight(layout, system)
     changed: dict[str, bool] = {}
     for directory, mode in ((layout.path("/etc/shiplord"), 0o755), (layout.registrations, 0o700),
                             (layout.environments, 0o700), (layout.authorized_keys, 0o755),
                             (layout.var, 0o755), (layout.app_state, 0o700), (layout.jobs, 0o700),
-                            (layout.data, 0o755), (layout.releases, 0o755), (layout.lib, 0o755)):
+                            (layout.backups, 0o700), (layout.data, 0o755), (layout.releases, 0o755),
+                            (layout.lib, 0o755)):
         _ensure_dir(directory, mode)
-    name, files = _build_payload(source)
-    changed["code"] = _install_version(layout, name, files)
-    changed["current"] = _switch_current(layout, name)
-    changed["wrappers"] = _install_wrappers(layout)
 
     descriptor = os.open(layout.var, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -444,11 +691,32 @@ def bootstrap(layout: Layout, source: Path, system: System, caddy: CaddyCommands
                 changed["caddy_import"] = RouteManager(layout.caddy_root, lock, caddy).ensure_import().changed
             except RoutingError as error:
                 raise BootstrapError(f"Caddy integration failed ({error.kind}): {error}") from None
+            name, files = _build_payload(source)
+            changed["code"] = _install_version(layout, name, files)
+            changed["current"] = _switch_current(layout, name)
+            changed["wrappers"] = _install_wrappers(layout)
+            changed["boot_recovery"] = _install_boot_unit(layout, system)
             changed["sshd_group"] = _ensure_deployment_group(system)
             changed["sshd"] = _install_sshd(layout, system, unit, socket)
+            collected, warnings = _collect_old_versions(layout)
     finally:
         os.close(descriptor)
-    return {"version": name, "changed": changed}
+    return {"version": name, "changed": changed, "collected": collected,
+            **({"warnings": warnings} if warnings else {})}
+
+
+def _collect_old_versions(layout: Layout) -> tuple[list[str], list[str]]:
+    """Garbage-collect old helper versions after a successful install; a cleanup failure is a warning.
+
+    The host is installed and serving by the time this runs, so a version that cannot be removed must not turn a
+    successful bootstrap into a reported failure. It is reported instead, and the next bootstrap retries it.
+    """
+    try:
+        return collect_old_versions(layout), []
+    except BootstrapError as error:
+        return [], [str(error)]
+    except OSError:
+        return [], ["old helper versions could not be collected"]
 
 
 def main() -> None:
