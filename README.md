@@ -7,7 +7,10 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## What you need
 
 - A computer with Python 3.11 or newer, Git, and OpenSSH.
-- A Linux server with systemd, SSH, administrator access, and Caddy.
+- A Linux server running **Ubuntu 24.04 or later, or Debian 12 or later**, with systemd, SSH, administrator
+  access, and Caddy from its package repository (`/usr/bin/caddy`). The helper needs **Python 3.11 or later at
+  `/usr/bin/python3`**; `shiplord server bootstrap` reads `/etc/os-release` and refuses any other distribution or
+  an older version with a message naming what is supported.
 - Docker on the server if you deploy Docker images.
 - A DNS record that points your app's domain to the server. Shiplord checks DNS but does not change it.
 
@@ -56,7 +59,9 @@ For a native Linux program, use the `google-adk` template above without `--image
 
 ## Deploy an update
 
-For a Docker app, build an image and push it to a registry. Deploy it by its digest, which identifies the exact image, and by the Git commit that produced it:
+Images can live on GitHub Container Registry (the `[github]` table means `ghcr.io/owner/name`) or Docker Hub
+(`[image] repository = "docker.io/namespace/name"`). Deploy either by its digest, which identifies the exact
+image, and by the Git commit that produced it:
 
 ```sh
 shiplord plan \
@@ -70,18 +75,33 @@ shiplord deploy \
 
 `plan` previews the change. It does not deploy. For a native Linux program, build it for the server's CPU and run `shiplord deploy --binary ./dist/orders --commit <commit-sha>`.
 
-If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data.
+To build and deploy in one step from the application's checkout, run `shiplord release`. It refuses a dirty
+working tree, builds and pushes the image for the server's platform with the commit recorded in the image's
+`org.opencontainers.image.revision` label, reads the pushed digest, and deploys that digest. Nothing has to be
+copied by hand. The platform defaults to `linux/amd64`; pass `--platform linux/arm64` for an arm64 server. Use
+`--image-repository` when `ship.toml` has no `[github]` section, and `--tag` to override the default tag (the
+commit SHA).
+
+If the new version fails its health check, Shiplord restores the last working version. It does not undo changes your app made to its saved data. For app data, the supported path is one SQLite database on the app's volume (or data directory); see [Application data](docs/guide.md#application-data).
 
 ## Check or undo a deployment
 
 ```sh
 shiplord status
 shiplord logs --tail 100
+shiplord logs --follow --timeout 300      # Ctrl-C stops it sooner
 shiplord rollback
 shiplord recover
 ```
 
-Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
+From any directory, `shiplord recover <app> --server <alias>` reconciles a named application without a checkout;
+`shiplord status` prints that exact command when it finds unfinished work.
+
+Use `shiplord env set --from-file .env.production` to set app secrets, or `shiplord env set KEY=VALUE` to change
+one variable without rewriting the rest. Preview the key names it would add or remove with `shiplord env diff
+--from-file .env.production`. Shiplord does not print or log secret values; a value passed on the command line does
+appear in your shell history and local process list, so prefer `--from-file` for secrets. Run `shiplord restart` to
+apply the current environment to the running release without a new commit.
 
 ## Learn more
 

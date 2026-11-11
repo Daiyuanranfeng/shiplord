@@ -22,6 +22,8 @@ from .shutdown import ShutdownError, check_budget, check_recovery_budget, policy
 from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
+CANDIDATE_LOG_LINES = 100  # the tail a failed candidate's crash output needs
+CANDIDATE_LOG_BYTES = 16384  # the outcome is stored in a job record bounded by MAX_RECORD_BYTES (64 KiB)
 SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover"}
 
 
@@ -78,9 +80,6 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
-        if "owner_uid" in candidate["configuration"].get("storage", {}):
-            # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
-            raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
         if candidate["artifact"]["kind"] == "docker":
             if candidate["artifact"]["image"].split("@", 1)[0] != registration["image_repository"]:
                 raise StateError("the image repository is not the one registered for this application")
@@ -176,6 +175,38 @@ class Deployer:
         return {"action": "deploy", "restarts_application": current is not None, **storage, **shutdown,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
+    def restart(self, request_id: str) -> Outcome:
+        """Apply the application's current environment to the committed release, without a new release."""
+        try:
+            refusal = self._gate(request_id)
+            if refusal:
+                return refusal
+            committed = self.state.read_state()
+        except StateError as error:
+            return Outcome("failed", 1, {"error": "state_unreadable", "message": str(error)})
+        current = committed["current"]
+        if current is None:
+            return self._nothing_deployed()
+        return self._transition(request_id, current, committed, restart=True)
+
+    def restart_preflight(self, request_id: str) -> Outcome | None:
+        """Cheap synchronous checks before a restart job is created; None means the request may proceed."""
+        try:
+            refusal = self._gate(request_id)
+            if refusal:
+                return refusal
+            if self.state.read_state()["current"] is None:
+                return self._nothing_deployed()
+            return None
+        except StateError as error:
+            return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
+
+    @staticmethod
+    def _nothing_deployed() -> Outcome:
+        return Outcome("rejected", 2, {"error": "nothing_deployed",
+                                       "message": "no release is deployed, so there is nothing to restart; "
+                                                  "deploy a release first"})
+
     def rollback(self, request_id: str) -> Outcome:
         try:
             refusal = self._gate(request_id)
@@ -258,7 +289,7 @@ class Deployer:
                 "domain": self.registration["api_domain"]}
 
     # the transaction ---------------------------------------------------------
-    def _transition(self, request_id: str, candidate: dict, before: dict) -> Outcome:
+    def _transition(self, request_id: str, candidate: dict, before: dict, *, restart: bool = False) -> Outcome:
         try:
             self._validate_budget(candidate, before["current"])
         except StateError as error:
@@ -298,6 +329,8 @@ class Deployer:
             if isinstance(failure, RuntimeFailure) and failure.intervention_required:
                 # The outgoing process was signalled and may still be draining: restoring would restart or remove it.
                 return self._intervention(failure, probes)
+            if restart:
+                return self._restart_failed(failure, probes, candidate)
             return self._restore(failure, probes, candidate, before)
         try:
             committed = self.state.record_commit()
@@ -406,6 +439,24 @@ class Deployer:
         except RuntimeFailure as failure:
             return [str(failure)]
 
+    def _capture_candidate_logs(self, candidate: dict) -> dict:
+        """The failed candidate's last log lines, read before the restore removes its container.
+
+        A candidate with no container reports nothing. A capture that fails is a note in the detail, never a restore
+        failure: a rollback that restored service must still report that result.
+        """
+        read = getattr(self.runtime, "release_logs", None)
+        if read is None or candidate["artifact"]["kind"] != "docker":
+            return {}
+        captured = {"tail": CANDIDATE_LOG_LINES, "max_bytes": CANDIDATE_LOG_BYTES}
+        try:
+            output = read(self.registration, candidate, CANDIDATE_LOG_LINES, max_bytes=CANDIDATE_LOG_BYTES)
+        except RuntimeFailure as failure:
+            return {"candidate_logs": {**captured, "error": str(failure)}}
+        if output is None:
+            return {}
+        return {"candidate_logs": {**captured, "output": output}}
+
     @staticmethod
     def _shared_resource(release: dict, retained: list[dict | None]) -> bool:
         """Whether discarding ``release`` would remove a resource one of the retained releases still uses."""
@@ -425,6 +476,8 @@ class Deployer:
     def _restore(self, failure: Exception, probes: dict, candidate: dict, before: dict) -> Outcome:
         """Return to the last committed release; clear the journal only after verifying that."""
         failed = {"error": "deployment_failed", **self._describe(failure), "probes": probes}
+        # The restore stops and removes the candidate's container, so its crash output must be read before that.
+        failed.update(self._capture_candidate_logs(candidate))
         try:
             journal = self.state.read_journal()
             target = self.state.reconciliation_target()
@@ -439,6 +492,20 @@ class Deployer:
         if target is None:
             return Outcome("failed", 1, failed)
         return Outcome("rolled_back", 5, failed)
+
+    def _restart_failed(self, failure: Exception, probes: dict, candidate: dict) -> Outcome:
+        """A restart that did not come back keeps its journal and asks for a person.
+
+        Restoring the "previous" release would run the same environment file that just failed, so reporting
+        ``rolled_back`` would claim a service restoration that did not happen. The runtime may already have been
+        replaced, so the journal stays until a verified recovery.
+        """
+        failed = {"error": "restart_failed", **self._describe(failure), "probes": probes}
+        failed.update(self._capture_candidate_logs(candidate))
+        failed.update(self._shutdown_report())
+        failed["recovery"] = ("the application did not come back with the new environment; fix the value and run "
+                              "`shiplord recover`")
+        return Outcome("intervention_required", 6, failed)
 
     @staticmethod
     def _describe(failure: Exception) -> dict:

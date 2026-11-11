@@ -145,6 +145,8 @@ class ScriptedDocker:
             return self.fail[key]
         if key == "volume inspect":
             return self.volume
+        if key == "image inspect":  # a start checks for the release's image before it replaces anything
+            return CommandResult(0, "sha256:" + ID_A + "\n")
         if verb == "ps":
             return CommandResult(0, "\n".join(self.containers) + "\n")
         if verb == "inspect":

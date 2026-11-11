@@ -63,7 +63,7 @@ class NativeCommandTests(ClientTestCase):
 
     def deploy(self, **overrides):
         options = dict(binary=self.binary_path, commit=COMMIT, sequence=1000, request_id="req-1", timeout=60,
-                       public_check=lambda domain, path: {"ok": True, "status": 200, "error": None})
+                       public_check=lambda domain, path, **kwargs: {"ok": True, "status": 200, "error": None})
         options.update(overrides)
         return commands.deploy_application(native_manifest(), self.client, **options)
 

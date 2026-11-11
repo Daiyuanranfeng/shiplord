@@ -29,12 +29,17 @@ MAX_PENDING_JOBS = 4  # unfinished jobs per application; further submissions are
 INTERRUPTED_SECONDS = MAX_RUNTIME_SECONDS + 300
 _UNIT_ID_LENGTH = 24  # a request ID that fits stays readable in the unit name; a longer one is hashed whole
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
-ACTIONS = ("deploy", "rollback", "recover", "backup", "restore")
+ACTIONS = ("deploy", "rollback", "restart", "recover", "backup", "restore")
 TERMINAL = ("finished",)
 
 
 class JobError(StateError):
     """A job record is invalid, or the job cannot be created or launched."""
+
+
+def valid_job_id(value: object) -> bool:
+    """Whether a value can name a job; request IDs and job IDs share one grammar."""
+    return isinstance(value, str) and bool(_ID.fullmatch(value))
 
 
 def unit_name(application_id: str, request_id: str) -> str:
@@ -68,7 +73,7 @@ class JobStore:
 
     @staticmethod
     def _name(request_id: str) -> str:
-        if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
+        if not valid_job_id(request_id):
             raise JobError("invalid job ID")
         return request_id + ".json"
 

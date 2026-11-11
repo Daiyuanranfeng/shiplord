@@ -36,7 +36,13 @@ run_unit() {
     su -s /bin/bash tester -c "set -o pipefail; cd /work && PATH=$PATH python -m unittest discover -s tests 2>&1 | tail -30"'
 }
 run_caddy()  { oneshot -- 'env SHIPLORD_TEST_CADDY=1 python -m unittest tests.test_caddy_integration -v 2>&1 | tail -30'; }
-run_host()   { oneshot -- 'env SHIPLORD_TEST_HOST=1 python -m unittest tests.test_host_integration -v 2>&1 | tail -40'; }
+run_host() {
+  oneshot -- 'env SHIPLORD_TEST_HOST=1 python -m unittest tests.test_host_integration -v 2>&1 | tail -40'
+  # The same code path against a host that reports an unsupported release: the file is mounted over
+  # /etc/os-release because an Ubuntu 22.04 image has Python 3.10 and cannot import the helper at all.
+  oneshot -v "$here/os-release-ubuntu-22.04:/etc/os-release:ro" -- \
+    'env SHIPLORD_TEST_UNSUPPORTED_OS=1 python -m unittest tests.test_host_integration.UnsupportedOsTests -v 2>&1 | tail -20'
+}
 run_docker() {
   # The backup test reads and wipes the volume through its mountpoint, so the daemon's root must be reachable.
   local docker_root

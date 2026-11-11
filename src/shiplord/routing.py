@@ -42,10 +42,14 @@ _PRIOR_MAIN = ".prior-Caddyfile"
 _VALIDATE_PREFIX = ".shiplord-validate-"
 SYSTEMCTL = "/usr/bin/systemctl"
 CADDY_UNIT = "caddy"
+DEFAULT_CADDY_BINARY = "/usr/bin/caddy"  # the packaged path; SHIPLORD_CADDY_BINARY overrides it
+CADDY_BINARY_VARIABLE = "SHIPLORD_CADDY_BINARY"
 PACKAGED_ENVIRONMENT_FILES = (Path("/etc/default/caddy"), Path("/etc/sysconfig/caddy"))
 MAX_ENVIRONMENT_BYTES = 64 * 1024
 _REDACTED = "[shiplord:redacted]"
 MIN_REDACTED_LENGTH = 4  # shorter values would replace ordinary words and destroy the diagnostic
+# A fixed, valid configuration that proves Caddy can run at all; it is never written to the host's Caddy root.
+CADDY_PROBE = b'http://127.0.0.1:1 {\n\trespond "ok"\n}\n'
 
 
 class RoutingError(Exception):
@@ -66,6 +70,29 @@ class RouteResult:
 class CaddyCommands(Protocol):
     def validate(self, config: Path) -> None: ...
     def reload(self) -> None: ...
+
+
+# --- The Caddy binary -----------------------------------------------------
+
+def caddy_binary(environ: Mapping[str, str] | None = None) -> str:
+    """The Caddy executable to run: ``SHIPLORD_CADDY_BINARY`` when it is absolute, else the packaged path.
+
+    The helper runs this path as root, so a value that is not an absolute path is ignored rather than resolved
+    against a working directory this module did not choose. The variable is read from the environment of the
+    process that runs the helper: the local CLI never forwards it, ``sudo`` drops it unless the host keeps it,
+    and the Caddy child process never receives it. A total function by design: the admin helper constructs
+    ``SubprocessCaddy`` where a raised ``RoutingError`` would escape as a crashed protocol response.
+    """
+    configured = (os.environ if environ is None else environ).get(CADDY_BINARY_VARIABLE, "")
+    if configured and os.path.isabs(configured) and "\0" not in configured:
+        return configured
+    return DEFAULT_CADDY_BINARY
+
+
+def _runner_environment(commands: CaddyCommands) -> Mapping[str, str] | None:
+    """The service environment the command runner can report, or None when it exposes none."""
+    provider = getattr(commands, "service_environment", None)
+    return provider() if callable(provider) else None
 
 
 # --- The service environment ----------------------------------------------
@@ -205,14 +232,15 @@ def _redact(text: str, values: Iterable[str]) -> str:
 
 
 class SubprocessCaddy:
-    """Run Caddy and systemd through fixed executables; no shell, fixed defaults, and the service's variables."""
+    """Run Caddy and systemd through resolved executables; no shell, fixed defaults, and the service's variables."""
 
     ENVIRONMENT = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
 
-    def __init__(self, caddy: str = "/usr/bin/caddy", systemctl: str = SYSTEMCTL,
+    def __init__(self, caddy: str | None = None, systemctl: str = SYSTEMCTL,
                  timeout: float = COMMAND_TIMEOUT_SECONDS,
                  service_environment: Callable[[], Mapping[str, str] | None] | None = None):
-        self.caddy, self.systemctl, self.timeout = caddy, systemctl, timeout
+        # None means "use the documented resolution", so bootstrap and validation cannot disagree about the path.
+        self.caddy, self.systemctl, self.timeout = caddy_binary() if caddy is None else caddy, systemctl, timeout
         # Injected so a caller that already knows the service environment can supply it; the default reads only
         # the documented service sources, never this process's environment.
         self.service_environment = service_environment or _host_service_environment
@@ -237,10 +265,25 @@ class SubprocessCaddy:
         try:
             result = run_command(argv, timeout=self.timeout, env=env or self.ENVIRONMENT)
         except CommandError as error:
-            message = "Caddy command timed out" if error.kind == "timeout" else "could not start the Caddy command"
-            raise RoutingError(message, kind, detail=_redact(error.output, secrets)) from None
+            if error.kind == "timeout":
+                raise RoutingError("Caddy command timed out", kind, detail=_redact(error.output, secrets)) from None
+            # A command that never started proves nothing about a Caddyfile, so it is not the caller's kind.
+            raise RoutingError(f"could not start {argv[0]}", "unavailable",
+                               detail=_redact(error.output, secrets)) from None
         if result.code != 0:
             raise RoutingError("Caddy command failed", kind, detail=_redact(result.output, secrets))
+
+
+def probe_caddy(commands: CaddyCommands) -> None:
+    """Prove the Caddy command can run, before anything on the host is written.
+
+    The configuration is fixed and trivial, so a refusal means Caddy itself is unusable rather than that an
+    operator's Caddyfile is wrong. A missing or unstartable binary is reported as ``unavailable``.
+    """
+    with tempfile.TemporaryDirectory(prefix="shiplord-caddy-probe-") as directory:
+        config = Path(directory) / "Caddyfile"
+        config.write_bytes(CADDY_PROBE)
+        commands.validate(config)
 
 
 def render_route(domain: str, port: int) -> bytes:
@@ -306,21 +349,32 @@ def _lines(text: str) -> Iterator[tuple[int, list[str], list[bool], int]]:
         raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
 
 
-def _address_tokens(tokens: list[str], quoted: list[bool]) -> tuple[list[str], bool]:
+_VARIABLE = re.compile(r"\{\$([^}:]+)(?::([^}]*))?\}")
+_ARGUMENT = re.compile(r"\{args\[(\d+)\]\}")
+_ARGUMENTS_ALL = "{args[:]}"
+_BLOCK_ARGUMENT = "{block}"
+
+
+def _address_tokens(tokens: list[str], quoted: list[bool],
+                    expand: Callable[[str], str] | None = None) -> tuple[list[str], bool]:
     """Return the tokens on this line that Caddy reads as a site address, and whether it opens a block.
 
     A site block begins with its addresses and ends them at the opening brace, so a directive
     argument such as an upstream, a header value, or a request matcher is never an address, and a
-    hostname inside one does not claim the site. A token that cannot be classified is refused.
+    hostname inside one does not claim the site. An address may read the service environment or the arguments
+    of the ``import`` that reached this text, so ``expand`` resolves a token before it is classified; a token
+    that still cannot be classified is refused.
     """
     addresses: list[str] = []
     for token, was_quoted in zip(tokens, quoted):
-        if "{" in token or "}" in token:
-            if not was_quoted and token in {"{", "}"}:
-                return addresses, token == "{"  # the block body starts here; the rest is directives
-            raise RoutingError("cannot determine hostnames from a placeholder", "uninspectable")
+        if not was_quoted and token in {"{", "}"}:
+            return addresses, token == "{"  # the block body starts here; the rest is directives
         if not was_quoted and token.startswith(("(", "&(")) and token.endswith(")"):
             continue  # a snippet or named-route definition names no site
+        if expand is not None:
+            token = expand(token)
+        if "{" in token or "}" in token:
+            raise RoutingError("cannot determine hostnames from a placeholder", "uninspectable")
         addresses.append(token)
     return addresses, False
 
@@ -340,35 +394,150 @@ def _canonical_host(host: str) -> str:
         return host
 
 
-class _Inspection:
-    def __init__(self, domain: str, own_glob: str, allow_wildcard_overlap: bool):
-        self.domain, self.own_glob, self.allow_wildcard = domain, own_glob, allow_wildcard_overlap
+@dataclass(frozen=True)
+class _Import:
+    """A top-level ``import``: the snippet name or file pattern, and the arguments passed to it."""
 
-    def scan(self, text: str) -> list[str]:
-        """Check one file for hostname takeover; return path-style imports.
+    pattern: str
+    arguments: tuple[str, ...]
+
+
+@dataclass
+class _Snippet:
+    """A snippet definition, with each body line's depth relative to the definition line."""
+
+    name: str
+    lines: list[tuple[tuple[str, ...], tuple[bool, ...], int]]
+
+
+class _Inspection:
+    def __init__(self, domain: str, own_glob: str, allow_wildcard_overlap: bool,
+                 environment: Mapping[str, str] | None = None):
+        self.domain, self.own_glob, self.allow_wildcard = domain, own_glob, allow_wildcard_overlap
+        self.environment = environment  # None means the service environment could not be read
+        self.snippets: dict[str, _Snippet] = {}  # definitions seen so far, with the bodies to inspect
+
+    def scan(self, text: str, arguments: tuple[str, ...] = (), context: str = "") -> list[_Import]:
+        """Check one file for hostname takeover; return its top-level imports.
 
         Only a site block declares addresses, so a hostname is compared only where one can be
         declared: on a depth-0 line, before its opening brace. A file whose single site block
         omits the braces reads its first line as the address list and the rest as directives.
+        ``arguments`` are the values the ``import`` that reached this file passed, which Caddy
+        substitutes into ``{args[N]}`` here and in no nested import; ``context`` names that import
+        in a refusal.
         """
-        imports: list[str] = []
+        lines = list(_lines(text))
+        self._collect_snippets(lines)
+        expand = self._expander(arguments, context)
+        imports: list[_Import] = []
         body = continuing = False
-        for _number, tokens, quoted, depth in _lines(text):
+        for _number, tokens, quoted, depth in lines:
             if depth != 0 or body or not tokens:
                 continue
             if tokens[0] == "import" and not quoted[0]:
-                imports.extend(tokens[1:])  # a top-level import substitutes site blocks in place
+                if len(tokens) < 2:
+                    raise RoutingError("cannot inspect the Caddy configuration", "uninspectable")
+                imports.append(_Import(tokens[1], tuple(tokens[2:])))  # a top-level import substitutes in place
                 continue
-            addresses, opened = _address_tokens(tokens, quoted)
-            for token in addresses:
-                for address in _addresses(token):
-                    if address == self.domain:
-                        raise RoutingError("hostname is already served by another configuration", "conflict")
-                    if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
-                        raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
+            addresses, opened = _address_tokens(tokens, quoted, expand)
+            self._compare(addresses)
             continuing = not opened and tokens[-1].endswith(",")  # Caddy continues the address list
             body = not opened and not continuing  # braces are optional for a single site block
         return imports
+
+    def _collect_snippets(self, lines: list[tuple[int, list[str], list[bool], int]]) -> None:
+        """Record every snippet definition in this file before its imports are resolved, so an import can
+        inspect the body a later line defines even though Caddy itself requires a definition before its use.
+        """
+        body: list | None = None
+        for _number, tokens, quoted, depth in lines:
+            if body is not None and depth > 0:
+                body.append((tuple(tokens), tuple(quoted), depth - 1))
+                continue
+            body = None
+            if (depth == 0 and tokens and not quoted[0]
+                    and tokens[0].startswith("(") and tokens[0].endswith(")")):
+                snippet = self.snippets.setdefault(tokens[0][1:-1], _Snippet(tokens[0][1:-1], []))
+                body = snippet.lines
+
+    def inspect_snippet(self, statement: _Import) -> None:
+        """Compare the site addresses a snippet body declares, with this import's arguments substituted.
+
+        A snippet body is a directive set, so only a body line that opens a block declares addresses: the
+        tokens before its ``{`` are the address list, exactly as a site block in a file. A body line with no
+        opening brace is a directive and declares no site, which keeps a directive-only snippet such as
+        ``(common) { encode gzip }`` working when it is imported with an argument.
+        """
+        expand = self._expander(statement.arguments, f"the snippet {statement.pattern}")
+        for tokens, quoted, depth in self.snippets[statement.pattern].lines:
+            if depth != 0 or not tokens:
+                continue
+            addresses, opened = _address_tokens(list(tokens), list(quoted), expand)
+            if opened:
+                self._compare(addresses)
+
+    def _compare(self, addresses: list[str]) -> None:
+        for token in addresses:
+            for address in _addresses(token):
+                if address == self.domain:
+                    raise RoutingError("hostname is already served by another configuration", "conflict")
+                if address.startswith("*.") and self.domain.endswith(address[1:]) and not self.allow_wildcard:
+                    raise RoutingError("hostname overlaps an existing wildcard site", "conflict")
+
+    def _expander(self, arguments: tuple[str, ...] = (), context: str = "") -> Callable[[str], str]:
+        """Resolve an address token's import arguments and service variables before it is classified."""
+        def expand(token: str) -> str:
+            return self._expand(token, arguments, context)
+        return expand
+
+    def _expand(self, token: str, arguments: tuple[str, ...] = (), context: str = "") -> str:
+        """Resolve ``{args[N]}`` from the import's arguments and ``{$NAME}`` from the Caddy service environment."""
+        if "{args[" in token:
+            token = self._expand_arguments(token, arguments, context)
+        if "{$" not in token:
+            return token
+
+        def replace(match: re.Match) -> str:
+            name, default = match.group(1), match.group(2)
+            marker = "{$" + name + "}"
+            if self.environment is None:
+                raise RoutingError(
+                    f"the Caddy service environment cannot be read, so the site address variable {marker} "
+                    "cannot be resolved", "uninspectable")
+            value = self.environment.get(name, default)
+            if value is None:
+                raise RoutingError(
+                    f"the Caddy service environment does not set the site address variable {marker}; set it "
+                    "for the caddy service and retry", "uninspectable")
+            if not value or any(char.isspace() for char in value) or "{" in value or "}" in value:
+                raise RoutingError(
+                    f"the site address variable {marker} does not expand to a single address", "uninspectable")
+            return value
+
+        return _VARIABLE.sub(replace, token)
+
+    @staticmethod
+    def _expand_arguments(token: str, arguments: tuple[str, ...], context: str) -> str:
+        """Substitute ``{args[N]}`` and ``{args[:]}`` the way Caddy does for the import that reached this text."""
+        where = f"the import of {context}" if context else "a site address"
+
+        def replace(match: re.Match) -> str:
+            index = int(match.group(1))
+            if index >= len(arguments):
+                raise RoutingError(
+                    f"{where} reads {{args[{index}]}}, but it provides no such argument; write the imported "
+                    "site addresses literally", "uninspectable")
+            return arguments[index]
+
+        token = _ARGUMENT.sub(replace, token)
+        if _BLOCK_ARGUMENT in token:
+            raise RoutingError(f"{where} reads {_BLOCK_ARGUMENT}, which cannot be inspected", "uninspectable")
+        if _ARGUMENTS_ALL in token:
+            if len(arguments) != 1:
+                raise RoutingError(f"{where} reads {_ARGUMENTS_ALL}, which is not a single address", "uninspectable")
+            token = token.replace(_ARGUMENTS_ALL, arguments[0])
+        return token
 
     def own_import_lines(self, text: str) -> list[int]:
         found = []
@@ -413,11 +582,29 @@ def _read_file(directory: int, name: str, *, trusted: bool) -> _CaddyFile | None
 
 
 def _read_path(path: str) -> str:
+    """Read an imported route file, following a symlink such as Debian's ``sites-enabled`` entry.
+
+    Only an imported file may be a link: the live Caddyfile, its prior copy, and every file the transaction
+    writes are still opened with ``O_NOFOLLOW`` by ``_read_file``. The descriptor is checked rather than the
+    path, so a replacement between the check and the read cannot swap in an untrusted target. A loop, a
+    directory, a device, an oversized target, a writable target, and another account's target are refused with
+    the same uninspectable refusal, and no content is echoed.
+    """
     try:
-        info = os.lstat(path)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
-            raise RoutingError("an imported Caddy file cannot be inspected", "uninspectable")
-        with open(path, "rb") as file:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)  # follows a symlink; O_NONBLOCK never waits on a FIFO
+    except OSError:
+        raise RoutingError("an imported Caddy file cannot be inspected", "uninspectable") from None
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise RoutingError("an imported Caddy file cannot be inspected", "uninspectable") from None
+    if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES
+            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022):
+        os.close(descriptor)
+        raise RoutingError("an imported Caddy file cannot be inspected", "uninspectable")
+    try:
+        with os.fdopen(descriptor, "rb") as file:
             return file.read(MAX_CONFIG_BYTES).decode("utf-8")
     except (OSError, UnicodeDecodeError):
         raise RoutingError("an imported Caddy file cannot be inspected", "uninspectable") from None
@@ -508,6 +695,8 @@ class RouteManager:
             try:
                 self.commands.validate(self.root / name)
             except RoutingError as error:
+                if error.kind == "unavailable":
+                    raise  # Caddy never ran, so it cannot have rejected the Caddyfile
                 raise RoutingError("Caddy rejected the Caddyfile with the managed import", "validation",
                                    detail=error.detail) from None
             finally:
@@ -527,6 +716,53 @@ class RouteManager:
         finally:
             os.close(root)
             os.close(ship)
+
+    def remove_import(self) -> RouteResult:
+        """Remove the managed import from the main Caddyfile once, validated and restorable."""
+        if not self.lock.held:
+            raise RoutingError("host lock is required", "precondition")
+        try:
+            root = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise RoutingError("Caddy directory is unavailable", "precondition") from None
+        try:
+            _directory(root)
+            token = secrets.token_hex(8)
+            main, _completed = self._settle_prior(root)
+            if main is None:
+                raise RoutingError("the main Caddyfile is missing", "precondition")
+            text = main.data.decode("utf-8", "replace")
+            found = _Inspection("", self.own_glob, False).own_import_lines(text)
+            if not found:
+                return RouteResult(changed=False)
+            if len(found) > 1:
+                raise RoutingError("the main Caddyfile imports the managed routes more than once", "precondition")
+            lines = text.splitlines()
+            del lines[found[0]]
+            candidate = ("\n".join(lines) + "\n" if lines else "").encode()
+            name = _VALIDATE_PREFIX + token
+            self._create(root, name, candidate, preserve=main)
+            try:
+                self.commands.validate(self.root / name)
+            except RoutingError as error:
+                raise RoutingError("Caddy rejected the Caddyfile without the managed import", "validation",
+                                   detail=error.detail) from None
+            finally:
+                self._unlink(root, name)
+            temp = _TEMP_PREFIX + "Caddyfile-" + token
+            self._create(root, temp, candidate, preserve=main)
+            os.link("Caddyfile", _PRIOR_MAIN, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+            self._publish(root, temp, "Caddyfile")
+            try:
+                self.commands.reload()
+            except RoutingError as error:
+                self._restore(root, "Caddyfile", _PRIOR_MAIN, True, error)
+                raise RoutingError("Caddy rejected the Caddyfile without the managed import; it was restored",
+                                   "reload", detail=error.detail) from None
+            self._unlink(root, _PRIOR_MAIN)
+            return RouteResult(changed=True)
+        finally:
+            os.close(root)
 
     # implementation
     def _with_import(self, data: bytes) -> bytes:
@@ -626,7 +862,8 @@ class RouteManager:
         if main is None:
             raise RoutingError("the main Caddyfile is missing", "precondition")
         main_text = main.data.decode("utf-8", "replace")
-        inspection = _Inspection(domain or "", self.own_glob, self.allow_wildcard_overlap)
+        inspection = _Inspection(domain or "", self.own_glob, self.allow_wildcard_overlap,
+                                 _runner_environment(self.commands) if domain is not None else None)
         import_lines = inspection.own_import_lines(main_text)
         if len(import_lines) != 1:
             raise RoutingError("the main Caddyfile must import the managed routes exactly once", "precondition")
@@ -683,25 +920,39 @@ class RouteManager:
     def _scan_hostnames(self, inspection: _Inspection, main_text: str, others: dict[str, str]) -> None:
         for text in others.values():
             inspection.scan(text)
-        seen: set[str] = set()
-        queue = [(main_text, str(self.root), 0)]
-        while queue:
-            text, base, depth = queue.pop()
-            for argument in inspection.scan(text):
-                if "/" not in argument and "*" not in argument and "." not in argument:
-                    continue  # snippet name
-                pattern = os.path.normpath(argument if os.path.isabs(argument) else os.path.join(base, argument))
-                if pattern == self.own_glob:
+        self._scan_imports(inspection, main_text, str(self.root), 0, (), set())
+
+    def _scan_imports(self, inspection: _Inspection, text: str, base: str, depth: int,
+                      arguments: tuple[str, ...], seen: set[tuple[str, tuple[str, ...]]],
+                      context: str = "") -> None:
+        """Follow imports in textual order, as Caddy reads them, so a snippet is known when it is imported."""
+        for statement in inspection.scan(text, arguments, context):
+            name = statement.pattern
+            if name in inspection.snippets:
+                inspection.inspect_snippet(statement)  # compare the addresses its body declares
+                continue
+            if "/" not in name and "*" not in name and "." not in name:
+                if not statement.arguments:
+                    continue  # no path shape and no definition: Caddy will try it as a file and fail validation
+                if not os.path.isfile(os.path.join(base, name)):
+                    raise RoutingError(
+                        f"the Caddy configuration imports {name} with arguments, but no snippet or file of "
+                        "that name was found; write the imported site addresses literally", "uninspectable")
+                pattern = os.path.normpath(os.path.join(base, name))
+            else:
+                pattern = os.path.normpath(name if os.path.isabs(name) else os.path.join(base, name))
+            if pattern == self.own_glob:
+                continue
+            if depth + 1 > MAX_IMPORT_DEPTH:
+                raise RoutingError("Caddy imports are nested too deeply to inspect", "uninspectable")
+            for path in sorted(glob.glob(pattern)):
+                if (path, statement.arguments) in seen:
                     continue
-                if depth + 1 > MAX_IMPORT_DEPTH:
-                    raise RoutingError("Caddy imports are nested too deeply to inspect", "uninspectable")
-                for path in sorted(glob.glob(pattern)):
-                    if path in seen:
-                        continue
-                    seen.add(path)
-                    if len(seen) > MAX_IMPORTED_FILES:
-                        raise RoutingError("Caddy imports too many files to inspect", "uninspectable")
-                    queue.append((_read_path(path), os.path.dirname(path), depth + 1))
+                seen.add((path, statement.arguments))
+                if len(seen) > MAX_IMPORTED_FILES:
+                    raise RoutingError("Caddy imports too many files to inspect", "uninspectable")
+                self._scan_imports(inspection, _read_path(path), os.path.dirname(path), depth + 1,
+                                  statement.arguments, seen, f"the file {name}")
 
     def _validate(self, root: int, main: _CaddyFile, import_line: int, imports: list[str]) -> None:
         lines = main.data.decode("utf-8", "replace").splitlines()
@@ -713,6 +964,8 @@ class RouteManager:
             try:
                 self.commands.validate(self.root / name)
             except RoutingError as error:
+                if error.kind == "unavailable":
+                    raise  # Caddy never ran, so it cannot have rejected the candidate or the existing file
                 baseline_ok = True
                 try:
                     self.commands.validate(self.root / "Caddyfile")

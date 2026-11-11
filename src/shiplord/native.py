@@ -14,10 +14,11 @@ import secrets
 import shutil
 import stat
 from pathlib import Path
+from typing import Callable
 
 from .environment import EnvironmentError_, load_environment_file
 from .layout import Layout, runtime_user
-from .runtime import RuntimeFailure, release_id
+from .runtime import DEFAULT_FOLLOW_SECONDS, RuntimeFailure, release_id
 from .system import CommandError, System
 
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -237,24 +238,77 @@ class NativeRuntime:
             raise RuntimeFailure("the service could not be stopped", "stop", result.output)
 
     def is_running(self, registration: dict, release: dict) -> bool:
+        """Is the service running the unit and environment this release's start writes?
+
+        The unit name does not encode configuration, so a marker and an active state alone could accept a service
+        still limited to the previous memory or serving the previous origins. Every value the start writes is
+        compared. An unreadable environment file cannot be compared, but the unit still decides, and a start would
+        fail on that same file: a running release must not look down for something a restart could not fix.
+        """
+        app = registration["application_id"]
         try:
-            marker = MARKER.search(self.unit_path(registration).read_text())
+            unit = self.unit_path(registration).read_bytes()
         except OSError:
+            return False  # not running: the following start reports why a file cannot be used
+        if unit != render_unit(self.layout, registration, release).encode():
             return False
-        if not marker or marker.group(1) != release_id(release):
+        try:
+            custom = load_environment_file(self.layout.environments / app / "app.env")
+        except EnvironmentError_:
+            environment_ok = True  # unreadable: cannot render what a start would write; the unit above decides
+        else:
+            try:
+                environment = (self.layout.environments / app / "native.env").read_bytes()
+            except OSError:
+                return False
+            environment_ok = environment == render_environment(registration, release, custom).encode()
+        if not environment_ok:
             return False
         result = self._systemctl(["show", "--property=ActiveState,SubState", self.unit_name(registration)], "inspect")
         state = dict(line.split("=", 1) for line in result.output.splitlines() if "=" in line)
         return result.code == 0 and state.get("ActiveState") == "active" and state.get("SubState") == "running"
 
-    def logs(self, registration: dict, tail: int) -> str:
+    def logs(self, registration: dict, release: dict | None, tail: int, *, since: str | None = None,
+             timestamps: bool = False) -> str:
+        """The journal of the current release's unit only; a unit left by another release is not read."""
+        if not self._current_unit(registration, release):
+            return ""
         tail = max(1, min(int(tail), MAX_LOG_LINES))
+        argv = [JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail)]
+        if since is not None:
+            argv.append(f"--since=-{since}")
+        argv += ["--no-pager", "--output", "short-iso-precise" if timestamps else "cat"]
         try:
-            result = self.system.run([JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail),
-                                      "--no-pager", "--output", "cat"], timeout=30, max_output=MAX_LOG_BYTES)
+            result = self.system.run(argv, timeout=30, max_output=MAX_LOG_BYTES)
         except CommandError:
             return ""
         return result.output if result.code == 0 else ""
+
+    def follow_logs(self, registration: dict, release: dict | None, *, tail: int, since: str | None = None,
+                    timestamps: bool = False, duration: int = DEFAULT_FOLLOW_SECONDS,
+                    emit: Callable[[str], None] = lambda chunk: None) -> str:
+        """Stream the current release's journal until ``duration`` expires; returns the stop reason."""
+        if not self._current_unit(registration, release):
+            return "unavailable"
+        tail = max(1, min(int(tail), MAX_LOG_LINES))
+        argv = [JOURNALCTL, "--unit", self.unit_name(registration), "--lines", str(tail), "--follow"]
+        if since is not None:
+            argv.append(f"--since=-{since}")
+        argv += ["--no-pager", "--output", "short-iso-precise" if timestamps else "cat"]
+        try:
+            return self.system.stream(argv, timeout=duration, on_chunk=emit)
+        except CommandError as error:
+            raise RuntimeFailure(f"journalctl could not complete ({error.kind})", "logs") from None
+
+    def _current_unit(self, registration: dict, release: dict | None) -> bool:
+        if release is None:
+            return False
+        try:
+            marker = MARKER.search(self.unit_path(registration).read_text())
+        except OSError:
+            return False
+        return bool(marker and marker.group(1) == release_id(release))
+
 
     def discard(self, registration: dict, release: dict) -> list[str]:
         directory = self.release_binary(registration, release).parent

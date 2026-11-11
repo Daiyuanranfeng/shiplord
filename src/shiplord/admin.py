@@ -15,14 +15,15 @@ from typing import BinaryIO
 from .framing import read_frame, write_frame
 from .layout import Layout
 from .manifest import ManifestError
-from .protocol import ADMIN_ACTIONS, PROTOCOL_VERSION, ProtocolError, validate_request
+from .protocol import ADMIN_ACTIONS, ADMIN_HOSTWIDE_ACTIONS, PROTOCOL_VERSION, ProtocolError, validate_request
 from .serverdoctor import application_inventory, server_doctor
 from .provision import ProvisionError, deprovision, manage_environment, manage_key, manage_registry, provision
 from .registry import Registry
 from .retire import make_retirer
 from .release_state import HostLock, StateError
-from .routing import SubprocessCaddy
+from .routing import RouteManager, RoutingError, SubprocessCaddy
 from .system import HostSystem, System
+from .uninstall import UninstallError, UninstallRefused, uninstall
 
 
 class AdminDenied(Exception):
@@ -36,7 +37,7 @@ READ_ONLY_ACTIONS = frozenset({"doctor", "apps"})
 
 def parse_request(message: object) -> dict:
     request = validate_request(message, require_compatible=False, actions=ADMIN_ACTIONS)
-    hostwide = request["action"] in {"doctor", "apps"}
+    hostwide = request["action"] in ADMIN_HOSTWIDE_ACTIONS
     if request["commit"] is not None or (request["application_id"] is None) != hostwide:
         raise ProtocolError("invalid administration request")
     return request
@@ -66,18 +67,37 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         if args:
             raise ProtocolError("unknown arguments")
         return application_inventory(layout, lock)
-    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb"},
-               "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text"}, "registry": {"operation", "registry", "username", "token"},
+    if action == "uninstall":
+        if set(args) - {"force"}:
+            raise ProtocolError("unknown arguments")
+        force = args.get("force", False)
+        if not isinstance(force, bool):
+            raise ProtocolError("force must be true or false")
+        return uninstall(layout, system, lock, SubprocessCaddy(), force=force)
+    allowed = {"provision": {"runtime", "api_domain", "image_repository", "public_key", "key_label", "max_memory_mb",
+                             "update"},
+               "keys": {"operation", "label", "public_key"}, "environment": {"operation", "text", "key", "value"},
+               "registry": {"operation", "registry", "username", "token"},
                "deprovision": {"retire"}}[action]
     if set(args) - allowed:
         raise ProtocolError("unknown arguments")
     if action == "provision":
-        if set(args) - {"max_memory_mb"} != allowed - {"max_memory_mb"}:
+        required = {"runtime", "api_domain", "image_repository", "public_key", "key_label"}
+        if not required <= set(args) or set(args) - required - {"max_memory_mb", "update"}:
             raise ProtocolError("missing arguments")
-        extra = {"max_memory_mb": args["max_memory_mb"]} if "max_memory_mb" in args else {}
+        if "update" in args and args["update"] is not True:
+            raise ProtocolError("update must be true")
+        extra = {key: args[key] for key in ("max_memory_mb", "update") if key in args}
+        apply_route = None
+        if extra.get("update") is True:
+            def apply_route(registration: dict):
+                try:
+                    return RouteManager(layout.caddy_root, lock, SubprocessCaddy()).apply(registration)
+                except RoutingError as error:
+                    raise ProvisionError(f"could not change the public route: {error}") from None
         return provision(layout, system, lock, application_id=app, runtime=args["runtime"], **extra,
                          api_domain=args["api_domain"], image_repository=args["image_repository"],
-                         public_key=args["public_key"], key_label=args["key_label"])
+                         public_key=args["public_key"], key_label=args["key_label"], apply_route=apply_route)
     if action == "keys":
         return manage_key(layout, app, args.get("operation"), label=args.get("label"),
                           public_key=args.get("public_key"))
@@ -85,7 +105,8 @@ def handle(request: dict, layout: Layout, system: System, lock: HostLock) -> dic
         return manage_registry(layout, app, args.get("operation"), registry=args.get("registry"),
                                username=args.get("username"), token=args.get("token"))
     if action == "environment":
-        return manage_environment(layout, app, args.get("operation"), text=args.get("text"))
+        return manage_environment(layout, app, args.get("operation"), text=args.get("text"),
+                                  key=args.get("key"), value=args.get("value"))
     retire = None
     if args.get("retire") is True:
         retire = make_retirer(layout, system, lock, SubprocessCaddy())
@@ -117,8 +138,11 @@ def run(message: object, layout: Layout, system: System, environ: dict[str, str]
         return {"status": "error", "request_id": request_id, "error": "denied"}, 3
     except (ProtocolError, ManifestError):
         return {"status": "error", "request_id": request_id, "error": "invalid_request"}, 2
-    except (ProvisionError, StateError, OSError) as error:
-        message = str(error) if isinstance(error, (ProvisionError, StateError)) else "host operation failed"
+    except UninstallRefused as error:
+        return {"status": "error", "request_id": request_id, "error": "rejected", "message": str(error)}, 2
+    except (UninstallError, ProvisionError, StateError, OSError) as error:
+        message = (str(error) if isinstance(error, (UninstallError, ProvisionError, StateError))
+                   else "host operation failed")
         return {"status": "error", "request_id": request_id, "error": "failed", "message": message}, 1
 
 

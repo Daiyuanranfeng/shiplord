@@ -130,7 +130,7 @@ class AuthorizationTests(unittest.TestCase):
         with self.checks():
             self.assertEqual(serve(io.BytesIO(encoded.getvalue()), output), 0)
         self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["actions"],
-                         ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "backup", "restore", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1"])
+                         ["capabilities", "plan", "deploy", "status", "logs", "rollback", "restart", "recover", "backup", "restore", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1", "recover_force_stop_v1", "runtime_knobs_v1"])
         request["application_id"] = "other"
         encoded = io.BytesIO()
         write_frame(encoded, request)

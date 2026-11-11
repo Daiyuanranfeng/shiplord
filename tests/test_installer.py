@@ -8,10 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import shiplord
 from shiplord.installer import (CLIENT_MODULES, DEPLOY_GROUP, PYTHON_PROBE, REQUIRED_PYTHON, SERVER_PYTHON,
-                                SSHD_DROPIN, BootstrapError, bootstrap, helper_modules, python_supported)
+                                SSHD_DROPIN, BootstrapError, bootstrap, collect_old_versions, helper_modules,
+                                python_supported)
 from shiplord.layout import Layout, deployment_user
 from shiplord.routing import RoutingError
 from shiplord.system import TRUNCATION_MARKER, CommandResult
@@ -86,9 +88,12 @@ class FakeCaddy:
         self.validated = 0
         self.reloaded = 0
         self.fail_reload = False
+        self.unavailable_at: int | None = None
 
     def validate(self, config):
         self.validated += 1
+        if self.validated == self.unavailable_at:
+            raise RoutingError("could not start /usr/bin/caddy", "unavailable")
 
     def reload(self):
         self.reloaded += 1
@@ -111,6 +116,8 @@ class InstallerTestCase(unittest.TestCase):
         sshd.mkdir(parents=True)
         self.sshd_config = sshd / "sshd_config"
         self.sshd_config.write_text("Include sshd_config.d/*.conf\n")
+        self.os_release = self.prefix / "etc" / "os-release"
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
         self.system = FakeSystem()
         self.caddy = FakeCaddy()
 
@@ -162,7 +169,7 @@ class BootstrapTests(InstallerTestCase):
                              f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B {layout.lib}/current/{launcher} "$@"\n')
         self.assertIn(f"import {layout.caddy_root}/ship/*.caddy", (layout.caddy_root / "Caddyfile").read_text())
         self.assertTrue((layout.caddy_root / "ship" / "00-shiplord.caddy").exists())
-        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (1, 1))
+        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (2, 1))  # probe, managed import
         dropin = layout.sshd_dropin.read_text()
         self.assertIn(f"AuthorizedKeysFile {layout.authorized_keys}/%u", dropin)
         self.assertIn("PermitTTY no", dropin)
@@ -223,11 +230,55 @@ class BootstrapTests(InstallerTestCase):
         with self.assertRaisesRegex(BootstrapError, "symbolic link"):
             self.run_bootstrap()
 
-    def test_missing_caddy_is_a_clear_failure_after_code_install(self):
+    def test_missing_caddy_configuration_directory_is_a_clear_failure_before_code_install(self):
         (self.layout.caddy_root / "Caddyfile").unlink()
         self.layout.caddy_root.rmdir()
         with self.assertRaisesRegex(BootstrapError, "Caddy is not installed"):
             self.run_bootstrap()
+        self.assertFalse((self.layout.lib / "current").exists())
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_missing_caddy_binary_names_caddy_and_how_to_install_it(self):
+        self.caddy.unavailable_at = 1
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": ""}):
+            with self.assertRaisesRegex(
+                    BootstrapError, r"Caddy is not installed.*install the caddy package.*/usr/bin/caddy"):
+                self.run_bootstrap()
+        self.assertEqual(self.caddy.validated, 1)  # the probe; nothing else ran
+        self.assertFalse(self.layout.lib.exists())
+        self.assertFalse(self.layout.sshd_dropin.exists())
+
+    def test_a_missing_caddy_binary_names_the_configured_path(self):
+        self.caddy.unavailable_at = 1
+        with patch.dict(os.environ, {"SHIPLORD_CADDY_BINARY": "/opt/caddy/caddy"}):
+            with self.assertRaisesRegex(BootstrapError, r"put the binary at /opt/caddy/caddy"):
+                self.run_bootstrap()
+        self.assertEqual(self.caddy.validated, 1)
+
+    def test_a_missing_caddy_binary_names_a_runners_own_path(self):
+        self.caddy.unavailable_at = 1
+        self.caddy.caddy = "/opt/runner/caddy"
+        with self.assertRaisesRegex(BootstrapError, r"put the binary at /opt/runner/caddy"):
+            self.run_bootstrap()
+
+    def test_a_missing_caddy_binary_leaves_the_previous_helper_active(self):
+        first = self.run_bootstrap()
+        current = os.readlink(self.layout.lib / "current")
+        dropin = self.layout.sshd_dropin.read_bytes()
+        self.caddy.validated = 0
+        self.caddy.unavailable_at = 1
+        with self.assertRaisesRegex(BootstrapError, "Caddy is not installed"):
+            self.run_bootstrap()
+        self.assertEqual(os.readlink(self.layout.lib / "current"), current)
+        self.assertEqual(self.layout.sshd_dropin.read_bytes(), dropin)
+        self.assertEqual(os.readlink(self.layout.lib / "current"), first["version"])
+
+    def test_an_unavailable_caddy_during_the_import_keeps_the_distinct_kind(self):
+        self.caddy.unavailable_at = 2  # the probe passes; the managed-import validation cannot start Caddy
+        with self.assertRaisesRegex(BootstrapError, r"Caddy integration failed \(unavailable\)") as caught:
+            self.run_bootstrap()
+        self.assertNotIn("rejected", str(caught.exception))
+        self.assertFalse((self.layout.lib / "current").exists())
         self.assertFalse(self.layout.sshd_dropin.exists())
 
     def test_caddy_failure_stops_before_touching_sshd(self):
@@ -236,6 +287,146 @@ class BootstrapTests(InstallerTestCase):
             self.run_bootstrap()
         self.assertFalse(self.layout.sshd_dropin.exists())
         self.assertNotIn(["/usr/sbin/sshd", "-t"], self.system.calls)
+
+
+class CollectTests(InstallerTestCase):
+    """A successful bootstrap keeps the current and previous helper versions and collects older ones."""
+
+    def version(self, name, *, complete=True):
+        path = self.layout.lib / name
+        (path / "shiplord").mkdir(parents=True)
+        (path / "shiplord" / "installer.py").write_text("x = 1\n")
+        if complete:
+            (path / ".complete").write_text("")
+        return path
+
+    def age(self, path, marker_mtime_ns):
+        os.utime(path / ".complete", ns=(marker_mtime_ns, marker_mtime_ns))
+
+    def old_versions(self):
+        """Two finished versions older than the installed one, newest first after the current version."""
+        first = self.run_bootstrap()
+        base = (self.layout.lib / first["version"] / ".complete").stat().st_mtime_ns
+        older = self.version("0.1.0-aaaaaaaaaaaa")
+        newer = self.version("0.1.0-bbbbbbbbbbbb")
+        self.age(older, base - 2_000_000_000)
+        self.age(newer, base - 1_000_000_000)
+        return first, older, newer
+
+    def test_a_second_bootstrap_keeps_the_current_and_the_previous_version(self):
+        first, older, newer = self.old_versions()
+        second = self.run_bootstrap()
+        self.assertEqual(second["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue((self.layout.lib / first["version"]).is_dir())
+        self.assertTrue(newer.is_dir())
+        self.assertFalse(older.exists())
+
+    def test_collecting_again_removes_nothing(self):
+        self.old_versions()
+        self.run_bootstrap()
+        self.assertEqual(self.run_bootstrap()["collected"], [])
+
+    def test_a_version_a_symlink_points_at_is_kept(self):
+        _first, older, newer = self.old_versions()
+        (self.layout.lib / "rollback").symlink_to(older.name)
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_the_version_the_running_helper_executes_from_is_kept(self):
+        _first, older, newer = self.old_versions()
+        running = older / "shiplord" / "installer.py"
+        with patch("shiplord.installer.__file__", str(running)):
+            self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-bbbbbbbbbbbb"])
+        self.assertTrue(older.is_dir())
+        self.assertFalse(newer.exists())
+
+    def test_an_unfinished_version_and_a_foreign_directory_are_left_alone(self):
+        self.old_versions()
+        unfinished = self.version("0.1.0-cccccccccccc", complete=False)
+        foreign = self.layout.lib / "manual"
+        foreign.mkdir()
+        self.assertEqual(self.run_bootstrap()["collected"], ["0.1.0-aaaaaaaaaaaa"])
+        self.assertTrue(unfinished.is_dir())
+        self.assertTrue(foreign.is_dir())
+
+    def test_a_collection_failure_is_a_warning_not_a_failed_bootstrap(self):
+        _first, older, _newer = self.old_versions()
+        with patch("shiplord.installer.remove_version_tree",
+                   side_effect=BootstrapError("could not remove an old helper version")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["collected"], [])
+        self.assertEqual(result["warnings"], ["could not remove an old helper version"])
+        self.assertTrue(older.is_dir())
+
+    def test_a_listing_failure_is_a_warning_without_a_host_path(self):
+        self.run_bootstrap()
+        with patch("shiplord.installer.complete_versions",
+                   side_effect=OSError(13, "Permission denied", "/var/lib/shiplord/current")):
+            result = self.run_bootstrap()
+        self.assertEqual(result["warnings"], ["old helper versions could not be collected"])
+        self.assertNotIn("/var/lib", result["warnings"][0])
+
+    def test_collecting_needs_an_installed_helper_directory(self):
+        with self.assertRaisesRegex(BootstrapError, "helper directory"):
+            collect_old_versions(self.layout)
+class OsBaselineTests(InstallerTestCase):
+    """An unsupported host is refused before the first side effect, not after a misleading failure."""
+
+    def assert_nothing_happened(self):
+        for path in (self.layout.var, self.layout.lib, self.layout.registrations, self.layout.sshd_dropin):
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(self.system.calls, [])
+        self.assertEqual((self.caddy.validated, self.caddy.reloaded), (0, 0))
+        self.assertEqual((self.layout.caddy_root / "Caddyfile").read_text(), "example.org {\n}\n")
+
+    def test_a_supported_host_bootstraps(self):
+        self.os_release.write_text('ID=debian\nVERSION_ID="12"\n')
+        self.assertTrue(all(self.run_bootstrap()["changed"].values()))
+
+    def test_ubuntu_22_04_is_refused_before_any_side_effect(self):
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        with self.assertRaises(BootstrapError) as caught:
+            self.run_bootstrap()
+        message = str(caught.exception)
+        self.assertIn("Ubuntu 24.04 or later and Debian 12 or later", message)
+        self.assertIn("ubuntu 22.04", message)
+        self.assertNotIn("/", message)
+        self.assertNotIn(str(self.prefix), message)
+        self.assert_nothing_happened()
+
+    def test_debian_11_is_refused_before_any_side_effect(self):
+        self.os_release.write_text('ID=debian\nVERSION_ID="11"\n')
+        with self.assertRaisesRegex(BootstrapError, "debian 11 is older than the supported minimum"):
+            self.run_bootstrap()
+        self.assert_nothing_happened()
+
+    def test_an_unknown_distribution_is_refused(self):
+        self.os_release.write_text('ID=alpine\nVERSION_ID="3.20.3"\n')
+        with self.assertRaisesRegex(BootstrapError, "alpine 3.20.3 is not a supported distribution"):
+            self.run_bootstrap()
+        self.assert_nothing_happened()
+
+    def test_a_missing_or_malformed_release_file_is_refused(self):
+        cases = {"missing": None, "malformed": "this is not an os-release file\n"}
+        for name, content in cases.items():
+            with self.subTest(name):
+                if content is None:
+                    self.os_release.unlink()
+                else:
+                    self.os_release.write_text(content)
+                with self.assertRaisesRegex(BootstrapError, "Ubuntu 24.04 or later and Debian 12 or later"):
+                    self.run_bootstrap()
+                self.assert_nothing_happened()
+
+    def test_the_os_check_runs_before_the_caddy_probe(self):
+        self.os_release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        self.caddy.unavailable_at = 1
+        with self.assertRaises(BootstrapError) as caught:
+            self.run_bootstrap()
+        self.assertIn("ubuntu 22.04", str(caught.exception))
+        self.assertNotIn("Caddy", str(caught.exception))
+        self.assertEqual(self.caddy.validated, 0)
 
 
 class SshdTests(InstallerTestCase):
