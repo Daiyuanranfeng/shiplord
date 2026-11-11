@@ -125,6 +125,21 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
 
 
+def diff_environment(manifest: dict, admin: AdminClient, text: str) -> tuple[int, dict]:
+    """Preview the key-name changes ``env set`` would make; only the read-only key list is requested."""
+    try:  # validated here too, so a bad file is caught before any SSH connection is made
+        values = parse_environment(text)
+    except EnvironmentError_ as error:
+        raise CommandError(str(error)) from None
+    if not values:
+        raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
+    _code, listing = set_environment(manifest, admin, "keys")
+    current, proposed = set(listing.get("keys") or []), set(values)
+    return 0, {"ok": True, "operation": "diff", "added": sorted(proposed - current),
+               "removed": sorted(current - proposed),
+               "note": "Key names only; a name present in both files may still have a different value."}
+
+
 def native_artifact(binary: Path) -> dict:
     """Describe a local binary (size, checksum) after checking that it is a Linux x86-64 ELF executable."""
     try:

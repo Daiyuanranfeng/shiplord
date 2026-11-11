@@ -390,7 +390,7 @@ reach the run page or the calling job.
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
 | `provision` | Create the application's account, state, port, and key access on the server. |
-| `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
+| `env set --from-file F` / `env diff --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `diff` previews the key names it would add or remove without reading values; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. `status --job-id <id>` reads one job by ID, including its phase or terminal outcome. |
